@@ -1,30 +1,40 @@
-/* sim2650.c  v1.2  - Signetics 2650 Simulator
- * Target: Signetics 2650 / 2650A
- * Host:   Linux or Windows (gcc)
+/* ============================================================================
+ * sim2650_v1.2.c  (simulator core version 1.3)
+ * ----------------------------------------------------------------------------
+ * Signetics 2650 / 2650A instruction-set simulator.
  *
- * Usage:  sim2650 [-t] [-b addr] [-rx rxfile] image.hex
- *   -t         trace mode
- *   -b hex     breakpoint address
- *   -rx file   pre-load stdin from file (for RX testing)
+ * PURPOSE
+ *   - Execute Intel HEX programs assembled for the 2650.
+ *   - Provide practical testing support for Tiny BASIC/uBASIC development.
  *
- * v1.0 - skeleton, unverified opcodes
- * v1.1 - complete opcode table from Signetics 2650 User Manual
- *         corrected PSW layout, all instruction handlers correct
- * v1.2 - Kowalski-style direct byte I/O (no bit-bang simulation)
- *         WRTD/WRTE/WRTC write R[n] directly to stdout (putchar)
- *         REDE/REDD/REDC read directly from stdin (getchar)
- *         -rx file option pre-loads stdin from a named file
- *         Real hardware uses bit-bang PUTCH/GETCH via FLAG/SENSE;
- *         the simulator uses direct I/O so we can test the BASIC
- *         interpreter logic without serial timing concerns.
- *         PUTCH/GETCH in asm are thin wrappers: PUTCH calls WRTD,
- *         GETCH calls REDE — one instruction each in sim context.
+ * HOST / BUILD
+ *   - ANSI C, tested with gcc/clang on Linux.
+ *   - Build: gcc -Wall -O2 -o sim2650 sim2650_v1.2.c
  *
- * Memory map (default):
- *   $0000-$07FF  ROM (2KB)
- *   $0800-$0FFF  RAM (2KB)
+ * USAGE
+ *   sim2650 [-t] [-b addr] [-rx rxfile] image.hex
+ *     -t         enable instruction trace
+ *     -b hex     stop when IAR reaches breakpoint address
+ *     -rx file   feed stdin from file (REDE/REDD input)
  *
- * Build: gcc -Wall -o sim2650 sim2650_v1.2.c
+ * SIMULATION MODEL
+ *   - CPU: register/PSW semantics based on Signetics documentation.
+ *   - I/O: direct byte-mode convenience mapping:
+ *       WRTD/WRTE/WRTC -> putchar()
+ *       REDE/REDD/REDC -> getchar()
+ *   - Address space: 15-bit (masked with 0x7FFF internally).
+ *
+ * uBASIC TARGET MEMORY MAP
+ *   - ROM : $0000-$0FFF (writes ignored when ROM protection enabled)
+ *   - RAM : $1000-$17FF
+ *   - all other addresses are unmapped (warned/ignored or read as $FF)
+ *
+ * VERSION NOTES
+ *   v1.0  initial skeleton
+ *   v1.1  opcode table and PSW behavior corrected
+ *   v1.2  direct byte I/O mode and RX-file input support
+ *   v1.3  uBASIC memory map + explicit unmapped access handling
+ * ============================================================================
  */
 
 #include <stdio.h>
@@ -32,12 +42,16 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER  "1.2"
-#define MEM_SIZE 0x8000
-#define ROM_END  0x07FF
+#define SIM_VER  "1.3"
+#define MEM_SIZE   0x8000
+#define ROM_START  0x0000
+#define ROM_END    0x0FFF
+#define RAM_START  0x1000
+#define RAM_END    0x17FF
 
 static unsigned char mem[MEM_SIZE];
 static int rom_protect=1;
+static int mem_warn_count=0;
 
 /* ── CPU state ───────────────────────────────────────────────── */
 static struct {
@@ -81,10 +95,31 @@ static int trace=0, running=1, breakpt=-1;
 static long icount=0, maxinstr=2000000L;
 
 /* ── memory ──────────────────────────────────────────────────── */
-static unsigned char mrd(unsigned short a){ return mem[a&0x7FFF]; }
+static int addr_mapped(unsigned short a){
+    a&=0x7FFF;
+    return ((a>=ROM_START&&a<=ROM_END) || (a>=RAM_START&&a<=RAM_END));
+}
+static unsigned char mrd(unsigned short a){
+    a&=0x7FFF;
+    if(!addr_mapped(a)){
+        if(mem_warn_count<16){
+            fprintf(stderr,"WARN: unmapped read $%04X -> $FF\n",a);
+            mem_warn_count++;
+        }
+        return 0xFF;
+    }
+    return mem[a];
+}
 static void mwr(unsigned short a, unsigned char v){
     a&=0x7FFF;
-    if(rom_protect&&a<=ROM_END){ fprintf(stderr,"WARN: ROM write $%04X ignored\n",a); return; }
+    if(!addr_mapped(a)){
+        if(mem_warn_count<16){
+            fprintf(stderr,"WARN: unmapped write $%04X ignored\n",a);
+            mem_warn_count++;
+        }
+        return;
+    }
+    if(rom_protect&&a>=ROM_START&&a<=ROM_END){ fprintf(stderr,"WARN: ROM write $%04X ignored\n",a); return; }
     mem[a]=v;
 }
 static unsigned char fetch(void){ unsigned char b=mrd(cpu.IAR); cpu.IAR=(cpu.IAR+1)&0x7FFF; return b; }
@@ -579,7 +614,18 @@ static int load_hex(const char *fn){
         int n,addr,type; sscanf(line+1,"%02x%04x%02x",&n,&addr,&type);
         if(type==1) break;
         if(type!=0) continue;
-        for(int i=0;i<n;i++){int b; sscanf(line+9+i*2,"%02x",&b); mem[addr++&0x7FFF]=(unsigned char)b; loaded++;}
+        for(int i=0;i<n;i++){
+            int b;
+            unsigned short a=(unsigned short)(addr&0x7FFF);
+            sscanf(line+9+i*2,"%02x",&b);
+            if(addr_mapped(a)){
+                mem[a]=(unsigned char)b;
+                loaded++;
+            }else{
+                fprintf(stderr,"WARN: HEX byte for unmapped $%04X ignored\n",a);
+            }
+            addr++;
+        }
     }
     fclose(f);
     fprintf(stderr,"Loaded %d bytes from '%s'\n",loaded,fn);

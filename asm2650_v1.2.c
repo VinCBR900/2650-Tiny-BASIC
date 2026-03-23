@@ -1,36 +1,35 @@
-/* asm2650.c  v1.2  - Signetics 2650 Cross-Assembler
- * Target: Signetics 2650 / 2650A
- * Host:   Linux or Windows (gcc)
+/* ============================================================================
+ * asm2650_v1.2.c  (assembler core version 1.3)
+ * ----------------------------------------------------------------------------
+ * Signetics 2650 / 2650A cross-assembler.
  *
- * Usage:  asm2650 source.asm [output.hex]
+ * PURPOSE
+ *   - Assemble 2650 source into Intel HEX.
+ *   - Provide a compact, readable implementation suitable for this repository.
  *
- * v1.0 - initial skeleton, opcode table unverified
- * v1.1 - complete opcode table from Signetics 2650 User Manual
- *         corrected PSW layout (CC in PSL bits 7-6, not PSU)
- *         corrected CC encoding: 00=zero 01=positive 10=negative
- *         corrected all instruction encodings from numeric listing
- * v1.2 - character literals: 'X' evaluates to ASCII value in eval_expr
- *         fixes LODI,R1 'H' style operands used in serial routines
+ * HOST / BUILD
+ *   - ANSI C, tested with gcc/clang on Linux.
+ *   - Build:  gcc -Wall -O2 -o asm2650 asm2650_v1.2.c
  *
- * Opcode format: oooooo rr  (6-bit op, 2-bit register)
- * Mode families (base per group, +4 per mode):
- *   Z (register)  base+$00  e.g. LODZ=$00-$03
- *   I (immediate) base+$04  e.g. LODI=$04-$07
- *   R (relative)  base+$08  e.g. LODR=$08-$0B
- *   A (absolute)  base+$0C  e.g. LODA=$0C-$0F
+ * USAGE
+ *   asm2650 source.asm [output.hex]
+ *     source.asm   input assembly source
+ *     output.hex   optional Intel HEX output path (stdout if omitted)
  *
- * Condition codes (2 bits in mnemonic suffix):
- *   EQ=00 (equal/zero)   GT=01 (positive)
- *   LT=10 (negative)     UN=11 (unconditional)
- * Note: branch opcodes encode condition in bits 1-0 of opcode
+ * ASSEMBLER CAPABILITIES
+ *   - Two-pass label resolution.
+ *   - Directives: ORG, EQU, DB, DW, DS, END.
+ *   - Core numeric expressions with +/-.
+ *   - Number formats: hex ($), binary (%), decimal.
+ *   - Character literals: 'A' style operands.
+ *   - High/low byte extractors: >expr and <expr.
+ *   - Signetics-style operand syntax (e.g., LODI,R0 $41).
  *
- * PSL byte: CC1(7) CC0(6) IDC(5) RS(4) WC(3) OVF(2) COM(1) C(0)
- * PSU byte: S(7)   F(6)   II(5)  -(4)  -(3)  SP2(2) SP1(1) SP0(0)
- *
- * Directives: ORG DB DW DS EQU END
- * Output: Intel HEX to named file or stdout; listing to stderr
- *
- * Build: gcc -Wall -o asm2650 asm2650_v1.1.c
+ * NOTES
+ *   - Opcode encoding follows the 2650 user manual mappings.
+ *   - Condition suffixes: EQ, GT, LT, UN.
+ *   - Listing/debug diagnostics are emitted to stderr.
+ * ============================================================================
  */
 
 #include <stdio.h>
@@ -81,6 +80,14 @@ static int eval_expr(char *s, int *ok){
     s=skip_ws(s); *ok=1;
     int neg=0;
     if(*s=='-'){ neg=1; s++; s=skip_ws(s); }
+    if(*s=='>'||*s=='<'){
+        int hi=(*s=='>');
+        s++;
+        int ok2=0;
+        int v=eval_expr(s,&ok2);
+        if(!ok2){ *ok=0; return 0; }
+        return hi?((v>>8)&0xFF):(v&0xFF);
+    }
     int val=0;
     if(*s=='$'){ s++; if(!isxdigit((unsigned char)*s)){*ok=0;return 0;}
         while(isxdigit((unsigned char)*s)) val=val*16+(isdigit((unsigned char)*s)?*s-'0':toupper((unsigned char)*s)-'A'+10), s++; }
