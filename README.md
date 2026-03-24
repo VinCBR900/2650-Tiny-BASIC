@@ -1,6 +1,6 @@
 # 2650-Tiny-BASIC
 
-Signetics 2650 Tiny BASIC.
+Signetics 2650 Tiny BASIC **WORK IN PRGRESS**.
 
 ## Current behavior notes
 
