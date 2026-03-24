@@ -42,6 +42,12 @@ These scenarios are intended for simulator/manual regression runs.
    - Corrupt program area in debugger/simulator and run.
    - Expected: explicit `?3` malformed-record error, run stops safely.
 
+8. **Line number bounds (1..32767)**
+   - `0 PRINT 1` => `?0` (rejected)
+   - `32767 PRINT 1` then `LIST` => line is accepted
+   - `32768 PRINT 1` => `?0` (rejected)
+   - `10 GOTO 0` and `10 GOTO 32768` during `RUN` => `?0` syntax error
+
 ## Expression language
 
 1. **Precedence**

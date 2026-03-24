@@ -4,7 +4,7 @@ Signetics 2650 Tiny BASIC.
 
 ## Current behavior notes
 
-- Program line numbers are 16-bit (`0..65535`) and are stored/sorted as 16-bit values.
+- Program line numbers are 16-bit values constrained to `1..32767` and are stored/sorted as unsigned 16-bit values.
 - Program-memory insertions enforce `PROGLIM`; when insertion would exceed capacity, interpreter reports `?1`.
 - Runtime `GOTO` to missing line reports `?2`.
 - Runtime malformed stored-line records report `?3` and stop `RUN`.
