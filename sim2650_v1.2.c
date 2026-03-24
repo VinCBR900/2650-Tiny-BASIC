@@ -25,8 +25,8 @@
  *   - Address space: 15-bit (masked with 0x7FFF internally).
  *
  * uBASIC TARGET MEMORY MAP
- *   - ROM : $0000-$0FFF (writes ignored when ROM protection enabled)
- *   - RAM : $1000-$17FF
+ *   - ROM : $0000-$13FF (5KB; writes ignored when ROM protection enabled)
+ *   - RAM : $1400-$1BFF
  *   - all other addresses are unmapped (warned/ignored or read as $FF)
  *
  * VERSION NOTES
@@ -42,12 +42,12 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER  "1.3"
+#define SIM_VER  "1.4"
 #define MEM_SIZE   0x8000
 #define ROM_START  0x0000
-#define ROM_END    0x0FFF
-#define RAM_START  0x1000
-#define RAM_END    0x17FF
+#define ROM_END    0x13FF
+#define RAM_START  0x1400
+#define RAM_END    0x1BFF
 
 static unsigned char mem[MEM_SIZE];
 static int rom_protect=1;
@@ -80,10 +80,13 @@ static struct {
 #define PSL_COM 0x02
 #define PSL_C   0x01
 
-/* CC field values (in bits 7-6 of PSL) */
-#define CC_ZERO 0x00  /* result = 0   (EQ) */
-#define CC_POS  0x40  /* result > 0   (GT) */
-#define CC_NEG  0x80  /* result < 0   (LT) */
+/* CC field values (in bits 7-6 of PSL)
+ * 2650 encoding used by branch conditions:
+ *   LT=00, GT=01, EQ=10
+ */
+#define CC_NEG  0x00  /* LT */
+#define CC_POS  0x40  /* GT */
+#define CC_ZERO 0x80  /* EQ */
 
 /* branch condition encoding (bits 1-0 of opcode) */
 #define COND_EQ 0
@@ -93,6 +96,9 @@ static struct {
 
 static int trace=0, running=1, breakpt=-1;
 static long icount=0, maxinstr=2000000L;
+static int strict_rom_image=1;
+static int trap_unhandled=1;
+static int run_fault=0;
 
 /* ── memory ──────────────────────────────────────────────────── */
 static int addr_mapped(unsigned short a){
@@ -134,11 +140,11 @@ static void set_cc(unsigned char result){
 
 /* test branch condition against current CC */
 static int test_cond(int cond){
-    int cc=(cpu.PSL&PSL_CC)>>6;  /* 0=zero 1=pos 2=neg */
+    unsigned char cc=(cpu.PSL&PSL_CC);
     switch(cond){
-        case COND_EQ: return (cc==0);
-        case COND_GT: return (cc==1);
-        case COND_LT: return (cc==2);
+        case COND_EQ: return (cc==CC_ZERO);
+        case COND_GT: return (cc==CC_POS);
+        case COND_LT: return (cc==CC_NEG);
         case COND_UN: return 1;
     }
     return 0;
@@ -518,7 +524,7 @@ static void execute(void){
                       if(idxctl==1){ cpu.R[rn]++; eff=(eff+cpu.R[rn])&0x7FFF; }
                       else if(idxctl==2){ cpu.R[rn]--; eff=(eff+cpu.R[rn])&0x7FFF; }
                       else if(idxctl==3){ eff=(eff+cpu.R[rn])&0x7FFF; }
-                      mwr(eff,cpu.R[0]); set_cc(cpu.R[0]); /* indexed: src=R0 */
+                      mwr(eff,cpu.R[rn]); set_cc(cpu.R[rn]);
                       return; }
             }
         }
@@ -603,12 +609,16 @@ static void execute(void){
 
     /* unknown */
     fprintf(stderr,"WARN [%04X]: unhandled opcode $%02X\n",op_pc,opcode);
+    if(trap_unhandled){
+        run_fault=1;
+        running=0;
+    }
 }
 
 /* ── Intel HEX loader ────────────────────────────────────────── */
 static int load_hex(const char *fn){
     FILE *f=fopen(fn,"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",fn);return 0;}
-    char line[128]; int loaded=0;
+    char line[128]; int loaded=0, rom_violations=0;
     while(fgets(line,128,f)){
         if(line[0]!=':') continue;
         int n,addr,type; sscanf(line+1,"%02x%04x%02x",&n,&addr,&type);
@@ -618,7 +628,9 @@ static int load_hex(const char *fn){
             int b;
             unsigned short a=(unsigned short)(addr&0x7FFF);
             sscanf(line+9+i*2,"%02x",&b);
-            if(addr_mapped(a)){
+            if(strict_rom_image && (a < ROM_START || a > ROM_END)){
+                rom_violations++;
+            }else if(addr_mapped(a)){
                 mem[a]=(unsigned char)b;
                 loaded++;
             }else{
@@ -628,6 +640,16 @@ static int load_hex(const char *fn){
         }
     }
     fclose(f);
+    if(rom_violations){
+        fprintf(stderr,
+                "ERROR: image contains %d byte(s) outside ROM $%04X-$%04X.\n",
+                rom_violations, ROM_START, ROM_END);
+        fprintf(stderr,
+                "       This overlaps runtime RAM (uBASIC uses RAM for program/data).\n");
+        fprintf(stderr,
+                "       Shrink code to fit ROM or rerun simulator with --allow-ram-image.\n");
+        return 0;
+    }
     fprintf(stderr,"Loaded %d bytes from '%s'\n",loaded,fn);
     return loaded;
 }
@@ -635,13 +657,17 @@ static int load_hex(const char *fn){
 /* ── main ────────────────────────────────────────────────────── */
 int main(int argc,char *argv[]){
     fprintf(stderr,"sim2650 v%s - Signetics 2650 Simulator\n",SIM_VER);
-    if(argc<2){fprintf(stderr,"Usage: sim2650 [-t] [-b addr] [-rx file] image.hex\n");return 1;}
+    if(argc<2){
+        fprintf(stderr,"Usage: sim2650 [-t] [-b addr] [-rx file] [--allow-ram-image] image.hex\n");
+        return 1;
+    }
     const char *hexfile=NULL;
     const char *rxfile =NULL;
     for(int i=1;i<argc;i++){
         if(strcmp(argv[i],"-t")==0) trace=1;
         else if(strcmp(argv[i],"-b")==0&&i+1<argc) breakpt=(int)strtol(argv[++i],NULL,16);
         else if(strcmp(argv[i],"-rx")==0&&i+1<argc) rxfile=argv[++i];
+        else if(strcmp(argv[i],"--allow-ram-image")==0) strict_rom_image=0;
         else hexfile=argv[i];
     }
     if(!hexfile){fprintf(stderr,"No HEX file\n");return 1;}
@@ -670,5 +696,7 @@ int main(int argc,char *argv[]){
     fprintf(stderr,"\nHalted after %ld instructions\n",icount);
     fprintf(stderr,"R0=$%02X R1=$%02X R2=$%02X R3=$%02X\n",cpu.R[0],cpu.R[1],cpu.R[2],cpu.R[3]);
     fprintf(stderr,"IAR=$%04X PSU=$%02X PSL=$%02X CC=%d\n",cpu.IAR,cpu.PSU,cpu.PSL,(cpu.PSL&PSL_CC)>>6);
+    if(run_fault) return 2;
+    if(icount>=maxinstr) return 3;
     return 0;
 }
