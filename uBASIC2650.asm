@@ -30,6 +30,8 @@ SP      EQU     $20
 NUL     EQU     $00
 DQ      EQU     '"'
 IBUFSZ  EQU     75
+PROGBASE EQU    $1100
+PROGLIM  EQU    $1800
 
 SPTR    EQU     $1000
 LPTR    EQU     $1002
@@ -61,6 +63,20 @@ NEGFLG  EQU     $1099
 DIGCNT  EQU     $109A
 RGTHI   EQU     $109B
 RGTLO   EQU     $109C
+PROGHI  EQU     $109D
+PROGLO  EQU     $109E
+P1HI    EQU     $109F
+P1LO    EQU     $10A0
+P2HI    EQU     $10A1
+P2LO    EQU     $10A2
+RUNFLG  EQU     $10A3
+GOTOFLG EQU     $10A4
+GOTOLN  EQU     $10A5
+TMPLEN  EQU     $10A6
+CURHI   EQU     $10A7
+CURLO   EQU     $10A8
+NEXTHI  EQU     $10A9
+NEXTLO  EQU     $10AA
 
         ORG     $0000
 
@@ -68,6 +84,7 @@ RGTLO   EQU     $109C
 ; RESET
 ; ════════════════════════════════════════════════════════════════
 RESET:
+        BSTA,UN INIT_PROG
         LODI,R0 >BANNER
         STRA,R0 SPTR
         LODI,R0 <BANNER
@@ -91,6 +108,11 @@ REPL:
         LODI,R0 <IBUF
         STRA,R0 IPTR+1
 
+        BSTA,UN TRY_STORE_LINE
+        LODA,R0 FOUND
+        COMI,R0 $00
+        BCTA,GT REPL
+
         BSTA,UN STMT_LINE
         BCTA,UN REPL
 
@@ -113,6 +135,10 @@ STMT_LINE:
         BCTA,EQ ST_END
         COMI,R1 'I'
         BCTA,EQ ST_I
+        COMI,R1 'N'
+        BCTA,EQ ST_NEW
+        COMI,R1 'G'
+        BCTA,EQ ST_GOTO
 
         BCTA,UN SYNERR
 
@@ -136,8 +162,10 @@ ST_PRINT_OK:
 ST_LET:
         BSTA,UN GETCI
         BSTA,UN UC
-        COMI,R1 'L'
+        COMI,R1 'E'
         BCTA,EQ ST_LET_2
+        COMI,R1 'I'
+        BCTA,EQ ST_LIST_2
         BCTA,UN SYNERR
 ST_LET_2:
         BSTA,UN GETCI
@@ -150,11 +178,36 @@ ST_LET_OK:
         BSTA,UN DO_LET
         BCTA,UN ST_RET
 
+ST_LIST_2:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'S'
+        BCTA,EQ ST_LIST_3
+        BCTA,UN SYNERR
+ST_LIST_3:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'T'
+        BCTA,EQ ST_LIST_OK
+        BCTA,UN SYNERR
+ST_LIST_OK:
+        BSTA,UN EATWORD
+        BSTA,UN CHECK_EOL
+        LODA,R0 ERRFLG
+        COMI,R0 $00
+        BCTA,EQ ST_LIST_DO
+        BCTA,UN SYNERR
+ST_LIST_DO:
+        BSTA,UN DO_LIST
+        BCTA,UN ST_RET
+
 ST_REM:
         BSTA,UN GETCI
         BSTA,UN UC
-        COMI,R1 'R'
+        COMI,R1 'E'
         BCTA,EQ ST_REM_2
+        COMI,R1 'U'
+        BCTA,EQ ST_RUN_2
         BCTA,UN SYNERR
 ST_REM_2:
         BSTA,UN GETCI
@@ -164,6 +217,23 @@ ST_REM_2:
         BCTA,UN SYNERR
 ST_REM_OK:
         BSTA,UN EATWORD
+        BCTA,UN ST_RET
+
+ST_RUN_2:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'N'
+        BCTA,EQ ST_RUN_OK
+        BCTA,UN SYNERR
+ST_RUN_OK:
+        BSTA,UN EATWORD
+        BSTA,UN CHECK_EOL
+        LODA,R0 ERRFLG
+        COMI,R0 $00
+        BCTA,EQ ST_RUN_DO
+        BCTA,UN SYNERR
+ST_RUN_DO:
+        BSTA,UN DO_RUN
         BCTA,UN ST_RET
 
 ST_END:
@@ -180,6 +250,13 @@ ST_END_2:
         BCTA,UN SYNERR
 ST_END_OK:
         BSTA,UN EATWORD
+        LODA,R0 RUNFLG
+        COMI,R0 $00
+        BCTA,EQ ST_END_HALT
+        LODI,R0 $00
+        STRA,R0 RUNFLG
+        RETC,UN
+ST_END_HALT:
         HALT
 
 ST_I:
@@ -196,6 +273,52 @@ ST_I_2:
         COMI,R1 'F'
         BCTA,EQ ST_IF_OK
         BCTA,UN SYNERR
+
+ST_NEW:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'E'
+        BCTA,EQ ST_NEW_2
+        BCTA,UN SYNERR
+ST_NEW_2:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'W'
+        BCTA,EQ ST_NEW_OK
+        BCTA,UN SYNERR
+ST_NEW_OK:
+        BSTA,UN EATWORD
+        BSTA,UN CHECK_EOL
+        LODA,R0 ERRFLG
+        COMI,R0 $00
+        BCTA,EQ ST_NEW_DO
+        BCTA,UN SYNERR
+ST_NEW_DO:
+        BSTA,UN INIT_PROG
+        BCTA,UN ST_RET
+
+ST_GOTO:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'O'
+        BCTA,EQ ST_GOTO_2
+        BCTA,UN SYNERR
+ST_GOTO_2:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'T'
+        BCTA,EQ ST_GOTO_3
+        BCTA,UN SYNERR
+ST_GOTO_3:
+        BSTA,UN GETCI
+        BSTA,UN UC
+        COMI,R1 'O'
+        BCTA,EQ ST_GOTO_OK
+        BCTA,UN SYNERR
+ST_GOTO_OK:
+        BSTA,UN EATWORD
+        BSTA,UN DO_GOTO
+        BCTA,UN ST_RET
 
 ST_INPUT_OK:
         BSTA,UN EATWORD             ; allow full INPUT
@@ -456,6 +579,499 @@ DIF_DONE:
         BCTA,EQ DIF_RET
         BSTA,UN STMT_LINE
 DIF_RET:
+        RETC,UN
+
+; ════════════════════════════════════════════════════════════════
+; DO_GOTO — GOTO n (effective during RUN)
+; ════════════════════════════════════════════════════════════════
+DO_GOTO:
+        BSTA,UN PARSE_U8
+        LODA,R0 FOUND
+        COMI,R0 $00
+        BCTA,EQ SYNERR
+        STRA,R1 GOTOLN
+        BSTA,UN CHECK_EOL
+        LODA,R0 ERRFLG
+        COMI,R0 $00
+        BCTA,EQ DG_CHK
+        BCTA,UN SYNERR
+DG_CHK:
+        LODA,R0 RUNFLG
+        COMI,R0 $00
+        BCTA,EQ SYNERR
+        LODI,R0 $01
+        STRA,R0 GOTOFLG
+        RETC,UN
+
+; ════════════════════════════════════════════════════════════════
+; TRY_STORE_LINE — if line starts with number: store/delete program line
+; FOUND=1 when handled as program line; FOUND=0 immediate command
+; ════════════════════════════════════════════════════════════════
+TRY_STORE_LINE:
+        LODI,R0 $00
+        STRA,R0 FOUND
+        BSTA,UN WPEEK
+        COMI,R1 '0'
+        BCTA,LT TSL_RET
+        COMI,R1 '9'+1
+        BCTA,LT TSL_PARSE
+        BCTA,UN TSL_RET
+TSL_PARSE:
+        BSTA,UN PARSE_U8
+        LODA,R0 FOUND
+        COMI,R0 $00
+        BCTA,EQ TSL_RET
+        STRA,R1 NUMVAL
+        BSTA,UN WPEEK
+        COMI,R1 NUL
+        BCTA,EQ TSL_DEL
+        BSTA,UN STORE_LINE
+        BCTA,UN TSL_DONE
+TSL_DEL:
+        BSTA,UN DELETE_LINE
+TSL_DONE:
+        LODI,R0 $01
+        STRA,R0 FOUND
+TSL_RET:
+        RETC,UN
+
+; STORE_LINE — line number in NUMVAL, text tail at IPTR
+STORE_LINE:
+        BSTA,UN DELETE_LINE
+        ; measure tail length into TMPLEN
+        LODI,R0 $00
+        STRA,R0 TMPLEN
+        LODA,R0 IPTR
+        STRA,R0 P1HI
+        LODA,R0 IPTR+1
+        STRA,R0 P1LO
+SL_MLP:
+        LODA,R1 *P1HI
+        COMI,R1 NUL
+        BCTA,EQ SL_MDONE
+        BSTA,UN INC_P1
+        LODA,R0 TMPLEN
+        ADDI,R0 1
+        STRA,R0 TMPLEN
+        BCTA,UN SL_MLP
+SL_MDONE:
+        LODA,R0 TMPLEN
+        ADDI,R0 2
+        STRA,R0 NUMTMP
+        ; find insertion pointer in P1
+        BSTA,UN FIND_LINE_PTR
+        ; P2 = current top
+        LODA,R0 PROGHI
+        STRA,R0 P2HI
+        LODA,R0 PROGLO
+        STRA,R0 P2LO
+        ; shift up by (2+TMPLEN)
+SL_SHP:
+        LODA,R0 P2HI
+        SUBA,R0 P1HI
+        BCTA,LT SL_SHDONE
+        BCTA,GT SL_SHMOVE
+        LODA,R0 P2LO
+        SUBA,R0 P1LO
+        BCTA,LT SL_SHDONE
+SL_SHMOVE:
+        LODA,R1 *P2HI
+        BSTA,UN ADD_NUMTMP_P2
+        STRA,R1 *P2HI
+        BSTA,UN DEC_P2
+        BCTA,UN SL_SHP
+SL_SHDONE:
+        ; write record
+        LODA,R1 NUMVAL
+        STRA,R1 *P1HI
+        BSTA,UN INC_P1
+        LODA,R1 TMPLEN
+        STRA,R1 *P1HI
+        BSTA,UN INC_P1
+        LODA,R0 IPTR
+        STRA,R0 P2HI
+        LODA,R0 IPTR+1
+        STRA,R0 P2LO
+SL_WLP:
+        LODA,R0 TMPLEN
+        COMI,R0 $00
+        BCTA,EQ SL_TOP
+        LODA,R1 *P2HI
+        STRA,R1 *P1HI
+        BSTA,UN INC_P1
+        BSTA,UN INC_P2
+        LODA,R0 TMPLEN
+        SUBI,R0 1
+        STRA,R0 TMPLEN
+        BCTA,UN SL_WLP
+SL_TOP:
+        BSTA,UN ADD_NUMTMP_PROG
+        RETC,UN
+
+; DELETE_LINE — remove NUMVAL record if present
+DELETE_LINE:
+        BSTA,UN FIND_LINE_PTR
+        LODA,R0 FOUND
+        COMI,R0 $00
+        BCTA,EQ DL_RET
+        ; P2 = next record
+        LODA,R0 P1HI
+        STRA,R0 P2HI
+        LODA,R0 P1LO
+        STRA,R0 P2LO
+        BSTA,UN INC_P2              ; read length at +1
+        LODA,R0 *P2HI
+        ADDI,R0 2
+        STRA,R0 NUMTMP
+        STRA,R0 TMPLEN
+        ; restore P2 to record start, then advance to next
+        BSTA,UN DEC_P2
+        BSTA,UN REC_NEXT_P2
+DL_CPY:
+        LODA,R0 PROGHI
+        SUBA,R0 P2HI
+        BCTA,LT DL_FIN
+        BCTA,GT DL_MOV
+        LODA,R0 PROGLO
+        SUBA,R0 P2LO
+        BCTA,LT DL_FIN
+DL_MOV:
+        LODA,R1 *P2HI
+        STRA,R1 *P1HI
+        BSTA,UN INC_P1
+        BSTA,UN INC_P2
+        BCTA,UN DL_CPY
+DL_FIN:
+        LODA,R0 TMPLEN
+        STRA,R0 NUMTMP
+        BSTA,UN SUB_NUMTMP_PROG
+        RETC,UN
+DL_RET:
+        RETC,UN
+
+; FIND_LINE_PTR — search NUMVAL
+; returns P1 at found line or insertion point, FOUND=1 if exact
+FIND_LINE_PTR:
+        LODI,R0 $00
+        STRA,R0 FOUND
+        LODI,R0 >PROGBASE
+        STRA,R0 P1HI
+        LODI,R0 <PROGBASE
+        STRA,R0 P1LO
+FLP_LP:
+        LODA,R0 P1HI
+        SUBA,R0 PROGHI
+        BCTA,GT FLP_DONE
+        BCTA,LT FLP_CHK
+        LODA,R0 P1LO
+        SUBA,R0 PROGLO
+        BCTA,GT FLP_DONE
+        BCTA,EQ FLP_DONE
+FLP_CHK:
+        LODA,R1 *P1HI
+        SUBA,R1 NUMVAL
+        BCTA,EQ FLP_HIT
+        BCTA,GT FLP_DONE
+        BSTA,UN REC_NEXT_P1
+        BCTA,UN FLP_LP
+FLP_HIT:
+        LODI,R0 $01
+        STRA,R0 FOUND
+FLP_DONE:
+        RETC,UN
+
+; DO_LIST — print stored lines
+DO_LIST:
+        LODI,R0 >PROGBASE
+        STRA,R0 P1HI
+        LODI,R0 <PROGBASE
+        STRA,R0 P1LO
+DLIST_LP:
+        LODA,R0 P1HI
+        SUBA,R0 PROGHI
+        BCTA,GT DLIST_RET
+        BCTA,LT DLIST_P
+        LODA,R0 P1LO
+        SUBA,R0 PROGLO
+        BCTA,GT DLIST_RET
+        BCTA,EQ DLIST_RET
+DLIST_P:
+        LODA,R1 *P1HI
+        BSTA,UN PRINT_U8
+        LODI,R1 SP
+        BSTA,UN PUTCH
+        BSTA,UN INC_P1
+        LODA,R0 *P1HI
+        STRA,R0 TMPLEN
+        BSTA,UN INC_P1
+DLIST_TX:
+        LODA,R0 TMPLEN
+        COMI,R0 $00
+        BCTA,EQ DLIST_NL
+        LODA,R1 *P1HI
+        BSTA,UN PUTCH
+        BSTA,UN INC_P1
+        LODA,R0 TMPLEN
+        SUBI,R0 1
+        STRA,R0 TMPLEN
+        BCTA,UN DLIST_TX
+DLIST_NL:
+        BSTA,UN PRNL
+        BCTA,UN DLIST_LP
+DLIST_RET:
+        RETC,UN
+
+; DO_RUN — execute stored lines
+DO_RUN:
+        LODI,R0 $01
+        STRA,R0 RUNFLG
+        LODI,R0 $00
+        STRA,R0 GOTOFLG
+        LODI,R0 >PROGBASE
+        STRA,R0 CURHI
+        LODI,R0 <PROGBASE
+        STRA,R0 CURLO
+DR_LP:
+        LODA,R0 RUNFLG
+        COMI,R0 $00
+        BCTA,EQ DR_RET
+        ; end?
+        LODA,R0 CURHI
+        SUBA,R0 PROGHI
+        BCTA,GT DR_STOP
+        BCTA,LT DR_EXEC
+        LODA,R0 CURLO
+        SUBA,R0 PROGLO
+        BCTA,GT DR_STOP
+        BCTA,EQ DR_STOP
+DR_EXEC:
+        ; load text to IBUF
+        LODA,R0 CURHI
+        STRA,R0 P1HI
+        LODA,R0 CURLO
+        STRA,R0 P1LO
+        BSTA,UN INC_P1              ; skip line number
+        LODA,R0 *P1HI
+        STRA,R0 TMPLEN
+        BSTA,UN INC_P1
+        LODI,R0 >IBUF
+        STRA,R0 P2HI
+        LODI,R0 <IBUF
+        STRA,R0 P2LO
+DR_CPY:
+        LODA,R0 TMPLEN
+        COMI,R0 $00
+        BCTA,EQ DR_NUL
+        LODA,R1 *P1HI
+        STRA,R1 *P2HI
+        BSTA,UN INC_P1
+        BSTA,UN INC_P2
+        LODA,R0 TMPLEN
+        SUBI,R0 1
+        STRA,R0 TMPLEN
+        BCTA,UN DR_CPY
+DR_NUL:
+        LODI,R1 NUL
+        STRA,R1 *P2HI
+        ; set next pointer
+        LODA,R0 CURHI
+        STRA,R0 NEXTHI
+        LODA,R0 CURLO
+        STRA,R0 NEXTLO
+        BSTA,UN REC_NEXT_NEXT
+        ; execute line
+        LODI,R0 >IBUF
+        STRA,R0 IPTR
+        LODI,R0 <IBUF
+        STRA,R0 IPTR+1
+        BSTA,UN STMT_LINE
+        LODA,R0 GOTOFLG
+        COMI,R0 $00
+        BCTA,EQ DR_NEXT
+        LODI,R0 $00
+        STRA,R0 GOTOFLG
+        LODA,R1 GOTOLN
+        STRA,R1 NUMVAL
+        BSTA,UN FIND_LINE_PTR
+        LODA,R0 FOUND
+        COMI,R0 $00
+        BCTA,EQ SYNERR
+        LODA,R0 P1HI
+        STRA,R0 CURHI
+        LODA,R0 P1LO
+        STRA,R0 CURLO
+        BCTA,UN DR_LP
+DR_NEXT:
+        LODA,R0 NEXTHI
+        STRA,R0 CURHI
+        LODA,R0 NEXTLO
+        STRA,R0 CURLO
+        BCTA,UN DR_LP
+DR_STOP:
+        LODI,R0 $00
+        STRA,R0 RUNFLG
+DR_RET:
+        RETC,UN
+
+; INIT_PROG — clear stored program area
+INIT_PROG:
+        LODI,R0 >PROGBASE
+        STRA,R0 PROGHI
+        LODI,R0 <PROGBASE
+        STRA,R0 PROGLO
+        LODI,R0 $00
+        STRA,R0 RUNFLG
+        STRA,R0 GOTOFLG
+        RETC,UN
+
+; REC_NEXT_P1/P2/NEXT — pointer += 2 + record_length
+REC_NEXT_P1:
+        BSTA,UN INC_P1
+        LODA,R0 *P1HI
+        STRA,R0 NUMTMP
+        BSTA,UN INC_P1
+RN1_LP:
+        LODA,R0 NUMTMP
+        COMI,R0 $00
+        BCTA,EQ RN1_RET
+        BSTA,UN INC_P1
+        LODA,R0 NUMTMP
+        SUBI,R0 1
+        STRA,R0 NUMTMP
+        BCTA,UN RN1_LP
+RN1_RET:
+        RETC,UN
+
+REC_NEXT_P2:
+        BSTA,UN INC_P2
+        LODA,R0 *P2HI
+        STRA,R0 NUMTMP
+        BSTA,UN INC_P2
+RN2_LP:
+        LODA,R0 NUMTMP
+        COMI,R0 $00
+        BCTA,EQ RN2_RET
+        BSTA,UN INC_P2
+        LODA,R0 NUMTMP
+        SUBI,R0 1
+        STRA,R0 NUMTMP
+        BCTA,UN RN2_LP
+RN2_RET:
+        RETC,UN
+
+REC_NEXT_NEXT:
+        ; uses NEXTHI:NEXTLO as pointer
+        BSTA,UN INC_NEXT
+        LODA,R0 *NEXTHI
+        STRA,R0 NUMTMP
+        BSTA,UN INC_NEXT
+RNN_LP:
+        LODA,R0 NUMTMP
+        COMI,R0 $00
+        BCTA,EQ RNN_RET
+        BSTA,UN INC_NEXT
+        LODA,R0 NUMTMP
+        SUBI,R0 1
+        STRA,R0 NUMTMP
+        BCTA,UN RNN_LP
+RNN_RET:
+        RETC,UN
+
+ADD_NUMTMP_P2:
+ANP2_LP:
+        LODA,R0 NUMTMP
+        COMI,R0 $00
+        BCTA,EQ ANP2_RET
+        BSTA,UN INC_P2
+        LODA,R0 NUMTMP
+        SUBI,R0 1
+        STRA,R0 NUMTMP
+        BCTA,UN ANP2_LP
+ANP2_RET:
+        RETC,UN
+
+ADD_NUMTMP_PROG:
+ANPG_LP:
+        LODA,R0 NUMTMP
+        COMI,R0 $00
+        BCTA,EQ ANPG_RET
+        LODA,R0 PROGLO
+        ADDI,R0 1
+        STRA,R0 PROGLO
+        BCTA,GT ANPG_NC
+        LODA,R0 PROGHI
+        ADDI,R0 1
+        STRA,R0 PROGHI
+ANPG_NC:
+        LODA,R0 NUMTMP
+        SUBI,R0 1
+        STRA,R0 NUMTMP
+        BCTA,UN ANPG_LP
+ANPG_RET:
+        RETC,UN
+
+SUB_NUMTMP_PROG:
+SNPG_LP:
+        LODA,R0 NUMTMP
+        COMI,R0 $00
+        BCTA,EQ SNPG_RET
+        LODA,R0 PROGLO
+        SUBI,R0 1
+        STRA,R0 PROGLO
+        BCTA,GT SNPG_NB
+        LODA,R0 PROGHI
+        SUBI,R0 1
+        STRA,R0 PROGHI
+SNPG_NB:
+        LODA,R0 NUMTMP
+        SUBI,R0 1
+        STRA,R0 NUMTMP
+        BCTA,UN SNPG_LP
+SNPG_RET:
+        RETC,UN
+
+INC_P1:
+        LODA,R0 P1LO
+        ADDI,R0 1
+        STRA,R0 P1LO
+        BCTA,GT IP1_RET
+        LODA,R0 P1HI
+        ADDI,R0 1
+        STRA,R0 P1HI
+IP1_RET:
+        RETC,UN
+
+INC_P2:
+        LODA,R0 P2LO
+        ADDI,R0 1
+        STRA,R0 P2LO
+        BCTA,GT IP2_RET
+        LODA,R0 P2HI
+        ADDI,R0 1
+        STRA,R0 P2HI
+IP2_RET:
+        RETC,UN
+
+DEC_P2:
+        LODA,R0 P2LO
+        SUBI,R0 1
+        STRA,R0 P2LO
+        BCTA,GT DP2_RET
+        LODA,R0 P2HI
+        SUBI,R0 1
+        STRA,R0 P2HI
+DP2_RET:
+        RETC,UN
+
+INC_NEXT:
+        LODA,R0 NEXTLO
+        ADDI,R0 1
+        STRA,R0 NEXTLO
+        BCTA,GT INX_RET
+        LODA,R0 NEXTHI
+        ADDI,R0 1
+        STRA,R0 NEXTHI
+INX_RET:
         RETC,UN
 
 ; ════════════════════════════════════════════════════════════════
@@ -1477,7 +2093,7 @@ RDLINE_EOL:
 ; ════════════════════════════════════════════════════════════════
 BANNER:
         DB      CR,LF
-        DB      'u','B','A','S','I','C',' ','v','0','.','3'
+        DB      'u','B','A','S','I','C',' ','v','0','.','4'
         DB      CR,LF
         DB      '2','6','5','0',' ','p','o','r','t',' ','(','W','I','P',')'
         DB      CR,LF,NUL
