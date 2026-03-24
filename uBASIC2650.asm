@@ -1,7 +1,7 @@
 ; ubasic_v0.1.asm  -  Tiny BASIC work-in-progress for Signetics 2650
 ; -----------------------------------------------------------------------
 ; TARGET:   Signetics 2650 @ 1 MHz
-;           ROM $0000-$0FFF (4KB), RAM $1000-$17FF (2KB)
+;           ROM $0000-$13FF (5KB), RAM $1400-$1BFF (2KB)
 ; SIM I/O:  WRTD,R1 = putchar,  REDE,R1 = getchar
 ;
 ; v0.4: continues port by adding more Tiny BASIC statements:
@@ -13,14 +13,14 @@
 ;       - signed 16-bit variable/value path for LET/PRINT/INPUT/IF
 ;       - REM / RE (no-op), END / EN (halt), ?0 syntax errors
 ;
-; RAM MAP ($1000-$17FF):
-;   $1000-$1001  SPTR    string walk pointer (2 bytes)
-;   $1002-$1003  LPTR    line buffer write pointer (2 bytes)
-;   $1004        LCNT    line buffer char count (1 byte)
-;   $1005-$104F  IBUF    input line buffer (75 bytes + NUL)
-;   $1050-$1051  IPTR    parse pointer into IBUF (2 bytes)
-;   $1052-$1085  VARS    A-Z variables, 2 bytes each (hi,lo)
-;   $1086-       parser/print scratch
+; RAM MAP ($1400-$1BFF):
+;   $1400-$1401  SPTR    string walk pointer (2 bytes)
+;   $1402-$1403  LPTR    line buffer write pointer (2 bytes)
+;   $1404        LCNT    line buffer char count (1 byte)
+;   $1405-$144F  IBUF    input line buffer (75 bytes + NUL)
+;   $1450-$1451  IPTR    parse pointer into IBUF (2 bytes)
+;   $1452-$1485  VARS    A-Z variables, 2 bytes each (hi,lo)
+;   $1486-       parser/print scratch
 ; -----------------------------------------------------------------------
 
 CR      EQU     $0D
@@ -30,56 +30,56 @@ SP      EQU     $20
 NUL     EQU     $00
 DQ      EQU     '"'
 IBUFSZ  EQU     75
-PROGBASE EQU    $1100
-PROGLIM  EQU    $1800
+PROGBASE EQU    $1500
+PROGLIM  EQU    $1C00
 
-SPTR    EQU     $1000
-LPTR    EQU     $1002
-LCNT    EQU     $1004
-IBUF    EQU     $1005
-IPTR    EQU     $1050
-VARS    EQU     $1052
+SPTR    EQU     $1400
+LPTR    EQU     $1402
+LCNT    EQU     $1404
+IBUF    EQU     $1405
+IPTR    EQU     $1450
+VARS    EQU     $1452
 
-TMPCHR  EQU     $1086
-TMPNUM  EQU     $1087
-FOUND   EQU     $1088
-ERRFLG  EQU     $1089
-NUMVAL  EQU     $108A
-NUMTMP  EQU     $108B
-DIGIT   EQU     $108C
-HUND    EQU     $108D
-TENS    EQU     $108E
-ONES    EQU     $108F
-LEFTV   EQU     $1090
-RIGHTV  EQU     $1091
-RELOP   EQU     $1092
-VALHI   EQU     $1093
-VALLO   EQU     $1094
-ACCHI   EQU     $1095
-ACCLO   EQU     $1096
-TMPHI2  EQU     $1097
-TMPLO2  EQU     $1098
-NEGFLG  EQU     $1099
-DIGCNT  EQU     $109A
-RGTHI   EQU     $109B
-RGTLO   EQU     $109C
-PROGHI  EQU     $109D
-PROGLO  EQU     $109E
-P1HI    EQU     $109F
-P1LO    EQU     $10A0
-P2HI    EQU     $10A1
-P2LO    EQU     $10A2
-RUNFLG  EQU     $10A3
-GOTOFLG EQU     $10A4
-GOTOLHI EQU     $10A5
-GOTOLLO EQU     $10A6
-TMPLEN  EQU     $10A7
-CURHI   EQU     $10A8
-CURLO   EQU     $10A9
-NEXTHI  EQU     $10AA
-NEXTLO  EQU     $10AB
-LNUMHI  EQU     $10AC
-LNUMLO  EQU     $10AD
+TMPCHR  EQU     $1486
+TMPNUM  EQU     $1487
+FOUND   EQU     $1488
+ERRFLG  EQU     $1489
+NUMVAL  EQU     $148A
+NUMTMP  EQU     $148B
+DIGIT   EQU     $148C
+HUND    EQU     $148D
+TENS    EQU     $148E
+ONES    EQU     $148F
+LEFTV   EQU     $1490
+RIGHTV  EQU     $1491
+RELOP   EQU     $1492
+VALHI   EQU     $1493
+VALLO   EQU     $1494
+ACCHI   EQU     $1495
+ACCLO   EQU     $1496
+TMPHI2  EQU     $1497
+TMPLO2  EQU     $1498
+NEGFLG  EQU     $1499
+DIGCNT  EQU     $149A
+RGTHI   EQU     $149B
+RGTLO   EQU     $149C
+PROGHI  EQU     $149D
+PROGLO  EQU     $149E
+P1HI    EQU     $149F
+P1LO    EQU     $14A0
+P2HI    EQU     $14A1
+P2LO    EQU     $14A2
+RUNFLG  EQU     $14A3
+GOTOFLG EQU     $14A4
+GOTOLHI EQU     $14A5
+GOTOLLO EQU     $14A6
+TMPLEN  EQU     $14A7
+CURHI   EQU     $14A8
+CURLO   EQU     $14A9
+NEXTHI  EQU     $14AA
+NEXTLO  EQU     $14AB
+LNUMHI  EQU     $14AC
+LNUMLO  EQU     $14AD
 
         ORG     $0000
 
@@ -213,7 +213,7 @@ ST_KW_HIT:
         COMI,R0 $09
         BCTA,EQ ST_NEW_OK
         COMI,R0 $0A
-        BCTA,EQ ST_GOTO_2
+        BCTA,EQ ST_GOTO_OK
         BCTA,UN SYNERR
 
 ST_PRINT_OK:
@@ -262,15 +262,13 @@ ST_NEW_DO:
         BSTA,UN INIT_PROG
         BCTA,UN ST_RET
 
-ST_GOTO_2:
+ST_GOTO_OK:
         LODI,R0 'T'
         STRA,R0 TMPCHR
         BSTA,UN EXPECT_UC_CHAR
-ST_GOTO_3:
         LODI,R0 'O'
         STRA,R0 TMPCHR
         BSTA,UN EXPECT_UC_CHAR
-ST_GOTO_OK:
         BSTA,UN EATWORD
         BSTA,UN DO_GOTO
         BCTA,UN ST_RET
@@ -2118,39 +2116,34 @@ GVP_RET:
 ; SYNERR  — print ?0 + newline
 ; ════════════════════════════════════════════════════════════════
 SYNERR:
-        LODI,R1 '?'
-        BSTA,UN PUTCH
         LODI,R1 '0'
-        BSTA,UN PUTCH
-        BSTA,UN PRNL
-        RETC,UN
+        BCTA,UN ERR_PRINT
 
 OOMERR:
-        LODI,R1 '?'
-        BSTA,UN PUTCH
         LODI,R1 '1'
-        BSTA,UN PUTCH
-        BSTA,UN PRNL
-        RETC,UN
+        BCTA,UN ERR_PRINT
 
 BADGOTO:
-        LODI,R1 '?'
-        BSTA,UN PUTCH
         LODI,R1 '2'
-        BSTA,UN PUTCH
-        BSTA,UN PRNL
+        BSTA,UN ERR_PRINT
         LODI,R0 $00
         STRA,R0 RUNFLG
         RETC,UN
 
 MALFERR:
-        LODI,R1 '?'
-        BSTA,UN PUTCH
         LODI,R1 '3'
-        BSTA,UN PUTCH
-        BSTA,UN PRNL
+        BSTA,UN ERR_PRINT
         LODI,R0 $00
         STRA,R0 RUNFLG
+        RETC,UN
+
+ERR_PRINT:
+        STRA,R1 TMPCHR
+        LODI,R1 '?'
+        BSTA,UN PUTCH
+        LODA,R1 TMPCHR
+        BSTA,UN PUTCH
+        BSTA,UN PRNL
         RETC,UN
 
 ; ════════════════════════════════════════════════════════════════
