@@ -25,6 +25,7 @@ It exercises parser-sensitive instruction semantics directly:
 - `COMI` + `BCTA,EQ/GT/LT`
 - `SUBI` + `BCTA,EQ/GT/LT`
 - `ADDI` wrap/non-wrap carry+zero branch expectations
+- `ADDI` zero-without-carry branch expectation (`GT` fast-path)
 - `BSTA`/`RETC` nested return-stack behavior
 - conditional `BSTA` non-taken path (must not push RAS)
 

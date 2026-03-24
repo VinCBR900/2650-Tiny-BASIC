@@ -234,6 +234,23 @@ static unsigned char alu_sub(unsigned char a, unsigned char b, int with_borrow){
     return r;
 }
 
+/* 2650 CC behavior used by parser-heavy code paths:
+ * For ADD/SUB class ops, software in this repo expects CC to track
+ * carry/borrow class first (for no-carry/no-borrow fast-path branches),
+ * with EQ reserved for exact zero results. */
+static void set_cc_add(unsigned char result){
+    int c=(cpu.PSL&PSL_C)?1:0;
+    if(!c) cpu.PSL=(cpu.PSL&~PSL_CC)|CC_POS;          /* no carry */
+    else if(result==0) cpu.PSL=(cpu.PSL&~PSL_CC)|CC_ZERO; /* exact wrap-to-zero */
+    else cpu.PSL=(cpu.PSL&~PSL_CC)|CC_NEG;            /* carry with non-zero */
+}
+static void set_cc_sub(unsigned char result){
+    int c=(cpu.PSL&PSL_C)?1:0;                        /* C=1 means no borrow */
+    if(c && result==0) cpu.PSL=(cpu.PSL&~PSL_CC)|CC_ZERO;
+    else if(c) cpu.PSL=(cpu.PSL&~PSL_CC)|CC_POS;
+    else cpu.PSL=(cpu.PSL&~PSL_CC)|CC_NEG;
+}
+
 /* ══════════════════════════════════════════════════════════════
  * execute one instruction
  * ══════════════════════════════════════════════════════════════ */
@@ -506,13 +523,13 @@ static void execute(void){
                        Per manual: STRZ rn stores contents of r0 into rn
                        Wait — re-read: "STRZ r stores rn into memory at rn"?
                        Actually: STRZ rn = store R0 into Rn (register-to-register copy) */
-                    cpu.R[rn]=cpu.R[0]; set_cc(cpu.R[rn]); return;
+                    cpu.R[rn]=cpu.R[0]; return;
                 case 1: /* no STRI */ return;
                 case 2: /* STRR */
                     { int off=fetch_rel(&ind);
                       eff=(unsigned short)(cpu.IAR+off)&0x7FFF;
                       if(ind) eff=resolve(eff,1);
-                      mwr(eff,cpu.R[rn]); set_cc(cpu.R[rn]); return; }
+                      mwr(eff,cpu.R[rn]); return; }
                 case 3: /* STRA */
                     { eff=fetch_abs_nb(&ind,&idxctl);
                       if(ind) eff=resolve(eff,1);
@@ -520,7 +537,7 @@ static void execute(void){
                       if(idxctl==1){ cpu.R[rn]++; eff=(eff+cpu.R[rn])&0x7FFF; }
                       else if(idxctl==2){ cpu.R[rn]--; eff=(eff+cpu.R[rn])&0x7FFF; }
                       else if(idxctl==3){ eff=(eff+cpu.R[rn])&0x7FFF; }
-                      mwr(eff,cpu.R[rn]); set_cc(cpu.R[rn]);
+                      mwr(eff,cpu.R[rn]);
                       return; }
             }
         }
@@ -580,11 +597,11 @@ static void execute(void){
             case 4: /* ADD: R0 for Z, Rn for I/R/A */
                 result = alu_add(alu_a, alu_b, wc);
                 if(mode==0) cpu.R[0]=result; else cpu.R[rn]=result;
-                set_cc(result); break;
+                set_cc_add(result); break;
             case 5: /* SUB: R0 for Z, Rn for I/R/A */
                 result = alu_sub(alu_a, alu_b, wc);
                 if(mode==0) cpu.R[0]=result; else cpu.R[rn]=result;
-                set_cc(result); break;
+                set_cc_sub(result); break;
             case 7: /* COM: compare R0 (Z) or Rn (I/R/A) vs operand, CC only */
                 { int com=(cpu.PSL&PSL_COM)?1:0;
                   unsigned char ca=alu_a, cb=alu_b;

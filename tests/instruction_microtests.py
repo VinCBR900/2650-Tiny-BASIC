@@ -121,6 +121,18 @@ def test_addi_nonwrap_gt_and_no_carry():
     assert res["regs"][3] == 0x44, res["stderr"]
 
 
+def test_addi_zero_without_carry_still_gt():
+    image = {}
+    put(image, 0x0000, 0x05, 0x00)                 # LODI,R1,#0x00
+    put(image, 0x0002, 0x85, 0x00)                 # ADDI,R1,#0x00 => 0x00, C=0, expect CC=GT
+    put(image, 0x0004, 0x1D, 0x00, 0x10)           # BCTA,GT $0010
+    put(image, 0x0007, 0x07, 0x50, 0x40)           # fail: R3=0x50 ; HALT
+    put(image, 0x0010, 0x07, 0x55, 0x40)           # pass: R3=0x55 ; HALT
+    res = run_image(image)
+    assert res["code"] == 0, res["stderr"]
+    assert res["regs"][3] == 0x55, res["stderr"]
+
+
 def test_bsta_retc_nested_chain():
     image = {}
     put(image, 0x0000, 0x3F, 0x00, 0x20)           # BSTA,UN $0020
@@ -163,6 +175,19 @@ def test_bsta_conditional_not_taken_does_not_push():
     assert (res["psu"] & 0x07) == 0, res["stderr"]
 
 
+def test_stra_does_not_clobber_cc():
+    image = {}
+    put(image, 0x0000, 0x05, 0x00)                 # LODI,R1,#0
+    put(image, 0x0002, 0xE5, 0x01)                 # COMI,R1,#1 => LT
+    put(image, 0x0004, 0xCD, 0x14, 0x90)           # STRA,R1,$1490 (must not alter CC)
+    put(image, 0x0007, 0x1E, 0x00, 0x10)           # BCTA,LT $0010
+    put(image, 0x000A, 0x07, 0x60, 0x40)           # fail: R3=0x60 ; HALT
+    put(image, 0x0010, 0x07, 0x66, 0x40)           # pass: R3=0x66 ; HALT
+    res = run_image(image)
+    assert res["code"] == 0, res["stderr"]
+    assert res["regs"][3] == 0x66, res["stderr"]
+
+
 def main():
     build_sim()
 
@@ -176,6 +201,11 @@ def main():
 
     test_addi_wrap_eq_and_carry()
     test_addi_nonwrap_gt_and_no_carry()
+    test_addi_zero_without_carry_still_gt()
+
+    test_bsta_retc_nested_chain()
+    test_bsta_conditional_not_taken_does_not_push()
+    test_stra_does_not_clobber_cc()
 
     test_bsta_retc_nested_chain()
     test_bsta_conditional_not_taken_does_not_push()
