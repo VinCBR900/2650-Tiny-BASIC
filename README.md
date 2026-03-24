@@ -16,6 +16,32 @@ Signetics 2650 Tiny BASIC **WORK IN PRGRESS**.
 - Numeric arithmetic uses 16-bit two's-complement wraparound semantics.
   - Example: `32767+1` => `-32768`
 
+## Instruction micro-tests (simulator semantics)
+
+A targeted simulator micro-test suite lives at `tests/instruction_microtests.py`.
+
+It exercises parser-sensitive instruction semantics directly:
+
+- `COMI` + `BCTA,EQ/GT/LT`
+- `SUBI` + `BCTA,EQ/GT/LT`
+- `ADDI` wrap/non-wrap carry+zero branch expectations
+- `ADDI` zero-without-carry branch expectation (`GT` fast-path)
+- `BSTA`/`RETC` nested return-stack behavior
+- conditional `BSTA` non-taken path (must not push RAS)
+
+Run it with:
+
+```bash
+python3 tests/instruction_microtests.py
+```
+
+For end-to-end regression probing of the current uBASIC `RUN`/`LIST` behavior
+on the simulator, use:
+
+```bash
+python3 tests/ubasic_run_list_regression.py
+```
+
 ## Regression scenarios
 
 See `regression_scenarios.md` for manual scenarios covering:
