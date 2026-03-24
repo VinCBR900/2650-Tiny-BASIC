@@ -207,6 +207,9 @@ def main():
     test_bsta_conditional_not_taken_does_not_push()
     test_stra_does_not_clobber_cc()
 
+    test_bsta_retc_nested_chain()
+    test_bsta_conditional_not_taken_does_not_push()
+
     print("All instruction micro-tests passed.")
 
 
