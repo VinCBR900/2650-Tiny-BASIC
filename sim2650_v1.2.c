@@ -384,16 +384,14 @@ static void execute(void){
         int cond=opcode&3; int ind; int off=fetch_rel(&ind);
         unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF;
         if(ind) t=resolve(t,1);
-        push_ras(cpu.IAR);
-        if(test_cond(cond)) cpu.IAR=t;
+        if(test_cond(cond)){ push_ras(cpu.IAR); cpu.IAR=t; }
         return;
     }
     /* BSTA,cc $3C-$3F (branch-subroutine if cc, absolute) */
     if(opcode>=0x3C&&opcode<=0x3F){
         int cond=opcode&3; int ind; unsigned short t=fetch_abs_br(&ind);
         if(ind) t=resolve(t,1);
-        push_ras(cpu.IAR);
-        if(test_cond(cond)) cpu.IAR=t;
+        if(test_cond(cond)){ push_ras(cpu.IAR); cpu.IAR=t; }
         return;
     }
     /* BSFR,cc $B8-$BA */
@@ -401,16 +399,14 @@ static void execute(void){
         int cond=opcode&3; int ind; int off=fetch_rel(&ind);
         unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF;
         if(ind) t=resolve(t,1);
-        push_ras(cpu.IAR);
-        if(!test_cond(cond)) cpu.IAR=t;
+        if(!test_cond(cond)){ push_ras(cpu.IAR); cpu.IAR=t; }
         return;
     }
     /* BSFA,cc $BC-$BE */
     if(opcode>=0xBC&&opcode<=0xBE){
         int cond=opcode&3; int ind; unsigned short t=fetch_abs_br(&ind);
         if(ind) t=resolve(t,1);
-        push_ras(cpu.IAR);
-        if(!test_cond(cond)) cpu.IAR=t;
+        if(!test_cond(cond)){ push_ras(cpu.IAR); cpu.IAR=t; }
         return;
     }
     /* BSNR,Rn $78-$7B (branch if sense != Rn[0], relative) */
