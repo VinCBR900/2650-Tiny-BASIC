@@ -1,4 +1,4 @@
-; ubasic_v0.1.asm  -  Tiny BASIC work-in-progress for Signetics 2650
+; ubasic2650.asm  -  Tiny BASIC work-in-progress for Signetics 2650
 ; -----------------------------------------------------------------------
 ; TARGET:   Signetics 2650 @ 1 MHz
 ;           ROM $0000-$13FF (5KB), RAM $1400-$1BFF (2KB)
