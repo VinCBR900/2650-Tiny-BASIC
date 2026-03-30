@@ -1,0 +1,2772 @@
+Assembled by WinArcadia 36.04 at 13:04:24 on 30/3/2026--------------------
+
+              :; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
+              :; Version: v1.1-pipbug
+              :; Build:   python3 asm2650.py uBASIC2650.asm ubasic.hex
+              :;          sim2650 --pipbug -rx test.bas ubasic.hex
+              :;
+              :; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
+              :;   Program loads at $0440.  All RAM EQUs remain at $1400+ (plenty of room).
+              :;   I/O via Pipbug ROM calls (replaces direct WRTD/REDE hardware instructions):
+              :;     COUT $02B4  — putchar: R0 = char to print
+              :;     CHIN $0286  — getchar non-blocking: returns R0=0 if no key ready
+              :;     CRLF $008A  — print CR+LF
+              :;
+              :; CC SEMANTICS (set_cc_add / set_cc_sub from sim2650):
+              :;   ADD: no-carry->GT  carry+zero->EQ  carry+nonzero->LT
+              :;   SUB: no-borrow+nonzero->GT  no-borrow+zero->EQ  borrow->LT
+              :;   Carry  skip idiom: BCTA,GT lbl   (GT = C=0 = no carry)
+              :;   Borrow skip idiom: BCFA,LT lbl   (NOT LT = C=1 = no borrow — covers GT+EQ)
+              :;   NEVER use BCTA,GT for borrow skip — misses the zero-result case.
+              :;
+              :; 16-bit pointer advance inline pattern (preserves R1):
+              :;   LODA,R0 PTR_L; ADDI,R0 1; STRA,R0 PTR_L; BCTA,GT lbl; LODA,R0 PTR_H; ADDI,R0 1; STRA,R0 PTR_H; lbl:
+              :;
+              :; DO_ERROR convention: LODI,R0 <code>; BCTA,UN DO_ERROR
+              :;   DO_ERROR saves RUNFLG, clears state, then BCTA,UN REPL (kills full RAS).
+              :;
+              :; I/O CONVENTION (Pipbug):
+              :;   Output: load char into R1, then LODZ,R1 (R0=R1) + BSTA,UN COUT
+              :;           OR call BSTA,UN PUTCH with char already in R1 (saves 1 byte per site)
+              :;   Input:  BSTA,UN GETKEY — spins on CHIN until R0 != 0, returns char in R0
+              :;   RDLINE: fills IBUF using GETKEY; echoes via COUT; result in R1 at each step
+              :;
+              :; RAS DEPTH BUDGET:
+              :;   REPL(1) -> STMT_EXEC(2) -> DO_xxx(3) -> PARSE_EXPR(4) -> PARSE_FACTOR(5)
+              :;     -> UPCASE(6)  [max 6 — safe within 8-level hardware RAS]
+              :;   COUT/CHIN are intercepted by sim (or are short ROM calls) — they push
+              :;   one level (BSTA) and pop on return: net depth = caller+1 at call site only.
+
+              :; ─── ASCII ────────────────────────────────────────────────────────────────────
+              :CR      EQU     $0D
+              :LF      EQU     $0A
+              :BS      EQU     $08
+              :SP      EQU     $20
+              :NUL     EQU     $00
+              :DQ      EQU     $22
+
+              :; ─── PIPBUG 1 I/O entry points ────────────────────────────────────────────────
+              :COUT    EQU     $02B4   ; putchar: R0 = char to output
+              :CHIN    EQU     $0286   ; getchar non-blocking: R0=0 if no key
+              :CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
+
+              :; ─── RAM $1400–$1BFF ──────────────────────────────────────────────────────────
+              :IPH     EQU     $1400   ; interpreter pointer hi
+              :IPL     EQU     $1401   ; interpreter pointer lo
+              :PEH     EQU     $1402   ; program end pointer hi
+              :PEL     EQU     $1403   ; program end pointer lo
+              :RUNFLG  EQU     $1404   ; $01=running $00=immediate
+              :GOTOFLG EQU     $1405   ; $01=GOTO/GOSUB pending
+              :GOTOH   EQU     $1406   ; pending target line hi
+              :GOTOL   EQU     $1407   ; pending target line lo
+              :CURH    EQU     $1408   ; current line hi  (error reporting)
+              :CURL    EQU     $1409   ; current line lo
+              :LNUMH   EQU     $140A   ; scratch line number hi
+              :LNUML   EQU     $140B   ; scratch line number lo
+              :SC0     EQU     $140C   ; scratch byte 0
+              :SC1     EQU     $140D   ; scratch byte 1
+              :ERRFLG  EQU     $140E   ; error flag $00=ok
+              :NEGFLG  EQU     $140F   ; sign / CHR$ flag
+              :EXPH    EQU     $1410   ; expression result hi
+              :EXPL    EQU     $1411   ; expression result lo
+              :TMPH    EQU     $1412   ; temp 16-bit hi
+              :TMPL    EQU     $1413   ; temp 16-bit lo
+              :OPSTK   EQU     $1414   ; operator stack [8]  $1414-$141B
+              :VALSH   EQU     $141C   ; value stack hi  [8]  $141C-$1423
+              :VALSL   EQU     $1424   ; value stack lo  [8]  $1424-$142B
+              :STKIDX  EQU     $142C   ; parser stack top ($FF=empty)
+              :SWSP    EQU     $142D   ; SW call stack pointer ($FF=empty)
+              :SWSTK   EQU     $142E   ; SW call stack 8×2 bytes  $142E-$143D
+              :RELOP   EQU     $143E   ; relational op 1-6
+              :IBUF    EQU     $1440   ; input buffer 64 bytes  $1440-$147F
+              :VARS    EQU     $1480   ; A-Z variables 2 bytes each  $1480-$14B3
+              :PROG    EQU     $14C0   ; program store base
+              :PROGLIM EQU     $1C00   ; one past end of program store
+
+              :; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
+0000          :        ORG     $0440
+
+              :; ─── RESET / ENTRY ────────────────────────────────────────────────────────────
+              :RESET:
+0440  04C0    :        LODI,R0 >PROG
+0442  CC1402  :        STRA,R0 PEH
+0445  0414    :        LODI,R0 <PROG
+0447  CC1403  :        STRA,R0 PEL
+044A  04FF    :        LODI,R0 $FF
+044C  CC142D  :        STRA,R0 SWSP
+044F  0400    :        LODI,R0 $00
+0451  CC1404  :        STRA,R0 RUNFLG
+0454  CC1405  :        STRA,R0 GOTOFLG
+              :        ; clear A-Z variables (52 bytes) using IPH:IPL as scratch pointer
+0457  0480    :        LODI,R0 >VARS
+0459  CC1400  :        STRA,R0 IPH
+045C  0414    :        LODI,R0 <VARS
+045E  CC1401  :        STRA,R0 IPL
+0461  0734    :        LODI,R3 $34
+              :CLRV:
+0463  0400    :        LODI,R0 $00
+0465  CC9400  :        STRA,R0 *IPH
+0468  3F143D  :        BSTA,UN INC_IP
+              :CLRV_NC:
+046B  5B76    :        BRNR,R3 CLRV
+046D  04A4    :        LODI,R0 >BANNER
+046F  CC1400  :        STRA,R0 IPH
+0472  0404    :        LODI,R0 <BANNER
+0474  CC1401  :        STRA,R0 IPL
+0477  3F13E2  :        BSTA,UN PRTSTR
+
+              :; ─── REPL ────────────────────────────────────────────────────────────────────
+              :REPL:
+047A  053E    :        LODI,R1 A'>'
+047C  01      :        LODZ,R1
+047D  3F02B4  :        BSTA,UN COUT
+0480  0520    :        LODI,R1 SP
+0482  01      :        LODZ,R1
+0483  3F02B4  :        BSTA,UN COUT
+0486  3F1351  :        BSTA,UN RDLINE
+0489  0440    :        LODI,R0 >IBUF
+048B  CC1400  :        STRA,R0 IPH
+048E  0414    :        LODI,R0 <IBUF
+0490  CC1401  :        STRA,R0 IPL
+0493  3F093D  :        BSTA,UN TRY_STORE_LINE
+0496  0C140E  :        LODA,R0 ERRFLG
+0499  E401    :        COMI,R0 $01
+049B  1C047A  :        BCTA,EQ REPL
+049E  3F04E5  :        BSTA,UN STMT_EXEC
+04A1  1F047A  :        BCTA,UN REPL
+
+              :; ─── TABLES ───────────────────────────────────────────────────────────────────
+              :BANNER:
+04A4  0D0A    :        DB CR, LF
+04A6  754241  :        DB A'u',A'B',A'A',A'S',A'I',A'C',A' ',A'2',A'6',A'5',A'0',A' ',A'v',A'1',A'.',A'0'
+04B6  0D0A00  :        DB CR, LF, NUL
+
+              :; Keyword table: [c1][c2][token]  NUL-terminated.
+              :; Matched on first two uppercase chars; EATWORD skips the rest.
+              :; Token 11 (THEN) matched internally by DO_IF — not dispatched here.
+              :KW_TAB:
+04B9  505201  :        DB A'P',A'R', 1   ; PRINT / PR
+04BC  4C4502  :        DB A'L',A'E', 2   ; LET   / LE
+04BF  4C4903  :        DB A'L',A'I', 3   ; LIST  / LI
+04C2  524504  :        DB A'R',A'E', 4   ; REM   / RE
+04C5  525505  :        DB A'R',A'U', 5   ; RUN   / RU
+04C8  454E06  :        DB A'E',A'N', 6   ; END   / EN
+04CB  494E07  :        DB A'I',A'N', 7   ; INPUT / IN
+04CE  494608  :        DB A'I',A'F', 8   ; IF
+04D1  4E4509  :        DB A'N',A'E', 9   ; NEW   / NE
+04D4  474F0A  :        DB A'G',A'O',10   ; GOTO  / GO
+04D7  504F0C  :        DB A'P',A'O',12   ; POKE  / PO
+04DA  00      :        DB NUL
+
+              :; Divisor table for PRINT_S16: big-endian pairs, sentinel $0000
+              :DIVTAB:
+04DB  2710    :        DB $27,$10      ; 10000
+04DD  03E8    :        DB $03,$E8      ;  1000
+04DF  0064    :        DB $00,$64      ;   100
+04E1  000A    :        DB $00,$0A      ;    10
+04E3  0000    :        DB $00,$00      ; sentinel
+
+              :; ─── STMT_EXEC ────────────────────────────────────────────────────────────────
+              :; Decode and dispatch one statement from IP.
+              :; RAS depth: 1 from REPL, or 3 from DO_IF (THEN body).
+              :; Worst inner depth from here: +4 (->DO_xxx->PARSE_EXPR->PARSE_FACTOR->UPCASE)
+              :STMT_EXEC:
+04E5  3F13F8  :        BSTA,UN WSKIP                   ; [+1]
+04E8  0C9400  :        LODA,R0 *IPH
+04EB  E400    :        COMI,R0 NUL
+04ED  1C0592  :        BCTA,EQ SE_RET  ; blank line
+
+04F0  3F1407  :        BSTA,UN GETCI_UC
+04F3  CC140C  :        STRA,R0 SC0  ; [+1] char1 uppercase, IP advanced
+04F6  3F1407  :        BSTA,UN GETCI_UC
+04F9  CC140D  :        STRA,R0 SC1  ; [+1] char2 uppercase, IP advanced
+
+              :        ; scan KW_TAB with TMPH:TMPL as pointer
+04FC  04B9    :        LODI,R0 >KW_TAB
+04FE  CC1412  :        STRA,R0 TMPH
+0501  0404    :        LODI,R0 <KW_TAB
+0503  CC1413  :        STRA,R0 TMPL
+              :SE_SCAN:
+0506  0C9412  :        LODA,R0 *TMPH
+0509  E400    :        COMI,R0 NUL
+050B  1C058D  :        BCTA,EQ SE_SYNERR  ; end of table
+050E  AC140C  :        SUBA,R0 SC0
+0511  1C052A  :        BCTA,EQ SE_CHK2  ; c1 matches
+              :        ; advance 3 bytes to next entry
+0514  0C1413  :        LODA,R0 TMPL
+0517  8403    :        ADDI,R0 3
+0519  CC1413  :        STRA,R0 TMPL
+051C  1D0506  :        BCTA,GT SE_SCAN
+051F  0C1412  :        LODA,R0 TMPH
+0522  8401    :        ADDI,R0 1
+0524  CC1412  :        STRA,R0 TMPH
+0527  1F0506  :        BCTA,UN SE_SCAN
+              :SE_CHK2:
+              :        ; advance to c2
+052A  3F1451  :        BSTA,UN INC_TMP
+              :SE_C2N:
+052D  0C9412  :        LODA,R0 *TMPH
+0530  AC140D  :        SUBA,R0 SC1
+0533  1C054C  :        BCTA,EQ SE_MATCH
+              :        ; c2 mismatch: advance 2 more bytes to next entry
+0536  0C1413  :        LODA,R0 TMPL
+0539  8402    :        ADDI,R0 2
+053B  CC1413  :        STRA,R0 TMPL
+053E  1D0506  :        BCTA,GT SE_SCAN
+0541  0C1412  :        LODA,R0 TMPH
+0544  8401    :        ADDI,R0 1
+0546  CC1412  :        STRA,R0 TMPH
+0549  1F0506  :        BCTA,UN SE_SCAN
+              :SE_MATCH:
+              :        ; advance to token byte
+054C  3F1451  :        BSTA,UN INC_TMP
+              :SE_TN:
+054F  0C9412  :        LODA,R0 *TMPH
+0552  CC140C  :        STRA,R0 SC0  ; SC0 = token id
+0555  3F1421  :        BSTA,UN EATWORD                  ; [+1] consume remaining alpha chars
+
+              :        ; dispatch
+0558  0C140C  :        LODA,R0 SC0
+055B  E401    :        COMI,R0  1
+055D  1C05AE  :        BCTA,EQ DO_PRINT
+0560  E402    :        COMI,R0  2
+0562  1C0630  :        BCTA,EQ DO_LET
+0565  E403    :        COMI,R0  3
+0567  1C0811  :        BCTA,EQ DO_LIST
+056A  E404    :        COMI,R0  4
+056C  1C0593  :        BCTA,EQ DO_REM
+056F  E405    :        COMI,R0  5
+0571  1C0875  :        BCTA,EQ DO_RUN
+0574  E406    :        COMI,R0  6
+0576  1C0594  :        BCTA,EQ DO_END
+0579  E407    :        COMI,R0  7
+057B  1C069C  :        BCTA,EQ DO_INPUT
+057E  E408    :        COMI,R0  8
+0580  1C06E3  :        BCTA,EQ DO_IF
+0583  E409    :        COMI,R0  9
+0585  1C05A3  :        BCTA,EQ DO_NEW
+0588  E40A    :        COMI,R0 10
+058A  1C07E2  :        BCTA,EQ DO_GOTO
+              :SE_SYNERR:
+058D  0400    :        LODI,R0 0
+058F  1F148D  :        BCTA,UN DO_ERROR
+              :SE_RET:
+0592  17      :        RETC,UN
+
+              :; ─── SIMPLE STATEMENTS ────────────────────────────────────────────────────────
+              :DO_REM:
+0593  17      :        RETC,UN
+
+              :DO_END:
+0594  0C1404  :        LODA,R0 RUNFLG
+0597  E400    :        COMI,R0 $00
+0599  1C05A2  :        BCTA,EQ DE_HALT
+059C  0400    :        LODI,R0 $00
+059E  CC1404  :        STRA,R0 RUNFLG
+05A1  17      :        RETC,UN
+              :DE_HALT:
+05A2  40      :        HALT
+
+              :DO_NEW:
+05A3  04C0    :        LODI,R0 >PROG
+05A5  CC1402  :        STRA,R0 PEH
+05A8  0414    :        LODI,R0 <PROG
+05AA  CC1403  :        STRA,R0 PEL
+05AD  17      :        RETC,UN
+
+              :; ─── DO_PRINT ─────────────────────────────────────────────────────────────────
+              :; PRINT [item {, item}]    item = "string" | expr
+              :; CHR$ flag: NEGFLG=$01 after PARSE_FACTOR detects CHR$ — print EXPL as char.
+              :DO_PRINT:
+05AE  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+05B1  0C9400  :        LODA,R0 *IPH
+05B4  E400    :        COMI,R0 NUL
+05B6  1C0623  :        BCTA,EQ DP_NL
+
+              :DP_ITEM:
+05B9  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+05BC  0C9400  :        LODA,R0 *IPH
+05BF  E422    :        COMI,R0 DQ
+05C1  1C05F2  :        BCTA,EQ DP_STRING
+05C4  0400    :        LODI,R0 $00
+05C6  CC140F  :        STRA,R0 NEGFLG  ; clear CHR$ flag before parse
+05C9  3F0C4D  :        BSTA,UN PARSE_EXPR               ; [+1]
+05CC  0C140E  :        LODA,R0 ERRFLG
+05CF  E400    :        COMI,R0 $00
+05D1  1C05DA  :        BCTA,EQ DP_NUM
+05D4  3F13F5  :        BSTA,UN PRTSTR_IP
+05D7  1F0623  :        BCTA,UN DP_NL  ; [+1] raw text fallback
+              :DP_NUM:
+05DA  0C140F  :        LODA,R0 NEGFLG
+05DD  E401    :        COMI,R0 $01
+05DF  1C05E8  :        BCTA,EQ DP_CHAR
+05E2  3F1281  :        BSTA,UN PRINT_S16
+05E5  1F060F  :        BCTA,UN DP_SEP  ; [+1]
+              :DP_CHAR:
+05E8  0D1411  :        LODA,R1 EXPL
+05EB  01      :        LODZ,R1
+05EC  3F02B4  :        BSTA,UN COUT
+05EF  1F060F  :        BCTA,UN DP_SEP
+
+              :DP_STRING:
+              :        ; consume opening "
+05F2  3F143D  :        BSTA,UN INC_IP
+              :DP_SLP:
+05F5  0D9400  :        LODA,R1 *IPH
+05F8  E500    :        COMI,R1 NUL
+05FA  1C060F  :        BCTA,EQ DP_SDONE
+05FD  E522    :        COMI,R1 DQ
+05FF  1C060C  :        BCTA,EQ DP_SCLS
+0602  01      :        LODZ,R1
+0603  3F02B4  :        BSTA,UN COUT
+0606  3F143D  :        BSTA,UN INC_IP
+0609  1F05F5  :        BCTA,UN DP_SLP
+              :DP_SCLS:
+              :        ; consume closing "
+060C  3F143D  :        BSTA,UN INC_IP
+              :DP_SDONE:
+              :DP_SEP:
+060F  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0612  0C9400  :        LODA,R0 *IPH
+0615  E42C    :        COMI,R0 A','
+0617  1C061D  :        BCTA,EQ DP_COMMA
+061A  1F0623  :        BCTA,UN DP_NL
+              :DP_COMMA:
+061D  3F143D  :        BSTA,UN INC_IP
+0620  1F05B9  :        BCTA,UN DP_ITEM
+              :DP_NL:
+0623  050D    :        LODI,R1 CR
+0625  01      :        LODZ,R1
+0626  3F02B4  :        BSTA,UN COUT
+0629  050A    :        LODI,R1 LF
+062B  01      :        LODZ,R1
+062C  3F02B4  :        BSTA,UN COUT
+062F  17      :        RETC,UN
+
+              :; ─── DO_LET / shared store path ───────────────────────────────────────────────
+              :; DO_INPUT jumps to DL_STORE with SC0 = variable letter already set.
+              :DO_LET:
+0630  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0633  0C9400  :        LODA,R0 *IPH
+0636  3F1411  :        BSTA,UN UPCASE  ; [+1]
+0639  E441    :        COMI,R0 A'A'
+063B  1E0643  :        BCTA,LT DL_ERR
+063E  E45B    :        COMI,R0 A'Z'+1
+0640  1E0648  :        BCTA,LT DL_VAROK
+              :DL_ERR:
+0643  0404    :        LODI,R0 4
+0645  1F148D  :        BCTA,UN DO_ERROR
+              :DL_VAROK:
+0648  CC140C  :        STRA,R0 SC0                      ; save variable letter
+064B  3F143D  :        BSTA,UN INC_IP
+              :DL_EQ:
+064E  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0651  0C9400  :        LODA,R0 *IPH
+0654  E43D    :        COMI,R0 A'='
+0656  1C065E  :        BCTA,EQ DL_EQC
+0659  0400    :        LODI,R0 0
+065B  1F148D  :        BCTA,UN DO_ERROR
+              :DL_EQC:
+065E  3F143D  :        BSTA,UN INC_IP
+              :DL_EX:
+0661  3F0C4D  :        BSTA,UN PARSE_EXPR               ; [+1]
+0664  0C140E  :        LODA,R0 ERRFLG
+0667  E400    :        COMI,R0 $00
+0669  1C0671  :        BCTA,EQ DL_STORE
+066C  0400    :        LODI,R0 0
+066E  1F148D  :        BCTA,UN DO_ERROR
+              :DL_STORE:
+              :        ; address = VARS + (SC0 - 'A') * 2
+0671  0C140C  :        LODA,R0 SC0
+0674  A441    :        SUBI,R0 A'A'  ; 0-25
+0676  CC140D  :        STRA,R0 SC1
+0679  8C140D  :        ADDA,R0 SC1  ; *2  (SC1 = index, R0 = index*2)
+067C  0514    :        LODI,R1 <VARS
+067E  81      :        ADDZ,R1
+067F  CC1413  :        STRA,R0 TMPL
+0682  0480    :        LODI,R0 >VARS
+0684  1D0689  :        BCTA,GT DL_NC
+0687  8401    :        ADDI,R0 1
+              :DL_NC:
+0689  CC1412  :        STRA,R0 TMPH
+068C  0C1410  :        LODA,R0 EXPH
+068F  CC9412  :        STRA,R0 *TMPH  ; store hi
+0692  3F1451  :        BSTA,UN INC_TMP
+              :DL_NC2:
+0695  0C1411  :        LODA,R0 EXPL
+0698  CC9412  :        STRA,R0 *TMPH  ; store lo
+069B  17      :        RETC,UN
+
+              :; ─── DO_INPUT ─────────────────────────────────────────────────────────────────
+              :DO_INPUT:
+069C  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+069F  0C9400  :        LODA,R0 *IPH
+06A2  3F1411  :        BSTA,UN UPCASE  ; [+1]
+06A5  E441    :        COMI,R0 A'A'
+06A7  1E06AF  :        BCTA,LT DIN_ERR
+06AA  E45B    :        COMI,R0 A'Z'+1
+06AC  1E06B4  :        BCTA,LT DIN_VAROK
+              :DIN_ERR:
+06AF  0404    :        LODI,R0 4
+06B1  1F148D  :        BCTA,UN DO_ERROR
+              :DIN_VAROK:
+06B4  CC140C  :        STRA,R0 SC0                      ; save variable letter
+06B7  3F143D  :        BSTA,UN INC_IP
+              :DIN_PR:
+06BA  053F    :        LODI,R1 A'?'
+06BC  01      :        LODZ,R1
+06BD  3F02B4  :        BSTA,UN COUT
+06C0  0520    :        LODI,R1 SP
+06C2  01      :        LODZ,R1
+06C3  3F02B4  :        BSTA,UN COUT
+06C6  3F1351  :        BSTA,UN RDLINE                   ; [+1]
+06C9  0440    :        LODI,R0 >IBUF
+06CB  CC1400  :        STRA,R0 IPH
+06CE  0414    :        LODI,R0 <IBUF
+06D0  CC1401  :        STRA,R0 IPL
+06D3  3F0FFF  :        BSTA,UN PARSE_S16                ; [+1]
+06D6  0C140E  :        LODA,R0 ERRFLG
+06D9  E400    :        COMI,R0 $00
+06DB  1C0671  :        BCTA,EQ DL_STORE
+06DE  0400    :        LODI,R0 0
+06E0  1F148D  :        BCTA,UN DO_ERROR
+
+              :; ─── DO_IF ────────────────────────────────────────────────────────────────────
+              :; IF expr relop expr THEN stmt
+              :; Depth at entry: 2 (from REPL->STMT_EXEC) or 4 (from REPL->STMT_EXEC->DO_IF->STMT_EXEC->here)
+              :; After THEN: calls STMT_EXEC at +1, which can call DO_xxx at +1, PARSE_EXPR at +1,
+              :;             PARSE_FACTOR at +1 → max total 2+1+1+1+1+1 = depth 7 OK.
+              :DO_IF:
+06E3  3F0C4D  :        BSTA,UN PARSE_EXPR               ; [+1]
+06E6  0C140E  :        LODA,R0 ERRFLG
+06E9  E400    :        COMI,R0 $00
+06EB  1C06F3  :        BCTA,EQ DIF_LS
+06EE  0400    :        LODI,R0 0
+06F0  1F148D  :        BCTA,UN DO_ERROR
+              :DIF_LS:
+06F3  0C1410  :        LODA,R0 EXPH
+06F6  CC1412  :        STRA,R0 TMPH  ; save left in TMPH:TMPL
+06F9  0C1411  :        LODA,R0 EXPL
+06FC  CC1413  :        STRA,R0 TMPL
+06FF  3F0F75  :        BSTA,UN PARSE_RELOP              ; [+1]
+0702  0C140E  :        LODA,R0 ERRFLG
+0705  E400    :        COMI,R0 $00
+0707  1C070F  :        BCTA,EQ DIF_RP
+070A  0400    :        LODI,R0 0
+070C  1F148D  :        BCTA,UN DO_ERROR
+              :DIF_RP:
+070F  3F0C4D  :        BSTA,UN PARSE_EXPR               ; [+1]
+0712  0C140E  :        LODA,R0 ERRFLG
+0715  E400    :        COMI,R0 $00
+0717  1C071F  :        BCTA,EQ DIF_EVAL
+071A  0400    :        LODI,R0 0
+071C  1F148D  :        BCTA,UN DO_ERROR
+              :DIF_EVAL:
+              :        ; signed 16-bit compare: TMPH:TMPL (left) vs EXPH:EXPL (right)
+              :        ; bias hi bytes by XOR $80 → unsigned compare
+071F  0C1412  :        LODA,R0 TMPH
+0722  2480    :        EORI,R0 $80
+0724  CC140C  :        STRA,R0 SC0
+0727  0C1410  :        LODA,R0 EXPH
+072A  2480    :        EORI,R0 $80
+072C  AC140C  :        SUBA,R0 SC0             ; biased right.hi - biased left.hi
+072F  1E0749  :        BCTA,LT DIF_LT
+0732  1D0751  :        BCTA,GT DIF_GT
+              :        ; hi bytes equal: compare lo (unsigned)
+0735  0C1411  :        LODA,R0 EXPL
+0738  AC1413  :        SUBA,R0 TMPL
+073B  1E0749  :        BCTA,LT DIF_LT
+073E  1D0751  :        BCTA,GT DIF_GT
+0741  0400    :        LODI,R0 $00
+0743  CC140D  :        STRA,R0 SC1
+0746  1F0756  :        BCTA,UN DIF_TH  ; EQ
+              :DIF_LT:
+0749  04FF    :        LODI,R0 $FF
+074B  CC140D  :        STRA,R0 SC1
+074E  1F0756  :        BCTA,UN DIF_TH  ; LT
+              :DIF_GT:
+0751  0401    :        LODI,R0 $01
+0753  CC140D  :        STRA,R0 SC1  ; GT
+
+              :DIF_TH:
+              :        ; consume THEN keyword: expect T then H then EATWORD
+0756  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0759  3F1407  :        BSTA,UN GETCI_UC                 ; [+1]  must be A'T'
+075C  E454    :        COMI,R0 A'T'
+075E  1C0766  :        BCTA,EQ DIF_TH2
+0761  0400    :        LODI,R0 0
+0763  1F148D  :        BCTA,UN DO_ERROR
+              :DIF_TH2:
+0766  3F1407  :        BSTA,UN GETCI_UC                 ; [+1]  must be A'H'
+0769  E448    :        COMI,R0 A'H'
+076B  1C0773  :        BCTA,EQ DIF_EW
+076E  0400    :        LODI,R0 0
+0770  1F148D  :        BCTA,UN DO_ERROR
+              :DIF_EW:
+0773  3F1421  :        BSTA,UN EATWORD                  ; [+1]
+
+              :        ; test condition using SC1 ($FF=LT $00=EQ $01=GT) vs RELOP
+0776  0C143E  :        LODA,R0 RELOP
+0779  E401    :        COMI,R0 1
+077B  1C079C  :        BCTA,EQ DIF_CEQ  ; =
+077E  E402    :        COMI,R0 2
+0780  1C07A7  :        BCTA,EQ DIF_CNE  ; <>
+0783  E403    :        COMI,R0 3
+0785  1C07B2  :        BCTA,EQ DIF_CLT  ; <
+0788  E404    :        COMI,R0 4
+078A  1C07BD  :        BCTA,EQ DIF_CGT  ; >
+078D  E405    :        COMI,R0 5
+078F  1C07C8  :        BCTA,EQ DIF_CLE  ; <=
+0792  E406    :        COMI,R0 6
+0794  1C07D3  :        BCTA,EQ DIF_CGE  ; >=
+0797  0400    :        LODI,R0 0
+0799  1F148D  :        BCTA,UN DO_ERROR
+
+079C  0C140D  :DIF_CEQ: LODA,R0 SC1
+079F  E400    :        COMI,R0 $00
+07A1  1C07DE  :        BCTA,EQ DIF_TRUE
+07A4  1F07E1  :        BCTA,UN DIF_FALSE
+07A7  0C140D  :DIF_CNE: LODA,R0 SC1
+07AA  E400    :        COMI,R0 $00
+07AC  9C07DE  :        BCFA,EQ DIF_TRUE
+07AF  1F07E1  :        BCTA,UN DIF_FALSE
+07B2  0C140D  :DIF_CLT: LODA,R0 SC1
+07B5  E4FF    :        COMI,R0 $FF
+07B7  1C07DE  :        BCTA,EQ DIF_TRUE
+07BA  1F07E1  :        BCTA,UN DIF_FALSE
+07BD  0C140D  :DIF_CGT: LODA,R0 SC1
+07C0  E401    :        COMI,R0 $01
+07C2  1C07DE  :        BCTA,EQ DIF_TRUE
+07C5  1F07E1  :        BCTA,UN DIF_FALSE
+07C8  0C140D  :DIF_CLE: LODA,R0 SC1
+07CB  E401    :        COMI,R0 $01
+07CD  9C07DE  :        BCFA,EQ DIF_TRUE
+07D0  1F07E1  :        BCTA,UN DIF_FALSE
+07D3  0C140D  :DIF_CGE: LODA,R0 SC1
+07D6  E4FF    :        COMI,R0 $FF
+07D8  9C07DE  :        BCFA,EQ DIF_TRUE
+07DB  1F07E1  :        BCTA,UN DIF_FALSE
+
+              :DIF_TRUE:
+07DE  3F04E5  :        BSTA,UN STMT_EXEC                ; [+1]  execute THEN body
+              :DIF_FALSE:
+07E1  17      :        RETC,UN
+
+              :; ─── DO_GOTO ──────────────────────────────────────────────────────────────────
+              :DO_GOTO:
+07E2  3F1042  :        BSTA,UN PARSE_U16                ; [+1]
+07E5  0C140E  :        LODA,R0 ERRFLG
+07E8  E400    :        COMI,R0 $00
+07EA  1C07F2  :        BCTA,EQ DG_OK
+07ED  0400    :        LODI,R0 0
+07EF  1F148D  :        BCTA,UN DO_ERROR
+              :DG_OK:
+07F2  0C1410  :        LODA,R0 EXPH
+07F5  CC1406  :        STRA,R0 GOTOH
+07F8  0C1411  :        LODA,R0 EXPL
+07FB  CC1407  :        STRA,R0 GOTOL
+07FE  0401    :        LODI,R0 $01
+0800  CC1405  :        STRA,R0 GOTOFLG
+0803  0C1404  :        LODA,R0 RUNFLG
+0806  E401    :        COMI,R0 $01
+0808  1C0810  :        BCTA,EQ DG_RET
+080B  0401    :        LODI,R0 $01
+080D  CC1404  :        STRA,R0 RUNFLG  ; start run if in immediate mode
+              :DG_RET:
+0810  17      :        RETC,UN
+
+              :; ─── DO_GOSUB / SRET / DO_RETURN ──────────────────────────────────────────────
+              :; SW call stack stores the *next-line pointer* (TMPH:TMPL value in DO_RUN
+              :; just after the executing line — i.e. the line after the GOSUB).
+              :; DO_RUN saves this in SC0:SC1 before calling STMT_EXEC.
+              :; DO_GOSUB reads SC0:SC1 and pushes to SWSTK[SWSP].
+              :DO_LIST:
+0811  04C0    :        LODI,R0 >PROG
+0813  CC1412  :        STRA,R0 TMPH
+0816  0414    :        LODI,R0 <PROG
+0818  CC1413  :        STRA,R0 TMPL
+              :DLS_LP:
+081B  0C1412  :        LODA,R0 TMPH
+081E  AC1402  :        SUBA,R0 PEH
+0821  1D0874  :        BCTA,GT DLS_RET
+0824  1E0833  :        BCTA,LT DLS_BODY
+0827  0C1413  :        LODA,R0 TMPL
+082A  AC1403  :        SUBA,R0 PEL
+082D  1E0833  :        BCTA,LT DLS_BODY
+0830  1F0874  :        BCTA,UN DLS_RET
+              :DLS_BODY:
+              :        ; line number hi:lo
+0833  0C9412  :        LODA,R0 *TMPH
+0836  CC1410  :        STRA,R0 EXPH
+0839  3F1451  :        BSTA,UN INC_TMP
+              :DLS_N1:
+083C  0C9412  :        LODA,R0 *TMPH
+083F  CC1411  :        STRA,R0 EXPL
+0842  3F1451  :        BSTA,UN INC_TMP
+              :DLS_N2:
+0845  3F1281  :        BSTA,UN PRINT_S16                ; [+1]
+0848  0520    :        LODI,R1 SP
+084A  01      :        LODZ,R1
+084B  3F02B4  :        BSTA,UN COUT
+              :        ; body length into R3
+084E  0F9412  :        LODA,R3 *TMPH
+0851  3F1451  :        BSTA,UN INC_TMP
+              :DLS_N3:
+0854  E700    :        COMI,R3 $00
+0856  1C0865  :        BCTA,EQ DLS_NL
+              :DLS_BLPX:
+0859  0D9412  :        LODA,R1 *TMPH
+085C  01      :        LODZ,R1
+085D  3F02B4  :        BSTA,UN COUT
+0860  3F1451  :        BSTA,UN INC_TMP
+              :DLS_BNC:
+0863  5B74    :        BRNR,R3 DLS_BLPX
+              :DLS_NL:
+0865  050D    :        LODI,R1 CR
+0867  01      :        LODZ,R1
+0868  3F02B4  :        BSTA,UN COUT
+086B  050A    :        LODI,R1 LF
+086D  01      :        LODZ,R1
+086E  3F02B4  :        BSTA,UN COUT
+0871  1F081B  :        BCTA,UN DLS_LP
+              :DLS_RET:
+0874  17      :        RETC,UN
+
+              :; ─── DO_RUN ───────────────────────────────────────────────────────────────────
+              :; Executes stored lines sequentially, honouring GOTOFLG for GOTO/GOSUB/RETURN.
+              :; SC0:SC1 = next-line-pointer saved BEFORE STMT_EXEC so DO_GOSUB can read it.
+              :DO_RUN:
+0875  0401    :        LODI,R0 $01
+0877  CC1404  :        STRA,R0 RUNFLG
+087A  0400    :        LODI,R0 $00
+087C  CC1405  :        STRA,R0 GOTOFLG
+087F  04C0    :        LODI,R0 >PROG
+0881  CC1412  :        STRA,R0 TMPH
+0884  0414    :        LODI,R0 <PROG
+0886  CC1413  :        STRA,R0 TMPL
+              :DR_LP:
+0889  0C1404  :        LODA,R0 RUNFLG
+088C  E400    :        COMI,R0 $00
+088E  1C093C  :        BCTA,EQ DR_RET
+              :        ; end of program?
+0891  0C1412  :        LODA,R0 TMPH
+0894  AC1402  :        SUBA,R0 PEH
+0897  1D0937  :        BCTA,GT DR_STOP
+089A  1E08A9  :        BCTA,LT DR_EXEC
+089D  0C1413  :        LODA,R0 TMPL
+08A0  AC1403  :        SUBA,R0 PEL
+08A3  1E08A9  :        BCTA,LT DR_EXEC
+08A6  1F0937  :        BCTA,UN DR_STOP
+              :DR_EXEC:
+              :        ; save line number for error reporting
+08A9  0C9412  :        LODA,R0 *TMPH
+08AC  CC1408  :        STRA,R0 CURH
+08AF  3F1451  :        BSTA,UN INC_TMP
+              :DR_N1:
+08B2  0C9412  :        LODA,R0 *TMPH
+08B5  CC1409  :        STRA,R0 CURL
+08B8  3F1451  :        BSTA,UN INC_TMP
+              :DR_N2:
+              :        ; body length into R3
+08BB  0F9412  :        LODA,R3 *TMPH
+08BE  3F1451  :        BSTA,UN INC_TMP
+              :DR_N3:
+              :        ; copy body to IBUF
+08C1  0440    :        LODI,R0 >IBUF
+08C3  CC1400  :        STRA,R0 IPH
+08C6  0414    :        LODI,R0 <IBUF
+08C8  CC1401  :        STRA,R0 IPL
+08CB  E700    :        COMI,R3 $00
+08CD  1C08DE  :        BCTA,EQ DR_CD
+              :DR_CPY:
+08D0  0D9412  :        LODA,R1 *TMPH
+08D3  CD9400  :        STRA,R1 *IPH
+08D6  3F1451  :        BSTA,UN INC_TMP
+              :DR_TNC:
+08D9  3F143D  :        BSTA,UN INC_IP
+              :DR_INC:
+08DC  5B72    :        BRNR,R3 DR_CPY
+              :DR_CD:
+08DE  0500    :        LODI,R1 NUL
+08E0  CD9400  :        STRA,R1 *IPH  ; NUL-terminate
+              :        ; save next-line pointer in SC0:SC1 BEFORE executing
+              :        ; (DO_GOSUB reads SC0:SC1 to know return address)
+08E3  0C1412  :        LODA,R0 TMPH
+08E6  CC140C  :        STRA,R0 SC0
+08E9  0C1413  :        LODA,R0 TMPL
+08EC  CC140D  :        STRA,R0 SC1
+              :        ; execute line
+08EF  0440    :        LODI,R0 >IBUF
+08F1  CC1400  :        STRA,R0 IPH
+08F4  0414    :        LODI,R0 <IBUF
+08F6  CC1401  :        STRA,R0 IPL
+08F9  3F04E5  :        BSTA,UN STMT_EXEC                ; [+1]
+              :        ; check GOTO/GOSUB/RETURN flag
+08FC  0C1405  :        LODA,R0 GOTOFLG
+08FF  E401    :        COMI,R0 $01
+0901  1C0913  :        BCTA,EQ DR_GOTO
+              :        ; advance: restore next-line pointer from SC0:SC1
+0904  0C140C  :        LODA,R0 SC0
+0907  CC1412  :        STRA,R0 TMPH
+090A  0C140D  :        LODA,R0 SC1
+090D  CC1413  :        STRA,R0 TMPL
+0910  1F0889  :        BCTA,UN DR_LP
+              :DR_GOTO:
+0913  0400    :        LODI,R0 $00
+0915  CC1405  :        STRA,R0 GOTOFLG
+0918  0C1406  :        LODA,R0 GOTOH
+091B  CC140A  :        STRA,R0 LNUMH
+091E  0C1407  :        LODA,R0 GOTOL
+0921  CC140B  :        STRA,R0 LNUML
+0924  3F0B5A  :        BSTA,UN FIND_LINE                ; [+1]
+0927  0C140E  :        LODA,R0 ERRFLG
+092A  E400    :        COMI,R0 $00
+092C  1C0889  :        BCTA,EQ DR_LP
+092F  0401    :        LODI,R0 1
+0931  3F148D  :        BSTA,UN DO_ERROR  ; [+1] undefined line — returns to REPL
+0934  1F0889  :        BCTA,UN DR_LP
+              :DR_STOP:
+0937  0400    :        LODI,R0 $00
+0939  CC1404  :        STRA,R0 RUNFLG
+              :DR_RET:
+093C  17      :        RETC,UN
+
+              :; ─── TRY_STORE_LINE ───────────────────────────────────────────────────────────
+              :; If IP starts with a digit, parse and store/delete the numbered line.
+              :; Returns ERRFLG=$01 if handled as a numbered line, $00 if immediate.
+              :TRY_STORE_LINE:
+093D  0400    :        LODI,R0 $00
+093F  CC140E  :        STRA,R0 ERRFLG
+0942  0C9400  :        LODA,R0 *IPH
+0945  E430    :        COMI,R0 A'0'
+0947  1E094F  :        BCTA,LT TSL_RET
+094A  E43A    :        COMI,R0 A'9'+1
+094C  1E0950  :        BCTA,LT TSL_NUM
+              :TSL_RET:
+094F  17      :        RETC,UN
+              :TSL_NUM:
+0950  3F1042  :        BSTA,UN PARSE_U16                ; [+1]
+0953  0C140E  :        LODA,R0 ERRFLG
+0956  E400    :        COMI,R0 $00
+0958  1C095E  :        BCTA,EQ TSL_GOT
+095B  1F094F  :        BCTA,UN TSL_RET
+              :TSL_GOT:
+              :        ; validate 1..32767
+095E  0C1410  :        LODA,R0 EXPH
+0961  E480    :        COMI,R0 $80
+0963  1E096C  :        BCTA,LT TSL_RNG
+0966  0401    :        LODI,R0 $01
+0968  CC140E  :        STRA,R0 ERRFLG
+096B  17      :        RETC,UN  ; >=32768 silently ignore
+              :TSL_RNG:
+096C  0C1410  :        LODA,R0 EXPH
+096F  E400    :        COMI,R0 $00
+0971  1D097C  :        BCTA,GT TSL_NZ
+0974  0C1411  :        LODA,R0 EXPL
+0977  E400    :        COMI,R0 $00
+0979  1C09A2  :        BCTA,EQ TSL_RET2  ; line 0 invalid
+              :TSL_NZ:
+097C  0C1410  :        LODA,R0 EXPH
+097F  CC140A  :        STRA,R0 LNUMH
+0982  0C1411  :        LODA,R0 EXPL
+0985  CC140B  :        STRA,R0 LNUML
+0988  3F13F8  :        BSTA,UN WSKIP                    ; [+1]  skip space after line number
+098B  0C9400  :        LODA,R0 *IPH
+098E  E400    :        COMI,R0 NUL
+0990  1C0999  :        BCTA,EQ TSL_DEL
+0993  3F09A3  :        BSTA,UN STORE_LINE               ; [+1]
+0996  1F099C  :        BCTA,UN TSL_DONE
+              :TSL_DEL:
+0999  3F0ADC  :        BSTA,UN DELETE_LINE              ; [+1]
+              :TSL_DONE:
+099C  0401    :        LODI,R0 $01
+099E  CC140E  :        STRA,R0 ERRFLG
+09A1  17      :        RETC,UN
+              :TSL_RET2:
+09A2  17      :        RETC,UN
+
+              :; ─── STORE_LINE ───────────────────────────────────────────────────────────────
+              :; Insert line LNUMH:LNUML with body at IP into program store (sorted).
+              :; Record format: [linehi][linelo][bodylen][body...]
+              :; Strategy: delete existing line, measure body, check space, find insertion
+              :;           point (EXPH:EXPL), shift existing records up, write new record.
+              :STORE_LINE:
+09A3  3F0ADC  :        BSTA,UN DELETE_LINE              ; [+1]  remove if exists
+
+              :        ; measure body length: walk from IP to NUL, count in R3
+09A6  0C1400  :        LODA,R0 IPH
+09A9  CC1412  :        STRA,R0 TMPH
+09AC  0C1401  :        LODA,R0 IPL
+09AF  CC1413  :        STRA,R0 TMPL  ; TMPH:TMPL = body start (save for write)
+09B2  0700    :        LODI,R3 0
+              :SL_MEAS:
+09B4  0C9412  :        LODA,R0 *TMPH
+09B7  E400    :        COMI,R0 NUL
+09B9  1C09C1  :        BCTA,EQ SL_MEASD
+09BC  3F1451  :        BSTA,UN INC_TMP
+              :SL_MNC:
+09BF  DB73    :        BIRR,R3 SL_MEAS         ; R3++ then always branch (counts: 0→1→2...)
+              :SL_MEASD:
+              :        ; R3 = body length.  SC0 = body len.  SC1 = record size = 3 + R3.
+09C1  CF140C  :        STRA,R3 SC0
+09C4  0C140C  :        LODA,R0 SC0
+09C7  8403    :        ADDI,R0 3
+09C9  CC140D  :        STRA,R0 SC1
+
+              :        ; check free space: PROGLIM - PE >= SC1
+09CC  041C    :        LODI,R0 <PROGLIM
+09CE  AC1403  :        SUBA,R0 PEL
+09D1  CC1413  :        STRA,R0 TMPL
+09D4  0400    :        LODI,R0 >PROGLIM
+09D6  AC1402  :        SUBA,R0 PEH
+09D9  9E09DE  :        BCFA,LT SL_NBC
+09DC  A401    :        SUBI,R0 1  ; borrow skip: BCFA,LT
+              :SL_NBC:
+09DE  CC1412  :        STRA,R0 TMPH            ; TMPH:TMPL = free bytes
+09E1  0C1412  :        LODA,R0 TMPH
+09E4  E400    :        COMI,R0 $00
+09E6  1D09F7  :        BCTA,GT SL_ROOM
+09E9  0C1413  :        LODA,R0 TMPL
+09EC  AC140D  :        SUBA,R0 SC1
+09EF  9E09F7  :        BCFA,LT SL_ROOM  ; free >= needed?
+09F2  0403    :        LODI,R0 3
+09F4  1F148D  :        BCTA,UN DO_ERROR  ; out of memory
+
+              :SL_ROOM:
+              :        ; find sorted insertion point → EXPH:EXPL
+09F7  3F0BD9  :        BSTA,UN FIND_INS                 ; [+1]  sets TMPH:TMPL
+              :        ; save insertion point in EXPH:EXPL (TMPH:TMPL will be used as walk pointer)
+09FA  0C1412  :        LODA,R0 TMPH
+09FD  CC1410  :        STRA,R0 EXPH
+0A00  0C1413  :        LODA,R0 TMPL
+0A03  CC1411  :        STRA,R0 EXPL
+
+              :        ; shift bytes PE-1 down to EXPH:EXPL upward by SC1 positions (backwards copy)
+              :        ; shift count = PE - EXPH:EXPL
+0A06  0C1403  :        LODA,R0 PEL
+0A09  AC1411  :        SUBA,R0 EXPL
+0A0C  CC1413  :        STRA,R0 TMPL
+0A0F  0C1402  :        LODA,R0 PEH
+0A12  AC1410  :        SUBA,R0 EXPH
+0A15  9E0A1A  :        BCFA,LT SL_SHCNB
+0A18  A401    :        SUBI,R0 1
+              :SL_SHCNB:
+0A1A  CC1412  :        STRA,R0 TMPH            ; TMPH:TMPL = shift count
+
+              :        ; if shift count == 0 skip loop
+0A1D  0C1412  :        LODA,R0 TMPH
+0A20  E400    :        COMI,R0 $00
+0A22  1D0A2D  :        BCTA,GT SL_DOSHIFT
+0A25  0C1413  :        LODA,R0 TMPL
+0A28  E400    :        COMI,R0 $00
+0A2A  1C0A8A  :        BCTA,EQ SL_NOSHIFT
+              :SL_DOSHIFT:
+              :        ; src = PE-1 in NEGFLG:SC1 (use two scratch bytes; LNUMH:LNUML free now)
+0A2D  0C1403  :        LODA,R0 PEL
+0A30  A401    :        SUBI,R0 1
+0A32  CC140B  :        STRA,R0 LNUML
+0A35  0C1402  :        LODA,R0 PEH
+0A38  9E0A3D  :        BCFA,LT SL_SNBR
+0A3B  A401    :        SUBI,R0 1
+              :SL_SNBR:
+0A3D  CC140A  :        STRA,R0 LNUMH           ; LNUMH:LNUML = src = PE-1
+              :        ; dst = src + SC1  → SC0 now holds body len not record size! Use SC1.
+              :        ; Actually SC1 = record size = shift amount.
+0A40  0C140B  :        LODA,R0 LNUML
+0A43  8C140D  :        ADDA,R0 SC1
+0A46  CC1407  :        STRA,R0 GOTOL
+0A49  0C140A  :        LODA,R0 LNUMH
+0A4C  1D0A51  :        BCTA,GT SL_DSNCA
+0A4F  8401    :        ADDI,R0 1
+              :SL_DSNCA:
+0A51  CC1406  :        STRA,R0 GOTOH           ; GOTOH:GOTOL = dst = PE-1+SC1
+
+              :        ; use R3 as count (shift count lo; assume <256 for any real program)
+0A54  0F1413  :        LODA,R3 TMPL
+              :SL_SHLOOP:
+0A57  E700    :        COMI,R3 $00
+0A59  1C0A8A  :        BCTA,EQ SL_NOSHIFT
+              :        ; read from LNUMH:LNUML
+0A5C  0D940A  :        LODA,R1 *LNUMH
+              :        ; write to GOTOH:GOTOL
+0A5F  CD9406  :        STRA,R1 *GOTOH
+              :        ; decrement both pointers
+0A62  0C140B  :        LODA,R0 LNUML
+0A65  A401    :        SUBI,R0 1
+0A67  CC140B  :        STRA,R0 LNUML
+0A6A  9E0A75  :        BCFA,LT SL_SRNB
+0A6D  0C140A  :        LODA,R0 LNUMH
+0A70  A401    :        SUBI,R0 1
+0A72  CC140A  :        STRA,R0 LNUMH
+              :SL_SRNB:
+0A75  0C1407  :        LODA,R0 GOTOL
+0A78  A401    :        SUBI,R0 1
+0A7A  CC1407  :        STRA,R0 GOTOL
+0A7D  9E0A88  :        BCFA,LT SL_DRNB
+0A80  0C1406  :        LODA,R0 GOTOH
+0A83  A401    :        SUBI,R0 1
+0A85  CC1406  :        STRA,R0 GOTOH
+              :SL_DRNB:
+0A88  5B4D    :        BRNR,R3 SL_SHLOOP
+
+              :SL_NOSHIFT:
+              :        ; write record at EXPH:EXPL (insertion point)
+              :        ; restore IP body start to TMPH:TMPL (saved at top of STORE_LINE)
+              :        ; TMPH:TMPL currently = shift count — need to reload body start from IP
+              :        ; IP still points to body start (WSKIP was called before STORE_LINE)
+0A8A  0C1400  :        LODA,R0 IPH
+0A8D  CC1412  :        STRA,R0 TMPH
+0A90  0C1401  :        LODA,R0 IPL
+0A93  CC1413  :        STRA,R0 TMPL
+
+0A96  0C140A  :        LODA,R0 LNUMH
+0A99  CC9410  :        STRA,R0 *EXPH  ; write line hi
+0A9C  3F1465  :        BSTA,UN INC_EXP
+              :SL_WN1:
+0A9F  0C140B  :        LODA,R0 LNUML
+0AA2  CC9410  :        STRA,R0 *EXPH  ; write line lo
+0AA5  3F1465  :        BSTA,UN INC_EXP
+              :SL_WN2:
+0AA8  0C140C  :        LODA,R0 SC0
+0AAB  CC9410  :        STRA,R0 *EXPH  ; write body length
+0AAE  3F1465  :        BSTA,UN INC_EXP
+              :SL_WN3:
+              :        ; write body bytes (R3 = body len from SC0)
+0AB1  0F140C  :        LODA,R3 SC0
+0AB4  E700    :        COMI,R3 $00
+0AB6  1C0AC7  :        BCTA,EQ SL_WDONE
+              :SL_WBODY:
+0AB9  0D9412  :        LODA,R1 *TMPH
+0ABC  CD9410  :        STRA,R1 *EXPH  ; copy body byte
+0ABF  3F1451  :        BSTA,UN INC_TMP
+              :SL_WBNC:
+0AC2  3F1465  :        BSTA,UN INC_EXP
+              :SL_WENC:
+0AC5  5B72    :        BRNR,R3 SL_WBODY
+              :SL_WDONE:
+              :        ; update PE += SC1 (record size)
+0AC7  0C1403  :        LODA,R0 PEL
+0ACA  8C140D  :        ADDA,R0 SC1
+0ACD  CC1403  :        STRA,R0 PEL
+0AD0  1D0ADB  :        BCTA,GT SL_PENC
+0AD3  0C1402  :        LODA,R0 PEH
+0AD6  8401    :        ADDI,R0 1
+0AD8  CC1402  :        STRA,R0 PEH
+              :SL_PENC:
+0ADB  17      :        RETC,UN
+
+              :; ─── DELETE_LINE ──────────────────────────────────────────────────────────────
+              :DELETE_LINE:
+0ADC  3F0B5A  :        BSTA,UN FIND_LINE                ; [+1]
+0ADF  0C140E  :        LODA,R0 ERRFLG
+0AE2  E400    :        COMI,R0 $00
+0AE4  1C0AE8  :        BCTA,EQ DL2_FOUND
+0AE7  17      :        RETC,UN
+              :DL2_FOUND:
+              :        ; record start in TMPH:TMPL.  Get size: 3 + bodylen at TMPH:TMPL+2.
+0AE8  0C1412  :        LODA,R0 TMPH
+0AEB  CC1410  :        STRA,R0 EXPH  ; save record start in EXPH:EXPL
+0AEE  0C1413  :        LODA,R0 TMPL
+0AF1  CC1411  :        STRA,R0 EXPL
+0AF4  0C1413  :        LODA,R0 TMPL
+0AF7  8402    :        ADDI,R0 2
+0AF9  CC1413  :        STRA,R0 TMPL
+0AFC  1D0B07  :        BCTA,GT DL2_BLN
+0AFF  0C1412  :        LODA,R0 TMPH
+0B02  8401    :        ADDI,R0 1
+0B04  CC1412  :        STRA,R0 TMPH
+              :DL2_BLN:
+0B07  0C9412  :        LODA,R0 *TMPH
+0B0A  8403    :        ADDI,R0 3
+0B0C  CC140C  :        STRA,R0 SC0  ; SC0 = record size
+              :        ; advance TMPH:TMPL past record to get src for copy
+0B0F  0F140C  :        LODA,R3 SC0
+0B12  A702    :        SUBI,R3 2  ; R3 = bodylen + 1  (skip len byte + body)
+              :DL2_SKIP:
+0B14  E700    :        COMI,R3 $00
+0B16  1C0B1E  :        BCTA,EQ DL2_COPY
+0B19  3F1451  :        BSTA,UN INC_TMP
+              :DL2_SN:
+0B1C  5B76    :        BRNR,R3 DL2_SKIP
+              :DL2_COPY:
+              :        ; copy TMPH:TMPL..PE-1 to EXPH:EXPL
+              :DL2_LP:
+0B1E  0C1412  :        LODA,R0 TMPH
+0B21  AC1402  :        SUBA,R0 PEH
+0B24  1D0B45  :        BCTA,GT DL2_DONE
+0B27  1E0B36  :        BCTA,LT DL2_MOV
+0B2A  0C1413  :        LODA,R0 TMPL
+0B2D  AC1403  :        SUBA,R0 PEL
+0B30  1E0B36  :        BCTA,LT DL2_MOV
+0B33  1F0B45  :        BCTA,UN DL2_DONE
+              :DL2_MOV:
+0B36  0D9412  :        LODA,R1 *TMPH
+0B39  CD9410  :        STRA,R1 *EXPH
+0B3C  3F1451  :        BSTA,UN INC_TMP
+              :DL2_TNC:
+0B3F  3F1465  :        BSTA,UN INC_EXP
+              :DL2_ENC:
+0B42  1F0B1E  :        BCTA,UN DL2_LP
+              :DL2_DONE:
+              :        ; PE -= SC0
+0B45  0C1403  :        LODA,R0 PEL
+0B48  AC140C  :        SUBA,R0 SC0
+0B4B  CC1403  :        STRA,R0 PEL
+0B4E  9E0B59  :        BCFA,LT DL2_PNC
+0B51  0C1402  :        LODA,R0 PEH
+0B54  A401    :        SUBI,R0 1
+0B56  CC1402  :        STRA,R0 PEH
+              :DL2_PNC:
+0B59  17      :        RETC,UN
+
+              :; ─── FIND_LINE ────────────────────────────────────────────────────────────────
+              :; Search for line LNUMH:LNUML in program store (sorted ascending).
+              :; Returns: TMPH:TMPL = record start if found; ERRFLG=$00 found / $01 not found.
+              :FIND_LINE:
+0B5A  0401    :        LODI,R0 $01
+0B5C  CC140E  :        STRA,R0 ERRFLG
+0B5F  04C0    :        LODI,R0 >PROG
+0B61  CC1412  :        STRA,R0 TMPH
+0B64  0414    :        LODI,R0 <PROG
+0B66  CC1413  :        STRA,R0 TMPL
+              :FL_LP:
+0B69  0C1412  :        LODA,R0 TMPH
+0B6C  AC1402  :        SUBA,R0 PEH
+0B6F  1D0BD8  :        BCTA,GT FL_RET
+0B72  1E0B81  :        BCTA,LT FL_CHK
+0B75  0C1413  :        LODA,R0 TMPL
+0B78  AC1403  :        SUBA,R0 PEL
+0B7B  1E0B81  :        BCTA,LT FL_CHK
+0B7E  1F0BD8  :        BCTA,UN FL_RET
+              :FL_CHK:
+0B81  0C9412  :        LODA,R0 *TMPH
+0B84  AC140A  :        SUBA,R0 LNUMH
+0B87  1E0BB2  :        BCTA,LT FL_ADV
+0B8A  1D0BD8  :        BCTA,GT FL_RET  ; stored.hi > target → not found
+              :        ; hi bytes equal: check lo at TMPH:TMPL+1
+0B8D  0C1413  :        LODA,R0 TMPL
+0B90  8401    :        ADDI,R0 1
+0B92  CC1411  :        STRA,R0 EXPL
+0B95  0C1412  :        LODA,R0 TMPH
+0B98  1D0B9D  :        BCTA,GT FL_LH
+0B9B  8401    :        ADDI,R0 1
+              :FL_LH:
+0B9D  CC1410  :        STRA,R0 EXPH                     ; EXPH:EXPL = lo byte address
+0BA0  0C9410  :        LODA,R0 *EXPH
+0BA3  AC140B  :        SUBA,R0 LNUML
+0BA6  1E0BB2  :        BCTA,LT FL_ADV
+0BA9  1D0BD8  :        BCTA,GT FL_RET
+0BAC  0400    :        LODI,R0 $00
+0BAE  CC140E  :        STRA,R0 ERRFLG
+0BB1  17      :        RETC,UN  ; exact match
+              :FL_ADV:
+              :        ; advance TMPH:TMPL by 3 + bodylen
+0BB2  0C1413  :        LODA,R0 TMPL
+0BB5  8402    :        ADDI,R0 2
+0BB7  CC1413  :        STRA,R0 TMPL
+0BBA  1D0BC5  :        BCTA,GT FL_AN
+0BBD  0C1412  :        LODA,R0 TMPH
+0BC0  8401    :        ADDI,R0 1
+0BC2  CC1412  :        STRA,R0 TMPH
+              :FL_AN:
+0BC5  0F9412  :        LODA,R3 *TMPH                    ; bodylen
+0BC8  3F1451  :        BSTA,UN INC_TMP
+              :FL_AN2:
+0BCB  E700    :        COMI,R3 $00
+0BCD  1C0B69  :        BCTA,EQ FL_LP
+              :FL_AS:
+0BD0  3F1451  :        BSTA,UN INC_TMP
+              :FL_ASN:
+0BD3  5B7B    :        BRNR,R3 FL_AS
+0BD5  1F0B69  :        BCTA,UN FL_LP
+              :FL_RET:
+0BD8  17      :        RETC,UN
+
+              :; ─── FIND_INS ─────────────────────────────────────────────────────────────────
+              :; Find sorted insertion point for LNUMH:LNUML.
+              :; Returns TMPH:TMPL = address where new record should be inserted.
+              :FIND_INS:
+0BD9  04C0    :        LODI,R0 >PROG
+0BDB  CC1412  :        STRA,R0 TMPH
+0BDE  0414    :        LODI,R0 <PROG
+0BE0  CC1413  :        STRA,R0 TMPL
+              :FI_LP:
+0BE3  0C1412  :        LODA,R0 TMPH
+0BE6  AC1402  :        SUBA,R0 PEH
+0BE9  1D0C4C  :        BCTA,GT FI_RET
+0BEC  1E0BFB  :        BCTA,LT FI_CHK
+0BEF  0C1413  :        LODA,R0 TMPL
+0BF2  AC1403  :        SUBA,R0 PEL
+0BF5  1E0BFB  :        BCTA,LT FI_CHK
+0BF8  1F0C4C  :        BCTA,UN FI_RET
+              :FI_CHK:
+0BFB  0C9412  :        LODA,R0 *TMPH
+0BFE  AC140A  :        SUBA,R0 LNUMH
+0C01  1E0C26  :        BCTA,LT FI_ADV
+0C04  1F0C4C  :        BCTA,UN FI_RET  ; stored.hi >= new → insert here
+              :        ; if EQ: check lo
+0C07  0C1413  :        LODA,R0 TMPL
+0C0A  8401    :        ADDI,R0 1
+0C0C  CC1411  :        STRA,R0 EXPL
+0C0F  0C1412  :        LODA,R0 TMPH
+0C12  1D0C17  :        BCTA,GT FI_LH
+0C15  8401    :        ADDI,R0 1
+              :FI_LH:
+0C17  CC1410  :        STRA,R0 EXPH
+0C1A  0C9410  :        LODA,R0 *EXPH
+0C1D  AC140B  :        SUBA,R0 LNUML
+0C20  1E0C26  :        BCTA,LT FI_ADV
+0C23  1F0C4C  :        BCTA,UN FI_RET
+              :FI_ADV:
+0C26  0C1413  :        LODA,R0 TMPL
+0C29  8402    :        ADDI,R0 2
+0C2B  CC1413  :        STRA,R0 TMPL
+0C2E  1D0C39  :        BCTA,GT FI_AN
+0C31  0C1412  :        LODA,R0 TMPH
+0C34  8401    :        ADDI,R0 1
+0C36  CC1412  :        STRA,R0 TMPH
+              :FI_AN:
+0C39  0F9412  :        LODA,R3 *TMPH
+0C3C  3F1451  :        BSTA,UN INC_TMP
+              :FI_AN2:
+0C3F  E700    :        COMI,R3 $00
+0C41  1C0BE3  :        BCTA,EQ FI_LP
+              :FI_AS:
+0C44  3F1451  :        BSTA,UN INC_TMP
+              :FI_ASN:
+0C47  5B7B    :        BRNR,R3 FI_AS
+0C49  1F0BE3  :        BCTA,UN FI_LP
+              :FI_RET:
+0C4C  17      :        RETC,UN
+
+              :; ─── PARSE_EXPR ───────────────────────────────────────────────────────────────
+              :; Shunting-yard iterative operator-precedence parser.
+              :; Entry: IP at expression.  Exit: EXPH:EXPL = result, ERRFLG=$00.
+              :; RAS budget: this routine is at depth N; calls PARSE_FACTOR at N+1.
+              :; Max depth from caller: +2. PARSE_FACTOR may call PARSE_EXPR for functions
+              :; at N+1+1 = N+2 total extra levels — tight at deepest path, see ARCH §12.
+              :;
+              :; OPSTK[0..STKIDX]: operator stack   '(' = sentinel (prec 0)
+              :; VALSH/VALSL[0..STKIDX]: value stack
+              :;
+              :; Operator precedences: '('=0 (sentinel, never reduces), '+''-'=1, '*''/'=2
+              :; Reduction: while top-op-prec >= cur-op-prec AND top-op != '(': apply top op
+              :PARSE_EXPR:
+0C4D  04FF    :        LODI,R0 $FF
+0C4F  CC142C  :        STRA,R0 STKIDX
+0C52  0400    :        LODI,R0 $00
+0C54  CC140E  :        STRA,R0 ERRFLG
+
+              :PX_ATOM:
+              :        ; skip spaces then parse one atom (number, variable, unary, paren)
+0C57  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0C5A  0C9400  :        LODA,R0 *IPH
+0C5D  E428    :        COMI,R0 A'('
+0C5F  1C0C78  :        BCTA,EQ PX_LPAR
+0C62  E42D    :        COMI,R0 A'-'
+0C64  1C0C9B  :        BCTA,EQ PX_UNEG
+0C67  E42B    :        COMI,R0 A'+'
+0C69  1C0CC0  :        BCTA,EQ PX_UPOS
+0C6C  3F0F29  :        BSTA,UN PARSE_FACTOR             ; [+1]
+0C6F  0C140E  :        LODA,R0 ERRFLG
+0C72  E400    :        COMI,R0 $00
+0C74  1C0CCF  :        BCTA,EQ PX_PUSHV
+0C77  17      :        RETC,UN
+
+              :PX_LPAR:
+              :        ; push '(' sentinel onto OPSTK
+0C78  3F143D  :        BSTA,UN INC_IP
+              :PX_LPN:
+0C7B  0C142C  :        LODA,R0 STKIDX
+0C7E  8401    :        ADDI,R0 1
+0C80  CC142C  :        STRA,R0 STKIDX
+0C83  0514    :        LODI,R1 <OPSTK
+0C85  81      :        ADDZ,R1
+0C86  CC1413  :        STRA,R0 TMPL
+0C89  0414    :        LODI,R0 >OPSTK
+0C8B  1D0C90  :        BCTA,GT PX_LPNCA
+0C8E  8401    :        ADDI,R0 1
+              :PX_LPNCA:
+0C90  CC1412  :        STRA,R0 TMPH
+0C93  0428    :        LODI,R0 A'('
+0C95  CC9412  :        STRA,R0 *TMPH
+0C98  1F0C57  :        BCTA,UN PX_ATOM
+
+              :PX_UNEG:
+              :        ; consume '-', parse factor, negate result
+0C9B  3F143D  :        BSTA,UN INC_IP
+              :PX_UNN:
+0C9E  3F0F29  :        BSTA,UN PARSE_FACTOR             ; [+1]
+0CA1  0C140E  :        LODA,R0 ERRFLG
+0CA4  E400    :        COMI,R0 $00
+0CA6  1C0CAA  :        BCTA,EQ PX_NEG
+0CA9  17      :        RETC,UN
+              :PX_NEG:
+0CAA  0C1410  :        LODA,R0 EXPH
+0CAD  24FF    :        EORI,R0 $FF
+0CAF  CC1410  :        STRA,R0 EXPH
+0CB2  0C1411  :        LODA,R0 EXPL
+0CB5  24FF    :        EORI,R0 $FF
+0CB7  CC1411  :        STRA,R0 EXPL
+0CBA  3F1465  :        BSTA,UN INC_EXP
+0CBD  1F0CCF  :        BCTA,UN PX_PUSHV
+
+              :PX_UPOS:
+              :        ; consume '+', parse factor — result unchanged
+0CC0  3F143D  :        BSTA,UN INC_IP
+              :PX_UPN:
+0CC3  3F0F29  :        BSTA,UN PARSE_FACTOR             ; [+1]
+0CC6  0C140E  :        LODA,R0 ERRFLG
+0CC9  E400    :        COMI,R0 $00
+0CCB  1C0CCF  :        BCTA,EQ PX_PUSHV
+0CCE  17      :        RETC,UN
+
+              :PX_PUSHV:
+              :        ; push EXPH:EXPL to value stack at STKIDX+1
+0CCF  0C142C  :        LODA,R0 STKIDX
+0CD2  8401    :        ADDI,R0 1
+0CD4  CC142C  :        STRA,R0 STKIDX
+0CD7  0514    :        LODI,R1 <VALSH
+0CD9  81      :        ADDZ,R1
+0CDA  CC1413  :        STRA,R0 TMPL
+0CDD  041C    :        LODI,R0 >VALSH
+0CDF  1D0CE4  :        BCTA,GT PX_VHN
+0CE2  8401    :        ADDI,R0 1
+              :PX_VHN:
+0CE4  CC1412  :        STRA,R0 TMPH
+0CE7  0C1410  :        LODA,R0 EXPH
+0CEA  CC9412  :        STRA,R0 *TMPH
+0CED  0C142C  :        LODA,R0 STKIDX
+0CF0  0514    :        LODI,R1 <VALSL
+0CF2  81      :        ADDZ,R1
+0CF3  CC1413  :        STRA,R0 TMPL
+0CF6  0424    :        LODI,R0 >VALSL
+0CF8  1D0CFD  :        BCTA,GT PX_VLN
+0CFB  8401    :        ADDI,R0 1
+              :PX_VLN:
+0CFD  CC1412  :        STRA,R0 TMPH
+0D00  0C1411  :        LODA,R0 EXPL
+0D03  CC9412  :        STRA,R0 *TMPH
+
+              :PX_PEEKOP:
+              :        ; peek next char for operator
+0D06  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0D09  0C9400  :        LODA,R0 *IPH
+
+0D0C  E429    :        COMI,R0 A')'
+0D0E  1C0D75  :        BCTA,EQ PX_RPAR  ; A')' → reduce until A'(' sentinel
+
+0D11  3F0DE6  :        BSTA,UN GET_PREC                 ; [+1]  R0 = prec(cur op)  ; 0=not an op
+0D14  E400    :        COMI,R0 $00
+0D16  1C0DAE  :        BCTA,EQ PX_RALL  ; end of expression → reduce all
+0D19  CC140D  :        STRA,R0 SC1                      ; SC1 = cur op prec
+
+              :PX_REDLP:
+              :        ; while STKIDX >= 1 and top-op-prec >= SC1: reduce
+0D1C  0C142C  :        LODA,R0 STKIDX
+0D1F  E400    :        COMI,R0 $00
+0D21  1C0D50  :        BCTA,EQ PX_PUSHOP  ; only 1 value
+              :        ; get top op from OPSTK[STKIDX-1]
+0D24  A401    :        SUBI,R0 1
+0D26  0514    :        LODI,R1 <OPSTK
+0D28  81      :        ADDZ,R1
+0D29  CC1413  :        STRA,R0 TMPL
+0D2C  0414    :        LODI,R0 >OPSTK
+0D2E  1D0D33  :        BCTA,GT PX_TOPNC
+0D31  8401    :        ADDI,R0 1
+              :PX_TOPNC:
+0D33  CC1412  :        STRA,R0 TMPH
+0D36  0C9412  :        LODA,R0 *TMPH
+0D39  CC140C  :        STRA,R0 SC0  ; SC0 = top op byte
+0D3C  E428    :        COMI,R0 A'('
+0D3E  1C0D50  :        BCTA,EQ PX_PUSHOP  ; sentinel → stop reducing
+0D41  3F0DE9  :        BSTA,UN GET_PREC_SC0             ; [+1]  R0 = prec(SC0)
+0D44  AC140D  :        SUBA,R0 SC1                      ; top_prec - cur_prec
+0D47  1E0D50  :        BCTA,LT PX_PUSHOP                ; top_prec < cur_prec → push new op
+0D4A  3F0E06  :        BSTA,UN APPLY_OP                 ; [+1]  reduce top pair
+0D4D  1F0D1C  :        BCTA,UN PX_REDLP
+
+              :PX_PUSHOP:
+              :        ; push cur op byte onto OPSTK[STKIDX] and consume from IP
+0D50  0C9400  :        LODA,R0 *IPH
+0D53  CC140C  :        STRA,R0 SC0
+0D56  3F143D  :        BSTA,UN INC_IP
+              :PX_PON:
+0D59  0C142C  :        LODA,R0 STKIDX
+0D5C  0514    :        LODI,R1 <OPSTK
+0D5E  81      :        ADDZ,R1
+0D5F  CC1413  :        STRA,R0 TMPL
+0D62  0414    :        LODI,R0 >OPSTK
+0D64  1D0D69  :        BCTA,GT PX_OPN
+0D67  8401    :        ADDI,R0 1
+              :PX_OPN:
+0D69  CC1412  :        STRA,R0 TMPH
+0D6C  0C140C  :        LODA,R0 SC0
+0D6F  CC9412  :        STRA,R0 *TMPH
+0D72  1F0C57  :        BCTA,UN PX_ATOM                  ; parse next value
+
+              :PX_RPAR:
+              :        ; consume ')'
+0D75  3F143D  :        BSTA,UN INC_IP
+              :PX_RPNCA:
+              :        ; reduce until '(' sentinel
+              :PX_RPLP:
+0D78  0C142C  :        LODA,R0 STKIDX
+0D7B  E400    :        COMI,R0 $00
+0D7D  1C0DAB  :        BCTA,EQ PX_RPDONE  ; guard
+0D80  A401    :        SUBI,R0 1
+0D82  0514    :        LODI,R1 <OPSTK
+0D84  81      :        ADDZ,R1
+0D85  CC1413  :        STRA,R0 TMPL
+0D88  0414    :        LODI,R0 >OPSTK
+0D8A  1D0D8F  :        BCTA,GT PX_RPNCA2
+0D8D  8401    :        ADDI,R0 1
+              :PX_RPNCA2:
+0D8F  CC1412  :        STRA,R0 TMPH
+0D92  0C9412  :        LODA,R0 *TMPH
+0D95  CC140C  :        STRA,R0 SC0
+0D98  E428    :        COMI,R0 A'('
+0D9A  1C0DA3  :        BCTA,EQ PX_POPSENT
+0D9D  3F0E06  :        BSTA,UN APPLY_OP                 ; [+1]
+0DA0  1F0D78  :        BCTA,UN PX_RPLP
+              :PX_POPSENT:
+              :        ; pop '(' sentinel: STKIDX-- (removes the op slot; val result stays at top)
+0DA3  0C142C  :        LODA,R0 STKIDX
+0DA6  A401    :        SUBI,R0 1
+0DA8  CC142C  :        STRA,R0 STKIDX
+              :PX_RPDONE:
+0DAB  1F0D06  :        BCTA,UN PX_PEEKOP                ; continue scanning for more operators
+
+              :PX_RALL:
+              :        ; reduce all remaining ops
+              :PX_RALL_LP:
+0DAE  0C142C  :        LODA,R0 STKIDX
+0DB1  E400    :        COMI,R0 $00
+0DB3  1C0DD4  :        BCTA,EQ PX_DONE
+0DB6  A401    :        SUBI,R0 1
+0DB8  0514    :        LODI,R1 <OPSTK
+0DBA  81      :        ADDZ,R1
+0DBB  CC1413  :        STRA,R0 TMPL
+0DBE  0414    :        LODI,R0 >OPSTK
+0DC0  1D0DC5  :        BCTA,GT PX_RANC
+0DC3  8401    :        ADDI,R0 1
+              :PX_RANC:
+0DC5  CC1412  :        STRA,R0 TMPH
+0DC8  0C9412  :        LODA,R0 *TMPH
+0DCB  CC140C  :        STRA,R0 SC0
+0DCE  3F0E06  :        BSTA,UN APPLY_OP                 ; [+1]
+0DD1  1F0DAE  :        BCTA,UN PX_RALL_LP
+              :PX_DONE:
+              :        ; result is VALSH[0]:VALSL[0]
+0DD4  0C141C  :        LODA,R0 VALSH
+0DD7  CC1410  :        STRA,R0 EXPH
+0DDA  0C1424  :        LODA,R0 VALSL
+0DDD  CC1411  :        STRA,R0 EXPL
+0DE0  0400    :        LODI,R0 $00
+0DE2  CC140E  :        STRA,R0 ERRFLG
+0DE5  17      :        RETC,UN
+
+              :; ─── GET_PREC ─────────────────────────────────────────────────────────────────
+              :; R0 = precedence of *IPH  (0=not-an-op, 1=+/-, 2=*/)
+              :GET_PREC:
+0DE6  0C9400  :        LODA,R0 *IPH
+              :        ; fall through to GET_PREC_SC0
+
+              :; R0 = precedence of char in R0
+              :GET_PREC_SC0:
+0DE9  E42B    :        COMI,R0 A'+'
+0DEB  1C0E00  :        BCTA,EQ GP_LOW
+0DEE  E42D    :        COMI,R0 A'-'
+0DF0  1C0E00  :        BCTA,EQ GP_LOW
+0DF3  E42A    :        COMI,R0 A'*'
+0DF5  1C0E03  :        BCTA,EQ GP_HIGH
+0DF8  E42F    :        COMI,R0 A'/'
+0DFA  1C0E03  :        BCTA,EQ GP_HIGH
+0DFD  0400    :        LODI,R0 0
+0DFF  17      :        RETC,UN
+0E00  0401    :GP_LOW:  LODI,R0 1
+0E02  17      :        RETC,UN
+0E03  0402    :GP_HIGH: LODI,R0 2
+0E05  17      :        RETC,UN
+
+              :; ─── APPLY_OP ─────────────────────────────────────────────────────────────────
+              :; Apply operator SC0 to top two stack values. Result → VALSH/VALSL[STKIDX-1].
+              :; STKIDX decremented (one value consumed).
+              :; Uses NEGFLG:SC1 as temp for left value during computation.
+              :APPLY_OP:
+              :        ; load right value: VALSH/VALSL[STKIDX]
+0E06  0C142C  :        LODA,R0 STKIDX
+0E09  0514    :        LODI,R1 <VALSH
+0E0B  81      :        ADDZ,R1
+0E0C  CC1413  :        STRA,R0 TMPL
+0E0F  041C    :        LODI,R0 >VALSH
+0E11  1D0E16  :        BCTA,GT AO_RHN
+0E14  8401    :        ADDI,R0 1
+              :AO_RHN:
+0E16  CC1412  :        STRA,R0 TMPH
+0E19  0C9412  :        LODA,R0 *TMPH
+0E1C  CC1410  :        STRA,R0 EXPH  ; right.hi
+0E1F  0C142C  :        LODA,R0 STKIDX
+0E22  0514    :        LODI,R1 <VALSL
+0E24  81      :        ADDZ,R1
+0E25  CC1413  :        STRA,R0 TMPL
+0E28  0424    :        LODI,R0 >VALSL
+0E2A  1D0E2F  :        BCTA,GT AO_RLN
+0E2D  8401    :        ADDI,R0 1
+              :AO_RLN:
+0E2F  CC1412  :        STRA,R0 TMPH
+0E32  0C9412  :        LODA,R0 *TMPH
+0E35  CC1411  :        STRA,R0 EXPL  ; right.lo
+
+              :        ; load left value: VALSH/VALSL[STKIDX-1]
+0E38  0C142C  :        LODA,R0 STKIDX
+0E3B  A401    :        SUBI,R0 1
+0E3D  0514    :        LODI,R1 <VALSH
+0E3F  81      :        ADDZ,R1
+0E40  CC1413  :        STRA,R0 TMPL
+0E43  041C    :        LODI,R0 >VALSH
+0E45  1D0E4A  :        BCTA,GT AO_LHN
+0E48  8401    :        ADDI,R0 1
+              :AO_LHN:
+0E4A  CC1412  :        STRA,R0 TMPH
+0E4D  0C9412  :        LODA,R0 *TMPH
+0E50  CC140F  :        STRA,R0 NEGFLG  ; left.hi → NEGFLG temp
+0E53  0C142C  :        LODA,R0 STKIDX
+0E56  A401    :        SUBI,R0 1
+0E58  0514    :        LODI,R1 <VALSL
+0E5A  81      :        ADDZ,R1
+0E5B  CC1413  :        STRA,R0 TMPL
+0E5E  0424    :        LODI,R0 >VALSL
+0E60  1D0E65  :        BCTA,GT AO_LLN
+0E63  8401    :        ADDI,R0 1
+              :AO_LLN:
+0E65  CC1412  :        STRA,R0 TMPH
+0E68  0C9412  :        LODA,R0 *TMPH
+0E6B  CC140D  :        STRA,R0 SC1  ; left.lo → SC1
+
+              :        ; left = NEGFLG:SC1,  right = EXPH:EXPL
+              :        ; dispatch on SC0
+0E6E  0C140C  :        LODA,R0 SC0
+0E71  E42B    :        COMI,R0 A'+'
+0E73  1C0E86  :        BCTA,EQ AO_ADD
+0E76  E42D    :        COMI,R0 A'-'
+0E78  1C0EA6  :        BCTA,EQ AO_SUB
+0E7B  E42A    :        COMI,R0 A'*'
+0E7D  1C0EC6  :        BCTA,EQ AO_MUL
+0E80  E42F    :        COMI,R0 A'/'
+0E82  1C0ED8  :        BCTA,EQ AO_DIV
+0E85  17      :        RETC,UN
+
+              :AO_ADD:
+              :        ; EXPH:EXPL = NEGFLG:SC1 + EXPH:EXPL
+0E86  0C140D  :        LODA,R0 SC1
+0E89  8C1411  :        ADDA,R0 EXPL
+0E8C  CC1411  :        STRA,R0 EXPL
+0E8F  1D0E9A  :        BCTA,GT AO_ADDNC
+0E92  0C140F  :        LODA,R0 NEGFLG
+0E95  8401    :        ADDI,R0 1
+0E97  1F0E9D  :        BCTA,UN AO_ADDHI
+              :AO_ADDNC:
+0E9A  0C140F  :        LODA,R0 NEGFLG
+              :AO_ADDHI:
+0E9D  8C1410  :        ADDA,R0 EXPH
+0EA0  CC1410  :        STRA,R0 EXPH
+0EA3  1F0EEA  :        BCTA,UN AO_STORE
+
+              :AO_SUB:
+              :        ; EXPH:EXPL = NEGFLG:SC1 - EXPH:EXPL
+0EA6  0C140D  :        LODA,R0 SC1
+0EA9  AC1411  :        SUBA,R0 EXPL
+0EAC  CC1411  :        STRA,R0 EXPL
+0EAF  9E0EBA  :        BCFA,LT AO_SUBNB                 ; no borrow → skip hi decrement
+0EB2  0C140F  :        LODA,R0 NEGFLG
+0EB5  A401    :        SUBI,R0 1
+0EB7  1F0EBD  :        BCTA,UN AO_SUBHI
+              :AO_SUBNB:
+0EBA  0C140F  :        LODA,R0 NEGFLG
+              :AO_SUBHI:
+0EBD  AC1410  :        SUBA,R0 EXPH
+0EC0  CC1410  :        STRA,R0 EXPH
+0EC3  1F0EEA  :        BCTA,UN AO_STORE
+
+              :AO_MUL:
+              :        ; MUL16: TMPH:TMPL * EXPH:EXPL → EXPH:EXPL  (NEGFLG:SC1 = left)
+0EC6  0C140F  :        LODA,R0 NEGFLG
+0EC9  CC1412  :        STRA,R0 TMPH
+0ECC  0C140D  :        LODA,R0 SC1
+0ECF  CC1413  :        STRA,R0 TMPL
+0ED2  3F10BC  :        BSTA,UN MUL16                    ; [+1]
+0ED5  1F0EEA  :        BCTA,UN AO_STORE
+
+              :AO_DIV:
+0ED8  0C140F  :        LODA,R0 NEGFLG
+0EDB  CC1412  :        STRA,R0 TMPH
+0EDE  0C140D  :        LODA,R0 SC1
+0EE1  CC1413  :        STRA,R0 TMPL
+0EE4  3F1197  :        BSTA,UN DIV16                    ; [+1]
+              :        ; ERRFLG=$01 on /0 — DO_ERROR called inside DIV16
+0EE7  1F0EEA  :        BCTA,UN AO_STORE
+
+              :AO_STORE:
+              :        ; write EXPH:EXPL to VALSH/VALSL[STKIDX-1]; STKIDX--
+0EEA  0C142C  :        LODA,R0 STKIDX
+0EED  A401    :        SUBI,R0 1
+0EEF  0514    :        LODI,R1 <VALSH
+0EF1  81      :        ADDZ,R1
+0EF2  CC1413  :        STRA,R0 TMPL
+0EF5  041C    :        LODI,R0 >VALSH
+0EF7  1D0EFC  :        BCTA,GT AO_SHN
+0EFA  8401    :        ADDI,R0 1
+              :AO_SHN:
+0EFC  CC1412  :        STRA,R0 TMPH
+0EFF  0C1410  :        LODA,R0 EXPH
+0F02  CC9412  :        STRA,R0 *TMPH
+0F05  0C142C  :        LODA,R0 STKIDX
+0F08  A401    :        SUBI,R0 1
+0F0A  0514    :        LODI,R1 <VALSL
+0F0C  81      :        ADDZ,R1
+0F0D  CC1413  :        STRA,R0 TMPL
+0F10  0424    :        LODI,R0 >VALSL
+0F12  1D0F17  :        BCTA,GT AO_SLN
+0F15  8401    :        ADDI,R0 1
+              :AO_SLN:
+0F17  CC1412  :        STRA,R0 TMPH
+0F1A  0C1411  :        LODA,R0 EXPL
+0F1D  CC9412  :        STRA,R0 *TMPH
+0F20  0C142C  :        LODA,R0 STKIDX
+0F23  A401    :        SUBI,R0 1
+0F25  CC142C  :        STRA,R0 STKIDX
+0F28  17      :        RETC,UN
+
+              :; ─── PARSE_FACTOR ─────────────────────────────────────────────────────────────
+              :; Parse one atom: variable A-Z, signed decimal, PEEK(), CHR$(), USR().
+              :; Called from PARSE_EXPR at depth N+1. May call PARSE_EXPR for function args
+              :; (adds 1 more level). Unary - and + handled by PARSE_EXPR before calling here.
+              :; CHR$ result: sets NEGFLG=$01 so DO_PRINT outputs EXPL as a character.
+              :PARSE_FACTOR:
+0F29  0400    :        LODI,R0 $00
+0F2B  CC140F  :        STRA,R0 NEGFLG  ; clear CHR$ flag
+0F2E  0C9400  :        LODA,R0 *IPH
+0F31  3F1411  :        BSTA,UN UPCASE  ; [+1]
+
+              :        ; check for variable A-Z
+0F34  E441    :        COMI,R0 A'A'
+0F36  1E0F3E  :        BCTA,LT PF_NUM
+0F39  E45B    :        COMI,R0 A'Z'+1
+0F3B  1E0F42  :        BCTA,LT PF_LOADVAR
+
+              :PF_NUM:
+              :        ; decimal number (may have leading '-' but unary is in PARSE_EXPR)
+0F3E  3F0FFF  :        BSTA,UN PARSE_S16                ; [+1]
+0F41  17      :        RETC,UN
+
+              :PF_LOADVAR:
+              :        ; load variable value from VARS
+              :        ; consume the variable character
+0F42  3F143D  :        BSTA,UN INC_IP
+              :PF_LVNCA:
+0F45  0C140C  :        LODA,R0 SC0
+0F48  A441    :        SUBI,R0 A'A'  ; 0-25
+0F4A  CC140D  :        STRA,R0 SC1
+0F4D  8C140D  :        ADDA,R0 SC1  ; *2
+0F50  0514    :        LODI,R1 <VARS
+0F52  81      :        ADDZ,R1
+0F53  CC1413  :        STRA,R0 TMPL
+0F56  0480    :        LODI,R0 >VARS
+0F58  1D0F5D  :        BCTA,GT PF_LVN
+0F5B  8401    :        ADDI,R0 1
+              :PF_LVN:
+0F5D  CC1412  :        STRA,R0 TMPH
+0F60  0C9412  :        LODA,R0 *TMPH
+0F63  CC1410  :        STRA,R0 EXPH
+0F66  3F1451  :        BSTA,UN INC_TMP
+              :PF_LVN2:
+0F69  0C9412  :        LODA,R0 *TMPH
+0F6C  CC1411  :        STRA,R0 EXPL
+0F6F  0400    :        LODI,R0 $00
+0F71  CC140E  :        STRA,R0 ERRFLG
+0F74  17      :        RETC,UN
+
+
+              :PARSE_RELOP:
+0F75  0401    :        LODI,R0 $01
+0F77  CC140E  :        STRA,R0 ERRFLG
+0F7A  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0F7D  0C9400  :        LODA,R0 *IPH
+0F80  E43D    :        COMI,R0 A'='
+0F82  1C0F90  :        BCTA,EQ PRO_EQ
+0F85  E43C    :        COMI,R0 A'<'
+0F87  1C0F9E  :        BCTA,EQ PRO_LT
+0F8A  E43E    :        COMI,R0 A'>'
+0F8C  1C0FD8  :        BCTA,EQ PRO_GT
+0F8F  17      :        RETC,UN
+
+              :PRO_EQ:
+0F90  3F143D  :        BSTA,UN INC_IP
+              :PRO_EQN:
+0F93  0401    :        LODI,R0 1
+0F95  CC143E  :        STRA,R0 RELOP
+0F98  0400    :        LODI,R0 $00
+0F9A  CC140E  :        STRA,R0 ERRFLG
+0F9D  17      :        RETC,UN
+
+              :PRO_LT:
+0F9E  3F143D  :        BSTA,UN INC_IP
+              :PRO_LTN:
+0FA1  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0FA4  0C9400  :        LODA,R0 *IPH
+0FA7  E43D    :        COMI,R0 A'='
+0FA9  1C0FBC  :        BCTA,EQ PRO_LE
+0FAC  E43E    :        COMI,R0 A'>'
+0FAE  1C0FCA  :        BCTA,EQ PRO_NE
+0FB1  0403    :        LODI,R0 3
+0FB3  CC143E  :        STRA,R0 RELOP
+0FB6  0400    :        LODI,R0 $00
+0FB8  CC140E  :        STRA,R0 ERRFLG
+0FBB  17      :        RETC,UN
+              :PRO_LE:
+0FBC  3F143D  :        BSTA,UN INC_IP
+              :PRO_LEN:
+0FBF  0405    :        LODI,R0 5
+0FC1  CC143E  :        STRA,R0 RELOP
+0FC4  0400    :        LODI,R0 $00
+0FC6  CC140E  :        STRA,R0 ERRFLG
+0FC9  17      :        RETC,UN
+              :PRO_NE:
+0FCA  3F143D  :        BSTA,UN INC_IP
+              :PRO_NEN:
+0FCD  0402    :        LODI,R0 2
+0FCF  CC143E  :        STRA,R0 RELOP
+0FD2  0400    :        LODI,R0 $00
+0FD4  CC140E  :        STRA,R0 ERRFLG
+0FD7  17      :        RETC,UN
+              :PRO_GT:
+0FD8  3F143D  :        BSTA,UN INC_IP
+              :PRO_GTN:
+0FDB  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+0FDE  0C9400  :        LODA,R0 *IPH
+0FE1  E43D    :        COMI,R0 A'='
+0FE3  1C0FF1  :        BCTA,EQ PRO_GE
+0FE6  0404    :        LODI,R0 4
+0FE8  CC143E  :        STRA,R0 RELOP
+0FEB  0400    :        LODI,R0 $00
+0FED  CC140E  :        STRA,R0 ERRFLG
+0FF0  17      :        RETC,UN
+              :PRO_GE:
+0FF1  3F143D  :        BSTA,UN INC_IP
+              :PRO_GEN:
+0FF4  0406    :        LODI,R0 6
+0FF6  CC143E  :        STRA,R0 RELOP
+0FF9  0400    :        LODI,R0 $00
+0FFB  CC140E  :        STRA,R0 ERRFLG
+0FFE  17      :        RETC,UN
+
+              :; ─── PARSE_S16 ────────────────────────────────────────────────────────────────
+              :; Parse optional leading '-' then decimal digits → EXPH:EXPL. ERRFLG=$00 if digits.
+              :PARSE_S16:
+0FFF  0400    :        LODI,R0 $00
+1001  CC140F  :        STRA,R0 NEGFLG
+1004  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+1007  0C9400  :        LODA,R0 *IPH
+100A  E42D    :        COMI,R0 A'-'
+100C  1C1012  :        BCTA,EQ PS16_NEG
+100F  1F101A  :        BCTA,UN PS16_UN
+              :PS16_NEG:
+1012  3F143D  :        BSTA,UN INC_IP
+              :PS16_NN:
+1015  0401    :        LODI,R0 $01
+1017  CC140F  :        STRA,R0 NEGFLG
+              :PS16_UN:
+101A  3F1042  :        BSTA,UN PARSE_U16                ; [+1]
+101D  0C140E  :        LODA,R0 ERRFLG
+1020  E400    :        COMI,R0 $00
+1022  1C1026  :        BCTA,EQ PS16_CHK
+1025  17      :        RETC,UN
+              :PS16_CHK:
+1026  0C140F  :        LODA,R0 NEGFLG
+1029  E400    :        COMI,R0 $00
+102B  1C1041  :        BCTA,EQ PS16_RET
+              :        ; negate EXPH:EXPL
+102E  0C1410  :        LODA,R0 EXPH
+1031  24FF    :        EORI,R0 $FF
+1033  CC1410  :        STRA,R0 EXPH
+1036  0C1411  :        LODA,R0 EXPL
+1039  24FF    :        EORI,R0 $FF
+103B  CC1411  :        STRA,R0 EXPL
+103E  3F1465  :        BSTA,UN INC_EXP
+              :PS16_RET:
+1041  17      :        RETC,UN
+
+              :; ─── PARSE_U16 ────────────────────────────────────────────────────────────────
+              :; Parse unsigned decimal digits → EXPH:EXPL. ERRFLG=$00 if ≥1 digit.
+              :PARSE_U16:
+1042  0400    :        LODI,R0 $00
+1044  CC1410  :        STRA,R0 EXPH
+1047  CC1411  :        STRA,R0 EXPL
+104A  0401    :        LODI,R0 $01
+104C  CC140E  :        STRA,R0 ERRFLG  ; assume failure
+              :PU16_LP:
+104F  3F13F8  :        BSTA,UN WSKIP                    ; [+1]
+1052  0C9400  :        LODA,R0 *IPH
+1055  E430    :        COMI,R0 A'0'
+1057  1E10BB  :        BCTA,LT PU16_DONE
+105A  E43A    :        COMI,R0 A'9'+1
+105C  1E1062  :        BCTA,LT PU16_DIG
+105F  1F10BB  :        BCTA,UN PU16_DONE
+              :PU16_DIG:
+1062  A430    :        SUBI,R0 A'0'
+1064  CC140C  :        STRA,R0 SC0  ; digit value 0-9
+1067  3F143D  :        BSTA,UN INC_IP
+              :PU16_DNC:
+              :        ; EXP = EXP*10 using R3 loop (BRNR counts down to 0)
+106A  0C1410  :        LODA,R0 EXPH
+106D  CC1412  :        STRA,R0 TMPH
+1070  0C1411  :        LODA,R0 EXPL
+1073  CC1413  :        STRA,R0 TMPL  ; TMPH:TMPL = old EXP
+1076  0400    :        LODI,R0 $00
+1078  CC1410  :        STRA,R0 EXPH
+107B  CC1411  :        STRA,R0 EXPL
+107E  070A    :        LODI,R3 10
+              :PU16_M10:
+1080  0C1411  :        LODA,R0 EXPL
+1083  8C1413  :        ADDA,R0 TMPL
+1086  CC1411  :        STRA,R0 EXPL
+1089  1D1094  :        BCTA,GT PU16_MNC
+108C  0C1410  :        LODA,R0 EXPH
+108F  8401    :        ADDI,R0 1
+1091  CC1410  :        STRA,R0 EXPH
+              :PU16_MNC:
+1094  0C1410  :        LODA,R0 EXPH
+1097  8C1412  :        ADDA,R0 TMPH
+109A  CC1410  :        STRA,R0 EXPH
+109D  5B61    :        BRNR,R3 PU16_M10
+              :        ; EXP += digit
+109F  0C1411  :        LODA,R0 EXPL
+10A2  8C140C  :        ADDA,R0 SC0
+10A5  CC1411  :        STRA,R0 EXPL
+10A8  1D10B3  :        BCTA,GT PU16_DIG_NC
+10AB  0C1410  :        LODA,R0 EXPH
+10AE  8401    :        ADDI,R0 1
+10B0  CC1410  :        STRA,R0 EXPH
+              :PU16_DIG_NC:
+10B3  0400    :        LODI,R0 $00
+10B5  CC140E  :        STRA,R0 ERRFLG  ; success: at least one digit
+10B8  1F104F  :        BCTA,UN PU16_LP
+              :PU16_DONE:
+10BB  17      :        RETC,UN
+
+              :; ─── MUL16 ────────────────────────────────────────────────────────────────────
+              :; Signed TMPH:TMPL × EXPH:EXPL → EXPH:EXPL  (16-bit two's complement wrap)
+              :MUL16:
+10BC  0400    :        LODI,R0 $00
+10BE  CC140F  :        STRA,R0 NEGFLG
+              :        ; abs(left) TMPH:TMPL
+10C1  0C1412  :        LODA,R0 TMPH
+10C4  E480    :        COMI,R0 $80
+10C6  1E10F1  :        BCTA,LT MU_LA
+10C9  0C1412  :        LODA,R0 TMPH
+10CC  24FF    :        EORI,R0 $FF
+10CE  CC1412  :        STRA,R0 TMPH
+10D1  0C1413  :        LODA,R0 TMPL
+10D4  24FF    :        EORI,R0 $FF
+10D6  CC1413  :        STRA,R0 TMPL
+10D9  0C1413  :        LODA,R0 TMPL
+10DC  8401    :        ADDI,R0 1
+10DE  CC1413  :        STRA,R0 TMPL
+10E1  1D10F1  :        BCTA,GT MU_LA
+10E4  0C1412  :        LODA,R0 TMPH
+10E7  8401    :        ADDI,R0 1
+10E9  CC1412  :        STRA,R0 TMPH
+10EC  0401    :        LODI,R0 $01
+10EE  CC140F  :        STRA,R0 NEGFLG
+              :MU_LA:
+              :        ; abs(right) EXPH:EXPL
+10F1  0C1410  :        LODA,R0 EXPH
+10F4  E480    :        COMI,R0 $80
+10F6  1E1124  :        BCTA,LT MU_RA
+10F9  0C1410  :        LODA,R0 EXPH
+10FC  24FF    :        EORI,R0 $FF
+10FE  CC1410  :        STRA,R0 EXPH
+1101  0C1411  :        LODA,R0 EXPL
+1104  24FF    :        EORI,R0 $FF
+1106  CC1411  :        STRA,R0 EXPL
+1109  0C1411  :        LODA,R0 EXPL
+110C  8401    :        ADDI,R0 1
+110E  CC1411  :        STRA,R0 EXPL
+1111  1D1124  :        BCTA,GT MU_RA
+1114  0C1410  :        LODA,R0 EXPH
+1117  8401    :        ADDI,R0 1
+1119  CC1410  :        STRA,R0 EXPH
+111C  0C140F  :        LODA,R0 NEGFLG
+111F  2401    :        EORI,R0 $01
+1121  CC140F  :        STRA,R0 NEGFLG
+              :MU_RA:
+              :        ; save right in SC0:SC1; result EXP=0
+1124  0C1410  :        LODA,R0 EXPH
+1127  CC140C  :        STRA,R0 SC0
+112A  0C1411  :        LODA,R0 EXPL
+112D  CC140D  :        STRA,R0 SC1
+1130  0400    :        LODI,R0 $00
+1132  CC1410  :        STRA,R0 EXPH
+1135  CC1411  :        STRA,R0 EXPL
+              :MU_LP:
+1138  0C1412  :        LODA,R0 TMPH
+113B  E400    :        COMI,R0 $00
+113D  1D1148  :        BCTA,GT MU_ADD
+1140  0C1413  :        LODA,R0 TMPL
+1143  E400    :        COMI,R0 $00
+1145  1C117B  :        BCTA,EQ MU_DONE
+              :MU_ADD:
+1148  0C1411  :        LODA,R0 EXPL
+114B  8C140D  :        ADDA,R0 SC1
+114E  CC1411  :        STRA,R0 EXPL
+1151  1D115C  :        BCTA,GT MU_MNC
+1154  0C1410  :        LODA,R0 EXPH
+1157  8401    :        ADDI,R0 1
+1159  CC1410  :        STRA,R0 EXPH
+              :MU_MNC:
+115C  0C1410  :        LODA,R0 EXPH
+115F  8C140C  :        ADDA,R0 SC0
+1162  CC1410  :        STRA,R0 EXPH
+              :        ; TMPH:TMPL-- (left counter)
+1165  0C1413  :        LODA,R0 TMPL
+1168  A401    :        SUBI,R0 1
+116A  CC1413  :        STRA,R0 TMPL
+116D  9E1178  :        BCFA,LT MU_TNB
+1170  0C1412  :        LODA,R0 TMPH
+1173  A401    :        SUBI,R0 1
+1175  CC1412  :        STRA,R0 TMPH
+              :MU_TNB:
+1178  1F1138  :        BCTA,UN MU_LP
+              :MU_DONE:
+117B  0C140F  :        LODA,R0 NEGFLG
+117E  E400    :        COMI,R0 $00
+1180  1C1196  :        BCTA,EQ MU_RET
+1183  0C1410  :        LODA,R0 EXPH
+1186  24FF    :        EORI,R0 $FF
+1188  CC1410  :        STRA,R0 EXPH
+118B  0C1411  :        LODA,R0 EXPL
+118E  24FF    :        EORI,R0 $FF
+1190  CC1411  :        STRA,R0 EXPL
+1193  3F1465  :        BSTA,UN INC_EXP
+              :MU_RET:
+1196  17      :        RETC,UN
+
+              :; ─── DIV16 ────────────────────────────────────────────────────────────────────
+              :; Signed TMPH:TMPL ÷ EXPH:EXPL → EXPH:EXPL  (truncate toward zero)
+              :; ERRFLG=$01 and DO_ERROR called on divide-by-zero.
+              :DIV16:
+1197  0400    :        LODI,R0 $00
+1199  CC140E  :        STRA,R0 ERRFLG
+119C  0C1410  :        LODA,R0 EXPH
+119F  E400    :        COMI,R0 $00
+11A1  1D11AC  :        BCTA,GT DV_NZ
+11A4  0C1411  :        LODA,R0 EXPL
+11A7  E400    :        COMI,R0 $00
+11A9  1C127C  :        BCTA,EQ DV_ZERO
+              :DV_NZ:
+11AC  0400    :        LODI,R0 $00
+11AE  CC140F  :        STRA,R0 NEGFLG
+              :        ; abs(dividend) TMPH:TMPL
+11B1  0C1412  :        LODA,R0 TMPH
+11B4  E480    :        COMI,R0 $80
+11B6  1E11E1  :        BCTA,LT DV_DA
+11B9  0C1412  :        LODA,R0 TMPH
+11BC  24FF    :        EORI,R0 $FF
+11BE  CC1412  :        STRA,R0 TMPH
+11C1  0C1413  :        LODA,R0 TMPL
+11C4  24FF    :        EORI,R0 $FF
+11C6  CC1413  :        STRA,R0 TMPL
+11C9  0C1413  :        LODA,R0 TMPL
+11CC  8401    :        ADDI,R0 1
+11CE  CC1413  :        STRA,R0 TMPL
+11D1  1D11E1  :        BCTA,GT DV_DA
+11D4  0C1412  :        LODA,R0 TMPH
+11D7  8401    :        ADDI,R0 1
+11D9  CC1412  :        STRA,R0 TMPH
+11DC  0401    :        LODI,R0 $01
+11DE  CC140F  :        STRA,R0 NEGFLG
+              :DV_DA:
+              :        ; abs(divisor) EXPH:EXPL
+11E1  0C1410  :        LODA,R0 EXPH
+11E4  E480    :        COMI,R0 $80
+11E6  1E1214  :        BCTA,LT DV_VA
+11E9  0C1410  :        LODA,R0 EXPH
+11EC  24FF    :        EORI,R0 $FF
+11EE  CC1410  :        STRA,R0 EXPH
+11F1  0C1411  :        LODA,R0 EXPL
+11F4  24FF    :        EORI,R0 $FF
+11F6  CC1411  :        STRA,R0 EXPL
+11F9  0C1411  :        LODA,R0 EXPL
+11FC  8401    :        ADDI,R0 1
+11FE  CC1411  :        STRA,R0 EXPL
+1201  1D1214  :        BCTA,GT DV_VA
+1204  0C1410  :        LODA,R0 EXPH
+1207  8401    :        ADDI,R0 1
+1209  CC1410  :        STRA,R0 EXPH
+120C  0C140F  :        LODA,R0 NEGFLG
+120F  2401    :        EORI,R0 $01
+1211  CC140F  :        STRA,R0 NEGFLG
+              :DV_VA:
+1214  0C1410  :        LODA,R0 EXPH
+1217  CC140C  :        STRA,R0 SC0  ; divisor hi
+121A  0C1411  :        LODA,R0 EXPL
+121D  CC140D  :        STRA,R0 SC1  ; divisor lo
+1220  0400    :        LODI,R0 $00
+1222  CC1410  :        STRA,R0 EXPH
+1225  CC1411  :        STRA,R0 EXPL  ; quotient = 0
+              :DV_LP:
+              :        ; while TMPH:TMPL >= SC0:SC1
+1228  0C1412  :        LODA,R0 TMPH
+122B  AC140C  :        SUBA,R0 SC0
+122E  1E1260  :        BCTA,LT DV_DONE
+1231  1D123D  :        BCTA,GT DV_SUB
+1234  0C1413  :        LODA,R0 TMPL
+1237  AC140D  :        SUBA,R0 SC1
+123A  1E1260  :        BCTA,LT DV_DONE
+              :DV_SUB:
+123D  0C1413  :        LODA,R0 TMPL
+1240  AC140D  :        SUBA,R0 SC1
+1243  CC1413  :        STRA,R0 TMPL
+1246  9E1251  :        BCFA,LT DV_SNB
+1249  0C1412  :        LODA,R0 TMPH
+124C  A401    :        SUBI,R0 1
+124E  CC1412  :        STRA,R0 TMPH
+              :DV_SNB:
+1251  0C1412  :        LODA,R0 TMPH
+1254  AC140C  :        SUBA,R0 SC0
+1257  CC1412  :        STRA,R0 TMPH
+              :        ; quotient++
+125A  3F1465  :        BSTA,UN INC_EXP
+125D  1F1228  :        BCTA,UN DV_LP
+              :DV_DONE:
+1260  0C140F  :        LODA,R0 NEGFLG
+1263  E400    :        COMI,R0 $00
+1265  1C127B  :        BCTA,EQ DV_RET
+1268  0C1410  :        LODA,R0 EXPH
+126B  24FF    :        EORI,R0 $FF
+126D  CC1410  :        STRA,R0 EXPH
+1270  0C1411  :        LODA,R0 EXPL
+1273  24FF    :        EORI,R0 $FF
+1275  CC1411  :        STRA,R0 EXPL
+1278  3F1465  :        BSTA,UN INC_EXP
+              :DV_RET:
+127B  17      :        RETC,UN
+              :DV_ZERO:
+127C  0402    :        LODI,R0 2
+127E  1F148D  :        BCTA,UN DO_ERROR  ; divide by zero error
+
+              :; ─── PRINT_S16 ────────────────────────────────────────────────────────────────
+              :; Print signed 16-bit value EXPH:EXPL as decimal.
+              :; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
+              :PRINT_S16:
+1281  0C1410  :        LODA,R0 EXPH
+1284  E480    :        COMI,R0 $80
+1286  1E12A2  :        BCTA,LT PS16P_POS
+1289  052D    :        LODI,R1 A'-'
+128B  01      :        LODZ,R1
+128C  3F02B4  :        BSTA,UN COUT
+              :        ; negate
+128F  0C1410  :        LODA,R0 EXPH
+1292  24FF    :        EORI,R0 $FF
+1294  CC1410  :        STRA,R0 EXPH
+1297  0C1411  :        LODA,R0 EXPL
+129A  24FF    :        EORI,R0 $FF
+129C  CC1411  :        STRA,R0 EXPL
+129F  3F1465  :        BSTA,UN INC_EXP
+              :PS16P_POS:
+12A2  0C1410  :        LODA,R0 EXPH
+12A5  E400    :        COMI,R0 $00
+12A7  1D12B9  :        BCTA,GT PS16P_NZ
+12AA  0C1411  :        LODA,R0 EXPL
+12AD  E400    :        COMI,R0 $00
+12AF  1D12B9  :        BCTA,GT PS16P_NZ
+12B2  0530    :        LODI,R1 A'0'
+12B4  01      :        LODZ,R1
+12B5  3F02B4  :        BSTA,UN COUT
+12B8  17      :        RETC,UN
+
+              :PS16P_NZ:
+12B9  04DB    :        LODI,R0 >DIVTAB
+12BB  CC1412  :        STRA,R0 TMPH
+12BE  0404    :        LODI,R0 <DIVTAB
+12C0  CC1413  :        STRA,R0 TMPL
+12C3  0400    :        LODI,R0 $00
+12C5  CC140F  :        STRA,R0 NEGFLG  ; leading-zero flag
+              :PS16P_DIVLP:
+              :        ; load next divisor pair from DIVTAB
+12C8  0C9412  :        LODA,R0 *TMPH
+12CB  CC140C  :        STRA,R0 SC0  ; div hi
+12CE  3F1451  :        BSTA,UN INC_TMP
+              :PS16P_D1:
+12D1  0C9412  :        LODA,R0 *TMPH
+12D4  CC140D  :        STRA,R0 SC1  ; div lo
+12D7  3F1451  :        BSTA,UN INC_TMP
+              :PS16P_D2:
+              :        ; sentinel 0,0 → print final ones digit
+12DA  0C140C  :        LODA,R0 SC0
+12DD  E400    :        COMI,R0 $00
+12DF  1D12EA  :        BCTA,GT PS16P_CNT
+12E2  0C140D  :        LODA,R0 SC1
+12E5  E400    :        COMI,R0 $00
+12E7  1C133E  :        BCTA,EQ PS16P_LAST
+              :PS16P_CNT:
+              :        ; count subtractions using R3 (BIRR: increment and branch while nonzero)
+12EA  0700    :        LODI,R3 $00
+              :PS16P_SLP:
+12EC  0C1410  :        LODA,R0 EXPH
+12EF  AC140C  :        SUBA,R0 SC0
+12F2  1E1320  :        BCTA,LT PS16P_EMIT
+12F5  1D1301  :        BCTA,GT PS16P_DO
+12F8  0C1411  :        LODA,R0 EXPL
+12FB  AC140D  :        SUBA,R0 SC1
+12FE  1E1320  :        BCTA,LT PS16P_EMIT
+              :PS16P_DO:
+1301  0C1411  :        LODA,R0 EXPL
+1304  AC140D  :        SUBA,R0 SC1
+1307  CC1411  :        STRA,R0 EXPL
+130A  9E1315  :        BCFA,LT PS16P_SNB
+130D  0C1410  :        LODA,R0 EXPH
+1310  A401    :        SUBI,R0 1
+1312  CC1410  :        STRA,R0 EXPH
+              :PS16P_SNB:
+1315  0C1410  :        LODA,R0 EXPH
+1318  AC140C  :        SUBA,R0 SC0
+131B  CC1410  :        STRA,R0 EXPH
+131E  DB4C    :        BIRR,R3 PS16P_SLP       ; R3++  ; loop
+              :PS16P_EMIT:
+              :        ; R3 = digit value
+1320  0C140F  :        LODA,R0 NEGFLG
+1323  E400    :        COMI,R0 $00
+1325  1D132E  :        BCTA,GT PS16P_FPRINT  ; already printing
+              :        ; leading zero check: LODZ,R3 → R0 = R3
+1328  03      :        LODZ,R3                 ; R0 = R3 (digit count, LODZ Rn loads Rn into R0)
+1329  E400    :        COMI,R0 $00
+132B  1C12C8  :        BCTA,EQ PS16P_DIVLP  ; skip leading zero
+              :PS16P_FPRINT:
+132E  03      :        LODZ,R3                 ; R0 = R3 (digit value)
+132F  C1      :        STRZ,R1                 ; R1 = R0 (= R3, digit value)
+1330  8530    :        ADDI,R1 A'0'             ; R1 = ASCII digit
+1332  01      :        LODZ,R1                 ; R0 = R1 (for COUT)
+1333  3F02B4  :        BSTA,UN COUT
+1336  0401    :        LODI,R0 $01
+1338  CC140F  :        STRA,R0 NEGFLG
+133B  1F12C8  :        BCTA,UN PS16P_DIVLP
+              :PS16P_LAST:
+133E  0D1411  :        LODA,R1 EXPL
+1341  8530    :        ADDI,R1 A'0'
+1343  01      :        LODZ,R1
+1344  3F02B4  :        BSTA,UN COUT
+1347  17      :        RETC,UN
+
+              :; ─── GETKEY ───────────────────────────────────────────────────────────────────
+              :; Blocking keyboard read via Pipbug CHIN (non-blocking).
+              :; Spins until a key is available.  Returns char in R0.
+              :; Clobbers R0 only.  RAS cost: +1 for CHIN call (net 0 at return).
+              :GETKEY:
+1348  3F0286  :        BSTA,UN CHIN            ; R0 = key, or 0 if no key ready
+134B  E400    :        COMI,R0 $00
+134D  1C1348  :        BCTA,EQ GETKEY          ; spin until non-zero
+1350  17      :        RETC,UN
+
+              :; ─── RDLINE ───────────────────────────────────────────────────────────────────
+              :; Read a line from input into IBUF, echo with backspace support. NUL-terminates.
+              :; Uses GETKEY (via CHIN) for blocking input. Char received in R0 at each step;
+              :; saved to R1 for storage/echo so R0 is free for pointer arithmetic.
+              :RDLINE:
+1351  0440    :        LODI,R0 >IBUF
+1353  CC1400  :        STRA,R0 IPH
+1356  0414    :        LODI,R0 <IBUF
+1358  CC1401  :        STRA,R0 IPL
+              :RL_LP:
+135B  3F1348  :        BSTA,UN GETKEY          ; [+1] blocking — R0 = char
+135E  C1      :        STRZ,R1                 ; R1 = R0 (char  ; R0 now free for pointer arithmetic)
+135F  E50D    :        COMI,R1 CR
+1361  1C13D0  :        BCTA,EQ RL_EOL
+1364  E50A    :        COMI,R1 LF
+1366  1C13D0  :        BCTA,EQ RL_EOL
+1369  E508    :        COMI,R1 BS
+136B  1C1393  :        BCTA,EQ RL_BS
+              :        ; buffer full?  IP >= IBUF+63
+136E  0C1400  :        LODA,R0 IPH
+1371  AC0040  :        SUBA,R0 >IBUF
+1374  1D1383  :        BCTA,GT RL_FULL
+1377  1E1386  :        BCTA,LT RL_STORE
+137A  0C1401  :        LODA,R0 IPL
+137D  AC0014  :        SUBA,R0 <IBUF+63
+1380  1E1386  :        BCTA,LT RL_STORE
+              :RL_FULL:
+1383  1F135B  :        BCTA,UN RL_LP
+              :RL_STORE:
+1386  CD9400  :        STRA,R1 *IPH            ; store char to buffer
+1389  01      :        LODZ,R1
+138A  3F02B4  :        BSTA,UN COUT            ; echo char
+138D  3F143D  :        BSTA,UN INC_IP
+1390  1F135B  :        BCTA,UN RL_LP
+              :RL_BS:
+              :        ; at IBUF start? — no backspace if buffer empty
+1393  0C1400  :        LODA,R0 IPH
+1396  AC0040  :        SUBA,R0 >IBUF
+1399  1D13A8  :        BCTA,GT RL_BSDO
+139C  1E135B  :        BCTA,LT RL_LP
+139F  0C1401  :        LODA,R0 IPL
+13A2  AC0014  :        SUBA,R0 <IBUF
+13A5  1C135B  :        BCTA,EQ RL_LP
+              :RL_BSDO:
+13A8  0C1401  :        LODA,R0 IPL
+13AB  A401    :        SUBI,R0 1
+13AD  CC1401  :        STRA,R0 IPL
+13B0  9E13BB  :        BCFA,LT RL_BSNB
+13B3  0C1400  :        LODA,R0 IPH
+13B6  A401    :        SUBI,R0 1
+13B8  CC1400  :        STRA,R0 IPH
+              :RL_BSNB:
+13BB  0508    :        LODI,R1 BS
+13BD  01      :        LODZ,R1
+13BE  3F02B4  :        BSTA,UN COUT
+13C1  0520    :        LODI,R1 SP
+13C3  01      :        LODZ,R1
+13C4  3F02B4  :        BSTA,UN COUT
+13C7  0508    :        LODI,R1 BS
+13C9  01      :        LODZ,R1
+13CA  3F02B4  :        BSTA,UN COUT
+13CD  1F135B  :        BCTA,UN RL_LP
+              :RL_EOL:
+13D0  0500    :        LODI,R1 NUL
+13D2  CD9400  :        STRA,R1 *IPH            ; NUL-terminate buffer
+13D5  050D    :        LODI,R1 CR
+13D7  01      :        LODZ,R1
+13D8  3F02B4  :        BSTA,UN COUT
+13DB  050A    :        LODI,R1 LF
+13DD  01      :        LODZ,R1
+13DE  3F02B4  :        BSTA,UN COUT
+13E1  17      :        RETC,UN
+
+              :; ─── PRTSTR / PRTSTR_IP ───────────────────────────────────────────────────────
+              :; Print NUL-terminated string at IPH:IPL.
+              :PRTSTR:
+13E2  0D9400  :        LODA,R1 *IPH
+13E5  E500    :        COMI,R1 NUL
+13E7  1C13F4  :        BCTA,EQ PRTSTR_RET
+13EA  01      :        LODZ,R1
+13EB  3F02B4  :        BSTA,UN COUT
+13EE  3F143D  :        BSTA,UN INC_IP
+13F1  1F13E2  :        BCTA,UN PRTSTR
+              :PRTSTR_RET:
+13F4  17      :        RETC,UN
+              :; PRTSTR_IP is the same routine, just an alias for clarity at the call site.
+              :PRTSTR_IP:
+13F5  1F13E2  :        BCTA,UN PRTSTR
+
+              :; ─── WSKIP ────────────────────────────────────────────────────────────────────
+              :WSKIP:
+13F8  0C9400  :        LODA,R0 *IPH
+13FB  E420    :        COMI,R0 SP
+13FD  1C1401  :        BCTA,EQ WS_ADV
+1400  17      :        RETC,UN
+              :WS_ADV:
+1401  3F143D  :        BSTA,UN INC_IP
+1404  1F13F8  :        BCTA,UN WSKIP
+
+              :; ─── GETCI_UC ─────────────────────────────────────────────────────────────────
+              :; Read *IPH uppercase into R0, advance IP.
+              :GETCI_UC:
+1407  0C9400  :        LODA,R0 *IPH
+140A  3F1411  :        BSTA,UN UPCASE                   ; [+1]
+140D  3F143D  :        BSTA,UN INC_IP
+              :GETCI_UC_RET:
+1410  17      :        RETC,UN
+
+              :; ─── UPCASE ───────────────────────────────────────────────────────────────────
+              :UPCASE:
+1411  E461    :        COMI,R0 A'a'
+1413  1E1420  :        BCTA,LT UC_RET
+1416  E47B    :        COMI,R0 A'z'+1
+1418  1E141E  :        BCTA,LT UC_DO
+141B  1F1420  :        BCTA,UN UC_RET
+141E  A420    :UC_DO:  SUBI,R0 32
+1420  17      :UC_RET: RETC,UN
+
+              :; ─── EATWORD ──────────────────────────────────────────────────────────────────
+              :; Skip [A-Za-z$] at IP.
+              :EATWORD:
+1421  0C9400  :        LODA,R0 *IPH
+1424  3F1411  :        BSTA,UN UPCASE  ; [+1]
+1427  E441    :        COMI,R0 A'A'
+1429  1E1431  :        BCTA,LT EW_DS
+142C  E45B    :        COMI,R0 A'Z'+1
+142E  1E1437  :        BCTA,LT EW_ADV
+1431  E424    :EW_DS:  COMI,R0 A'$'
+1433  1C1437  :        BCTA,EQ EW_ADV
+1436  17      :        RETC,UN
+              :EW_ADV:
+1437  3F143D  :        BSTA,UN INC_IP
+143A  1F1421  :        BCTA,UN EATWORD
+
+              :; ─── SHARED 16-BIT POINTER INCREMENT/DECREMENT SUBROUTINES ───────────────────
+              :; INC_IP  : IPH:IPL  += 1   (clobbers R0)
+              :; INC_TMP : TMPH:TMPL += 1  (clobbers R0)
+              :; INC_EXP : EXPH:EXPL += 1  (clobbers R0)
+              :; DEC_TMP : TMPH:TMPL -= 1  (clobbers R0)
+              :; Rule: NO BSTA inside these — must not consume extra RAS depth.
+              :; Carry idiom: ADDI sets no-carry->GT, carry->EQ/LT.
+              :;   BCTA,GT skip  =  skip hi-byte increment if no carry from lo-byte add.
+              :; Borrow idiom: SUBI sets no-borrow->GT/EQ, borrow->LT.
+              :;   BCFA,LT skip  =  skip hi-byte decrement if no borrow (C=1).
+
+              :INC_IP:
+143D  0C1401  :        LODA,R0 IPL
+1440  8401    :        ADDI,R0 1
+1442  CC1401  :        STRA,R0 IPL
+1445  1D1450  :        BCTA,GT INC_IP_RET      ; no carry — hi byte unchanged
+1448  0C1400  :        LODA,R0 IPH
+144B  8401    :        ADDI,R0 1
+144D  CC1400  :        STRA,R0 IPH
+              :INC_IP_RET:
+1450  17      :        RETC,UN
+
+              :INC_TMP:
+1451  0C1413  :        LODA,R0 TMPL
+1454  8401    :        ADDI,R0 1
+1456  CC1413  :        STRA,R0 TMPL
+1459  1D1464  :        BCTA,GT INC_TMP_RET     ; no carry
+145C  0C1412  :        LODA,R0 TMPH
+145F  8401    :        ADDI,R0 1
+1461  CC1412  :        STRA,R0 TMPH
+              :INC_TMP_RET:
+1464  17      :        RETC,UN
+
+              :INC_EXP:
+1465  0C1411  :        LODA,R0 EXPL
+1468  8401    :        ADDI,R0 1
+146A  CC1411  :        STRA,R0 EXPL
+146D  1D1478  :        BCTA,GT INC_EXP_RET     ; no carry
+1470  0C1410  :        LODA,R0 EXPH
+1473  8401    :        ADDI,R0 1
+1475  CC1410  :        STRA,R0 EXPH
+              :INC_EXP_RET:
+1478  17      :        RETC,UN
+
+              :DEC_TMP:
+1479  0C1413  :        LODA,R0 TMPL
+147C  A401    :        SUBI,R0 1
+147E  CC1413  :        STRA,R0 TMPL
+1481  9E148C  :        BCFA,LT DEC_TMP_RET     ; no borrow (C=1) — hi byte unchanged
+1484  0C1412  :        LODA,R0 TMPH
+1487  A401    :        SUBI,R0 1
+1489  CC1412  :        STRA,R0 TMPH
+              :DEC_TMP_RET:
+148C  17      :        RETC,UN
+
+
+              :; ─── DO_ERROR ─────────────────────────────────────────────────────────────────
+              :; Entry: R0 = error code (0-5).
+              :; Saves RUNFLG, clears all run state, prints "?n [IN line]", jumps to REPL.
+              :; This is a tail-jump (BCTA,UN DO_ERROR from callers), so it kills the full RAS.
+              :DO_ERROR:
+148D  CC140C  :        STRA,R0 SC0                      ; save error code
+1490  0C1404  :        LODA,R0 RUNFLG
+1493  CC140D  :        STRA,R0 SC1  ; save run state
+1496  0400    :        LODI,R0 $00
+1498  CC1404  :        STRA,R0 RUNFLG  ; clear run
+149B  04FF    :        LODI,R0 $FF
+149D  CC142D  :        STRA,R0 SWSP  ; clear GOSUB stack
+14A0  053F    :        LODI,R1 A'?'
+14A2  01      :        LODZ,R1
+14A3  3F02B4  :        BSTA,UN COUT
+14A6  0D140C  :        LODA,R1 SC0
+14A9  8530    :        ADDI,R1 A'0'
+14AB  01      :        LODZ,R1
+14AC  3F02B4  :        BSTA,UN COUT
+14AF  0C140D  :        LODA,R0 SC1
+14B2  E401    :        COMI,R0 $01
+14B4  1C14BA  :        BCTA,EQ DE_IN
+14B7  1F14E1  :        BCTA,UN DE_NL
+              :DE_IN:
+14BA  0520    :        LODI,R1 SP
+14BC  01      :        LODZ,R1
+14BD  3F02B4  :        BSTA,UN COUT
+14C0  0549    :        LODI,R1 A'I'
+14C2  01      :        LODZ,R1
+14C3  3F02B4  :        BSTA,UN COUT
+14C6  054E    :        LODI,R1 A'N'
+14C8  01      :        LODZ,R1
+14C9  3F02B4  :        BSTA,UN COUT
+14CC  0520    :        LODI,R1 SP
+14CE  01      :        LODZ,R1
+14CF  3F02B4  :        BSTA,UN COUT
+14D2  0C1408  :        LODA,R0 CURH
+14D5  CC1410  :        STRA,R0 EXPH
+14D8  0C1409  :        LODA,R0 CURL
+14DB  CC1411  :        STRA,R0 EXPL
+14DE  3F1281  :        BSTA,UN PRINT_S16                ; [+1]
+              :DE_NL:
+14E1  050D    :        LODI,R1 CR
+14E3  01      :        LODZ,R1
+14E4  3F02B4  :        BSTA,UN COUT
+14E7  050A    :        LODI,R1 LF
+14E9  01      :        LODZ,R1
+14EA  3F02B4  :        BSTA,UN COUT
+14ED  1F047A  :        BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
+
+              :        END
+
+Symbol Table--------------------------------------------------------------
+
+;CPU flags:
+data            0x0001  C
+data            0x0001  CAR
+data            0x0001  CRY
+data            0x0002  COM
+data            0x0002  LCOM
+data            0x0004  OVF
+data            0x0008  WC
+data            0x0010  RS
+data            0x0020  IDC
+data            0x0020  II
+data            0x0040  F
+data            0x0040  FLAG
+data            0x0080  S
+data            0x0080  SENS
+;Guest-specific:
+code            0x0000  INIT
+code            0x0003  AINI
+vector          0x0019  VEC
+code            0x001D  EBUG
+code            0x0022  MBUG
+code            0x005B  LINE
+code            0x0060  LLIN
+code            0x0079  ALIN
+code            0x007D  ELIN
+code            0x007F  CLIN
+code            0x0084  DLIN
+code            0x008A  CRLF
+code            0x0095  BLIN
+code            0x00A4  STRT
+code            0x00AB  ALTE
+code            0x00AB  INCT
+code            0x00AE  LALT
+code            0x00D2  CALT
+code            0x00E3  DALT
+code            0x00F4  SREG
+code            0x00F7  LSRE
+code            0x0116  ASRE
+code            0x012A  BSRE
+code            0x0132  CSRE
+code            0x013A  GOTO
+code            0x0160  BK01
+code            0x016E  BK02
+code            0x017A  BKEN
+code            0x01AB  CLBK
+code            0x01CA  CLR
+code            0x01D7  NOK
+code            0x01E5  BKPT
+code            0x0222  DISP
+code            0x0224  BIN
+code            0x023D  CBCC
+code            0x0246  LKUP
+code            0x0248  ALKU
+code            0x0250  ABRT
+data            0x0259  ANSI
+code            0x0269  BOUT
+code            0x0286  CHIN
+code            0x028F  ACHI
+code            0x0296  BCHI
+code            0x02A8  DLAY
+code            0x02AD  DLY
+code            0x02B4  COUT
+code            0x02C1  ACOU
+code            0x02CA  ONE
+code            0x02CC  ZERO
+code            0x02D5  DNUM
+code            0x02DB  GNUM
+code            0x02E1  LNUM
+code            0x02F2  BNUM
+code            0x02F5  CNUM
+code            0x0310  DUMP
+code            0x0325  FDUM
+code            0x0351  CDUM
+code            0x035B  FORM
+code            0x035F  GAP
+code            0x0361  AGAP
+code            0x0369  ADUM
+code            0x036B  BDUM
+code            0x0386  DDUM
+code            0x039A  EDUM
+code            0x039B  DLAY
+code            0x039F  DLY
+code            0x03B5  LOAD
+code            0x03D4  ALOA
+code            0x03E1  BLOA
+code            0x03F5  CLOA
+data            0x0400  COM
+code            0x0409  XGOT
+data            0x040D  TEMP
+data            0x040F  TEMQ
+data            0x0411  TEMR
+data            0x0412  TEMS
+data            0x0413  BUFF
+data            0x0427  BPTR
+data            0x0428  MCNT
+data            0x0429  CNT
+data            0x042A  CODE
+data            0x042B  OKGO
+data            0x042C  BCC
+data            0x042D  MARK
+data            0x042F  HDAT
+data            0x0431  LDAT
+data            0x0433  HADR
+data            0x0435  LADR
+data            0x2FFA  START
+data            0x2FFC  ZEND
+data            0x2FFE  NEW
+code            0x3C07  GPAR
+code            0x3C2A  INCRT
+code            0x3C3C  PADR
+code            0x3C50  HEXLIST
+code            0x3C6A  SEARCH
+code            0x3C8A  HEXIN
+code            0x3CDD  VERIFY
+code            0x3CF8  OK
+code            0x3D0E  FAULTY
+code            0x3D3B  MOVE
+code            0x3DBE  Z3OUT
+code            0x3DE4  Z3IN
+code            0x3E02  ZDUMP
+code            0x3E53  ZLOAD
+code            0x3EA2  ZVERIFY
+;User-defined:
+symbol          0x000D  CR
+symbol          0x000A  LF
+symbol          0x0008  BS
+symbol          0x0020  SP
+symbol          0x0000  NUL
+symbol          0x0022  DQ
+symbol          0x1400  IPH
+symbol          0x1401  IPL
+symbol          0x1402  PEH
+symbol          0x1403  PEL
+symbol          0x1404  RUNFLG
+symbol          0x1405  GOTOFLG
+symbol          0x1406  GOTOH
+symbol          0x1407  GOTOL
+symbol          0x1408  CURH
+symbol          0x1409  CURL
+symbol          0x140A  LNUMH
+symbol          0x140B  LNUML
+symbol          0x140C  SC0
+symbol          0x140D  SC1
+symbol          0x140E  ERRFLG
+symbol          0x140F  NEGFLG
+symbol          0x1410  EXPH
+symbol          0x1411  EXPL
+symbol          0x1412  TMPH
+symbol          0x1413  TMPL
+symbol          0x1414  OPSTK
+symbol          0x141C  VALSH
+symbol          0x1424  VALSL
+symbol          0x142C  STKIDX
+symbol          0x142D  SWSP
+symbol          0x142E  SWSTK             ;Unused
+symbol          0x143E  RELOP
+symbol          0x1440  IBUF
+symbol          0x1480  VARS
+symbol          0x14C0  PROG
+symbol          0x1C00  PROGLIM
+symbol          0x0440  RESET             ;Unused
+symbol          0x0463  CLRV
+symbol          0x046B  CLRV_NC           ;Unused
+symbol          0x047A  REPL
+symbol          0x04A4  BANNER
+symbol          0x04B9  KW_TAB
+symbol          0x04DB  DIVTAB
+symbol          0x04E5  STMT_EXEC
+symbol          0x0506  SE_SCAN
+symbol          0x052A  SE_CHK2
+symbol          0x052D  SE_C2N            ;Unused
+symbol          0x054C  SE_MATCH
+symbol          0x054F  SE_TN             ;Unused
+symbol          0x058D  SE_SYNERR
+symbol          0x0592  SE_RET
+symbol          0x0593  DO_REM
+symbol          0x0594  DO_END
+symbol          0x05A2  DE_HALT
+symbol          0x05A3  DO_NEW
+symbol          0x05AE  DO_PRINT
+symbol          0x05B9  DP_ITEM
+symbol          0x05DA  DP_NUM
+symbol          0x05E8  DP_CHAR
+symbol          0x05F2  DP_STRING
+symbol          0x05F5  DP_SLP
+symbol          0x060C  DP_SCLS
+symbol          0x060F  DP_SDONE
+symbol          0x060F  DP_SEP
+symbol          0x061D  DP_COMMA
+symbol          0x0623  DP_NL
+symbol          0x0630  DO_LET
+symbol          0x0643  DL_ERR
+symbol          0x0648  DL_VAROK
+symbol          0x064E  DL_EQ             ;Unused
+symbol          0x065E  DL_EQC
+symbol          0x0661  DL_EX             ;Unused
+symbol          0x0671  DL_STORE
+symbol          0x0689  DL_NC
+symbol          0x0695  DL_NC2            ;Unused
+symbol          0x069C  DO_INPUT
+symbol          0x06AF  DIN_ERR
+symbol          0x06B4  DIN_VAROK
+symbol          0x06BA  DIN_PR            ;Unused
+symbol          0x06E3  DO_IF
+symbol          0x06F3  DIF_LS
+symbol          0x070F  DIF_RP
+symbol          0x071F  DIF_EVAL
+symbol          0x0749  DIF_LT
+symbol          0x0751  DIF_GT
+symbol          0x0756  DIF_TH
+symbol          0x0766  DIF_TH2
+symbol          0x0773  DIF_EW
+symbol          0x079C  DIF_CEQ
+symbol          0x07A7  DIF_CNE
+symbol          0x07B2  DIF_CLT
+symbol          0x07BD  DIF_CGT
+symbol          0x07C8  DIF_CLE
+symbol          0x07D3  DIF_CGE
+symbol          0x07DE  DIF_TRUE
+symbol          0x07E1  DIF_FALSE
+symbol          0x07E2  DO_GOTO
+symbol          0x07F2  DG_OK
+symbol          0x0810  DG_RET
+symbol          0x0811  DO_LIST
+symbol          0x081B  DLS_LP
+symbol          0x0833  DLS_BODY
+symbol          0x083C  DLS_N1            ;Unused
+symbol          0x0845  DLS_N2            ;Unused
+symbol          0x0854  DLS_N3            ;Unused
+symbol          0x0859  DLS_BLPX
+symbol          0x0863  DLS_BNC           ;Unused
+symbol          0x0865  DLS_NL
+symbol          0x0874  DLS_RET
+symbol          0x0875  DO_RUN
+symbol          0x0889  DR_LP
+symbol          0x08A9  DR_EXEC
+symbol          0x08B2  DR_N1             ;Unused
+symbol          0x08BB  DR_N2             ;Unused
+symbol          0x08C1  DR_N3             ;Unused
+symbol          0x08D0  DR_CPY
+symbol          0x08D9  DR_TNC            ;Unused
+symbol          0x08DC  DR_INC            ;Unused
+symbol          0x08DE  DR_CD
+symbol          0x0913  DR_GOTO
+symbol          0x0937  DR_STOP
+symbol          0x093C  DR_RET
+symbol          0x093D  TRY_STORE_LINE
+symbol          0x094F  TSL_RET
+symbol          0x0950  TSL_NUM
+symbol          0x095E  TSL_GOT
+symbol          0x096C  TSL_RNG
+symbol          0x097C  TSL_NZ
+symbol          0x0999  TSL_DEL
+symbol          0x099C  TSL_DONE
+symbol          0x09A2  TSL_RET2
+symbol          0x09A3  STORE_LINE
+symbol          0x09B4  SL_MEAS
+symbol          0x09BF  SL_MNC            ;Unused
+symbol          0x09C1  SL_MEASD
+symbol          0x09DE  SL_NBC
+symbol          0x09F7  SL_ROOM
+symbol          0x0A1A  SL_SHCNB
+symbol          0x0A2D  SL_DOSHIFT
+symbol          0x0A3D  SL_SNBR
+symbol          0x0A51  SL_DSNCA
+symbol          0x0A57  SL_SHLOOP
+symbol          0x0A75  SL_SRNB
+symbol          0x0A88  SL_DRNB
+symbol          0x0A8A  SL_NOSHIFT
+symbol          0x0A9F  SL_WN1            ;Unused
+symbol          0x0AA8  SL_WN2            ;Unused
+symbol          0x0AB1  SL_WN3            ;Unused
+symbol          0x0AB9  SL_WBODY
+symbol          0x0AC2  SL_WBNC           ;Unused
+symbol          0x0AC5  SL_WENC           ;Unused
+symbol          0x0AC7  SL_WDONE
+symbol          0x0ADB  SL_PENC
+symbol          0x0ADC  DELETE_LINE
+symbol          0x0AE8  DL2_FOUND
+symbol          0x0B07  DL2_BLN
+symbol          0x0B14  DL2_SKIP
+symbol          0x0B1C  DL2_SN            ;Unused
+symbol          0x0B1E  DL2_COPY
+symbol          0x0B1E  DL2_LP
+symbol          0x0B36  DL2_MOV
+symbol          0x0B3F  DL2_TNC           ;Unused
+symbol          0x0B42  DL2_ENC           ;Unused
+symbol          0x0B45  DL2_DONE
+symbol          0x0B59  DL2_PNC
+symbol          0x0B5A  FIND_LINE
+symbol          0x0B69  FL_LP
+symbol          0x0B81  FL_CHK
+symbol          0x0B9D  FL_LH
+symbol          0x0BB2  FL_ADV
+symbol          0x0BC5  FL_AN
+symbol          0x0BCB  FL_AN2            ;Unused
+symbol          0x0BD0  FL_AS
+symbol          0x0BD3  FL_ASN            ;Unused
+symbol          0x0BD8  FL_RET
+symbol          0x0BD9  FIND_INS
+symbol          0x0BE3  FI_LP
+symbol          0x0BFB  FI_CHK
+symbol          0x0C17  FI_LH
+symbol          0x0C26  FI_ADV
+symbol          0x0C39  FI_AN
+symbol          0x0C3F  FI_AN2            ;Unused
+symbol          0x0C44  FI_AS
+symbol          0x0C47  FI_ASN            ;Unused
+symbol          0x0C4C  FI_RET
+symbol          0x0C4D  PARSE_EXPR
+symbol          0x0C57  PX_ATOM
+symbol          0x0C78  PX_LPAR
+symbol          0x0C7B  PX_LPN            ;Unused
+symbol          0x0C90  PX_LPNCA
+symbol          0x0C9B  PX_UNEG
+symbol          0x0C9E  PX_UNN            ;Unused
+symbol          0x0CAA  PX_NEG
+symbol          0x0CC0  PX_UPOS
+symbol          0x0CC3  PX_UPN            ;Unused
+symbol          0x0CCF  PX_PUSHV
+symbol          0x0CE4  PX_VHN
+symbol          0x0CFD  PX_VLN
+symbol          0x0D06  PX_PEEKOP
+symbol          0x0D1C  PX_REDLP
+symbol          0x0D33  PX_TOPNC
+symbol          0x0D50  PX_PUSHOP
+symbol          0x0D59  PX_PON            ;Unused
+symbol          0x0D69  PX_OPN
+symbol          0x0D75  PX_RPAR
+symbol          0x0D78  PX_RPNCA          ;Unused
+symbol          0x0D78  PX_RPLP
+symbol          0x0D8F  PX_RPNCA2
+symbol          0x0DA3  PX_POPSENT
+symbol          0x0DAB  PX_RPDONE
+symbol          0x0DAE  PX_RALL
+symbol          0x0DAE  PX_RALL_LP
+symbol          0x0DC5  PX_RANC
+symbol          0x0DD4  PX_DONE
+symbol          0x0DE6  GET_PREC
+symbol          0x0DE9  GET_PREC_SC0
+symbol          0x0E00  GP_LOW
+symbol          0x0E03  GP_HIGH
+symbol          0x0E06  APPLY_OP
+symbol          0x0E16  AO_RHN
+symbol          0x0E2F  AO_RLN
+symbol          0x0E4A  AO_LHN
+symbol          0x0E65  AO_LLN
+symbol          0x0E86  AO_ADD
+symbol          0x0E9A  AO_ADDNC
+symbol          0x0E9D  AO_ADDHI
+symbol          0x0EA6  AO_SUB
+symbol          0x0EBA  AO_SUBNB
+symbol          0x0EBD  AO_SUBHI
+symbol          0x0EC6  AO_MUL
+symbol          0x0ED8  AO_DIV
+symbol          0x0EEA  AO_STORE
+symbol          0x0EFC  AO_SHN
+symbol          0x0F17  AO_SLN
+symbol          0x0F29  PARSE_FACTOR
+symbol          0x0F3E  PF_NUM
+symbol          0x0F42  PF_LOADVAR
+symbol          0x0F45  PF_LVNCA          ;Unused
+symbol          0x0F5D  PF_LVN
+symbol          0x0F69  PF_LVN2           ;Unused
+symbol          0x0F75  PARSE_RELOP
+symbol          0x0F90  PRO_EQ
+symbol          0x0F93  PRO_EQN           ;Unused
+symbol          0x0F9E  PRO_LT
+symbol          0x0FA1  PRO_LTN           ;Unused
+symbol          0x0FBC  PRO_LE
+symbol          0x0FBF  PRO_LEN           ;Unused
+symbol          0x0FCA  PRO_NE
+symbol          0x0FCD  PRO_NEN           ;Unused
+symbol          0x0FD8  PRO_GT
+symbol          0x0FDB  PRO_GTN           ;Unused
+symbol          0x0FF1  PRO_GE
+symbol          0x0FF4  PRO_GEN           ;Unused
+symbol          0x0FFF  PARSE_S16
+symbol          0x1012  PS16_NEG
+symbol          0x1015  PS16_NN           ;Unused
+symbol          0x101A  PS16_UN
+symbol          0x1026  PS16_CHK
+symbol          0x1041  PS16_RET
+symbol          0x1042  PARSE_U16
+symbol          0x104F  PU16_LP
+symbol          0x1062  PU16_DIG
+symbol          0x106A  PU16_DNC          ;Unused
+symbol          0x1080  PU16_M10
+symbol          0x1094  PU16_MNC
+symbol          0x10B3  PU16_DIG_NC
+symbol          0x10BB  PU16_DONE
+symbol          0x10BC  MUL16
+symbol          0x10F1  MU_LA
+symbol          0x1124  MU_RA
+symbol          0x1138  MU_LP
+symbol          0x1148  MU_ADD
+symbol          0x115C  MU_MNC
+symbol          0x1178  MU_TNB
+symbol          0x117B  MU_DONE
+symbol          0x1196  MU_RET
+symbol          0x1197  DIV16
+symbol          0x11AC  DV_NZ
+symbol          0x11E1  DV_DA
+symbol          0x1214  DV_VA
+symbol          0x1228  DV_LP
+symbol          0x123D  DV_SUB
+symbol          0x1251  DV_SNB
+symbol          0x1260  DV_DONE
+symbol          0x127B  DV_RET
+symbol          0x127C  DV_ZERO
+symbol          0x1281  PRINT_S16
+symbol          0x12A2  PS16P_POS
+symbol          0x12B9  PS16P_NZ
+symbol          0x12C8  PS16P_DIVLP
+symbol          0x12D1  PS16P_D1          ;Unused
+symbol          0x12DA  PS16P_D2          ;Unused
+symbol          0x12EA  PS16P_CNT
+symbol          0x12EC  PS16P_SLP
+symbol          0x1301  PS16P_DO
+symbol          0x1315  PS16P_SNB
+symbol          0x1320  PS16P_EMIT
+symbol          0x132E  PS16P_FPRINT
+symbol          0x133E  PS16P_LAST
+symbol          0x1348  GETKEY
+symbol          0x1351  RDLINE
+symbol          0x135B  RL_LP
+symbol          0x1383  RL_FULL
+symbol          0x1386  RL_STORE
+symbol          0x1393  RL_BS
+symbol          0x13A8  RL_BSDO
+symbol          0x13BB  RL_BSNB
+symbol          0x13D0  RL_EOL
+symbol          0x13E2  PRTSTR
+symbol          0x13F4  PRTSTR_RET
+symbol          0x13F5  PRTSTR_IP
+symbol          0x13F8  WSKIP
+symbol          0x1401  WS_ADV
+symbol          0x1407  GETCI_UC
+symbol          0x1410  GETCI_UC_RET      ;Unused
+symbol          0x1411  UPCASE
+symbol          0x141E  UC_DO
+symbol          0x1420  UC_RET
+symbol          0x1421  EATWORD
+symbol          0x1431  EW_DS
+symbol          0x1437  EW_ADV
+symbol          0x143D  INC_IP
+symbol          0x1450  INC_IP_RET
+symbol          0x1451  INC_TMP
+symbol          0x1464  INC_TMP_RET
+symbol          0x1465  INC_EXP
+symbol          0x1478  INC_EXP_RET
+symbol          0x1479  DEC_TMP           ;Unused
+symbol          0x148C  DEC_TMP_RET
+symbol          0x148D  DO_ERROR
+symbol          0x14BA  DE_IN
+symbol          0x14E1  DE_NL
+Assembled 2309 line(s) (0 warning(s), 0 error(s)).
