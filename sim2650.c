@@ -23,9 +23,6 @@
  *              (previously returned without fetching, leaving PC wrong).
  *   BUG-SIM-06 FIXED: --pipbug implicitly enables --allow-ram-image so the
  *              user program hex (loaded at $0440+) is accepted without error.
- *   NOTE: Emu2650.cs ADD/SUB CC uses sign-based SetCCFor — this is WRONG per
- *         the 2650 datasheet. sim2650 carry-based set_cc_add/set_cc_sub are
- *         correct and intentionally differ from Emu2650.cs on those opcodes.
  *
  * Changes v1.4 -> v1.5:
  *   BUG-SIM-01 FIXED: ZBSR fetches signed 7-bit operand as page-relative target
@@ -43,7 +40,7 @@
  * PSL: CC1[7] CC0[6] IDC[5] RS[4] WC[3] OVF[2] COM[1] C[0]
  * PSU: S[7] F[6] II[5] - - SP[2:0]
  *
- * PIPBUG 1 memory map (Motorola MK3880 / Signetics reference board):
+ * PIPBUG 1 memory map:
  *   $0000-$03FF  PIPBUG ROM  (1 kB, read-only)
  *   $0400-$043F  PIPBUG RAM  (64 B, stack/scratch)
  *   $0440-$1BFF  User RAM    (program+data, writable)
@@ -63,15 +60,15 @@
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
 #define DEF_ROM_START 0x0000
-#define DEF_ROM_END   0x13FF
-#define DEF_RAM_START 0x1400
-#define DEF_RAM_END   0x1BFF
+#define DEF_ROM_END   0x0fff
+#define DEF_RAM_START 0x1000
+#define DEF_RAM_END   0x1fFF
 
 /* PIPBUG 1 memory map */
 #define PB_ROM_START  0x0000
 #define PB_ROM_END    0x03FF   /* 1 kB Pipbug ROM */
 #define PB_RAM_START  0x0400   /* 64 B Pipbug RAM + user area */
-#define PB_RAM_END    0x1BFF
+#define PB_RAM_END    0x1fFF
 
 /* Active map (set at startup) */
 static unsigned short ROM_START_A = DEF_ROM_START;
