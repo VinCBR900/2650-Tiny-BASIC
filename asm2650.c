@@ -157,14 +157,24 @@ static void assemble_line(char *line){
     if(strcmp(mn,"SPSL")==0){ emit(pc,0x13);pc++; return; }
     if(strcmp(mn,"LPSU")==0){ emit(pc,0x92);pc++; return; }
     if(strcmp(mn,"LPSL")==0){ emit(pc,0x93);pc++; return; }
-    /* ZBRR: 1-byte instruction $9B, no operand (per 2650 manual).
-     * WinArcadia assembler quirk: expects ZBRR with a dummy arg — use RETC,UN
-     * in WinArcadia source for compatibility. Our asm2650 is correct. */
+    /* ZBRR and ZBSR - Both Buggy but fix/test later.
+    * 2 byte isntruction, 2nd byte bit 7 is indirect, bits 6-0 is SIGNED offset
+    * from 2650 User manual:
+        ZBSR (*)a - ZERO BRANCH TO SUBROUTINE, RELATIVE
+        ZBRR (*)a - ZERO BRANCH, RELATIVE
+        The specified value, a, is interpreted as a relative displacement from
+        page zero, byte zero. Therefore, displacement may be specified from -64 to
+        +63 bytes. The address calculation is modulo 8192, so the negative
+        displacement actually will develop addresses at the end of page zero. For
+        example, ZBRR -8 will develop an effective address of 8184, and ZBRR +52
+        will develop an effective address of 52.
+        This instruction causes the processor to clear address bits #13 and #14,
+        the page address bits, and may be executed anywhere within addressable
+        memory.
+        Indirect addressing may be specified. (Bit 7 2nd byte)
+    * ZBSR replaces BSTA,UN & ZBRR replaces BCTA,UN both unconditional
+    * short form 2 byte replacements instead of 3, with indirect (*) lookup table*/
     if(strcmp(mn,"ZBRR")==0){ emit(pc,0x9B);pc++; return; }
-    /* ZBSR: 2-byte instruction $BB + signed 7-bit page-relative target.
-     * Syntax: ZBSR *offset  where offset is 0..$3F (positive) or negative wrap.
-     * WinArcadia range check: signed 7-bit = -64..+63 only.
-     * Positive range 0..$3F reaches addresses $0000-$003F in page 0. */
     if(strcmp(mn,"ZBSR")==0){
         emit(pc,0xBB); pc++;
         char *a=ops[0]; if(*a=='*') a++;  /* strip optional * prefix */
