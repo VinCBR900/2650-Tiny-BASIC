@@ -7,7 +7,7 @@
 ;   Program loads at $0440.  All RAM EQUs remain at $1400+ (plenty of room).
 ;   I/O via Pipbug ROM calls (replaces direct WRTD/REDE hardware instructions):
 ;     COUT $02B4  — putchar: R0 = char to print
-;     CHIN $0286  — getchar non-blocking: returns R0=0 if no key ready
+;     CHIN $0286  — getchar blocking: returns R0=ASCII
 ;     CRLF $008A  — print CR+LF
 ;
 ; CC SEMANTICS (set_cc_add / set_cc_sub from sim2650):
@@ -24,9 +24,8 @@
 ;   DO_ERROR saves RUNFLG, clears state, then BCTA,UN REPL (kills full RAS).
 ;
 ; I/O CONVENTION (Pipbug):
-;   Output: load char into R1, then LODZ,R1 (R0=R1) + BSTA,UN COUT
-;           OR call BSTA,UN PUTCH with char already in R1 (saves 1 byte per site)
-;   Input:  BSTA,UN GETKEY — spins on CHIN until R0 != 0, returns char in R0
+;   Output: call BSTA,UN PUTCH with char already in R1 
+;   Input:  BSTA,UN GETKEY — waits until press, returns char in R0
 ;   RDLINE: fills IBUF using GETKEY; echoes via COUT; result in R1 at each step
 ;
 ; RAS DEPTH BUDGET:
@@ -115,11 +114,9 @@ CLRV_NC:
 
 ; ─── REPL ────────────────────────────────────────────────────────────────────
 REPL:
-        LODI,R1 A'>'
-        LODZ,R1
+        LODI,R0 A'>'
         BSTA,UN COUT
-        LODI,R1 SP
-        LODZ,R1
+        LODI,R0 SP
         BSTA,UN COUT
         BSTA,UN RDLINE
         LODI,R0 >IBUF
@@ -301,8 +298,7 @@ DP_NUM:
         BSTA,UN PRINT_S16
         BCTA,UN DP_SEP  ; [+1]
 DP_CHAR:
-        LODA,R1 EXPL
-        LODZ,R1
+        LODA,R0 EXPL
         BSTA,UN COUT
         BCTA,UN DP_SEP
 
@@ -333,12 +329,7 @@ DP_COMMA:
         BSTA,UN INC_IP
         BCTA,UN DP_ITEM
 DP_NL:
-        LODI,R1 CR
-        LODZ,R1
-        BSTA,UN COUT
-        LODI,R1 LF
-        LODZ,R1
-        BSTA,UN COUT
+        BSTA,UN CRLF
         RETC,UN
 
 ; ─── DO_LET / shared store path ───────────────────────────────────────────────
@@ -411,11 +402,9 @@ DIN_VAROK:
         STRA,R0 SC0                      ; save variable letter
         BSTA,UN INC_IP
 DIN_PR:
-        LODI,R1 A'?'
-        LODZ,R1
+        LODI,R0 A'?'
         BSTA,UN COUT
-        LODI,R1 SP
-        LODZ,R1
+        LODI,R0 SP
         BSTA,UN COUT
         BSTA,UN RDLINE                   ; [+1]
         LODI,R0 >IBUF
@@ -603,8 +592,7 @@ DLS_N1:
         BSTA,UN INC_TMP
 DLS_N2:
         BSTA,UN PRINT_S16                ; [+1]
-        LODI,R1 SP
-        LODZ,R1
+        LODI,R0 SP
         BSTA,UN COUT
         ; body length into R3
         LODA,R3 *TMPH
@@ -613,19 +601,13 @@ DLS_N3:
         COMI,R3 $00
         BCTA,EQ DLS_NL
 DLS_BLPX:
-        LODA,R1 *TMPH
-        LODZ,R1
+        LODA,R0 *TMPH
         BSTA,UN COUT
         BSTA,UN INC_TMP
 DLS_BNC:
         BRNR,R3 DLS_BLPX
 DLS_NL:
-        LODI,R1 CR
-        LODZ,R1
-        BSTA,UN COUT
-        LODI,R1 LF
-        LODZ,R1
-        BSTA,UN COUT
+        BSTA,UN CRLF
         BCTA,UN DLS_LP
 DLS_RET:
         RETC,UN
@@ -1961,8 +1943,7 @@ PRINT_S16:
         LODA,R0 EXPH
         COMI,R0 $80
         BCTA,LT PS16P_POS
-        LODI,R1 A'-'
-        LODZ,R1
+        LODI,R0 A'-'
         BSTA,UN COUT
         ; negate
         LODA,R0 EXPH
@@ -1979,8 +1960,7 @@ PS16P_POS:
         LODA,R0 EXPL
         COMI,R0 $00
         BCTA,GT PS16P_NZ
-        LODI,R1 A'0'
-        LODZ,R1
+        LODI,R0 A'0'
         BSTA,UN COUT
         RETC,UN
 
@@ -2042,29 +2022,24 @@ PS16P_EMIT:
         COMI,R0 $00
         BCTA,EQ PS16P_DIVLP  ; skip leading zero
 PS16P_FPRINT:
-        LODZ,R3                 ; R0 = R3 (digit value)
-        STRZ,R1                 ; R1 = R0 (= R3, digit value)
-        ADDI,R1 A'0'             ; R1 = ASCII digit
-        LODZ,R1                 ; R0 = R1 (for COUT)
+        LODZ,R3                 ; R0 = R3 (digit value 0-9)
+        ADDI,R0 A'0'            ; R0 = ASCII digit
         BSTA,UN COUT
         LODI,R0 $01
         STRA,R0 NEGFLG
         BCTA,UN PS16P_DIVLP
 PS16P_LAST:
-        LODA,R1 EXPL
-        ADDI,R1 A'0'
-        LODZ,R1
+        LODA,R0 EXPL
+        ADDI,R0 A'0'
         BSTA,UN COUT
         RETC,UN
 
 ; ─── GETKEY ───────────────────────────────────────────────────────────────────
-; Blocking keyboard read via Pipbug CHIN (non-blocking).
-; Spins until a key is available.  Returns char in R0.
-; Clobbers R0 only.  RAS cost: +1 for CHIN call (net 0 at return).
+; Blocking keyboard read via Pipbug CHIN.
+; CHIN is blocking — waits for a keypress before returning.
+; Returns char in R0.  Clobbers R0 only.
 GETKEY:
-        BSTA,UN CHIN            ; R0 = key, or 0 if no key ready
-        COMI,R0 $00
-        BCTA,EQ GETKEY          ; spin until non-zero
+        BSTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
         RETC,UN
 
 ; ─── RDLINE ───────────────────────────────────────────────────────────────────
@@ -2119,25 +2094,17 @@ RL_BSDO:
         SUBI,R0 1
         STRA,R0 IPH
 RL_BSNB:
-        LODI,R1 BS
-        LODZ,R1
+        LODI,R0 BS
         BSTA,UN COUT
-        LODI,R1 SP
-        LODZ,R1
+        LODI,R0 SP
         BSTA,UN COUT
-        LODI,R1 BS
-        LODZ,R1
+        LODI,R0 BS
         BSTA,UN COUT
         BCTA,UN RL_LP
 RL_EOL:
         LODI,R1 NUL
         STRA,R1 *IPH            ; NUL-terminate buffer
-        LODI,R1 CR
-        LODZ,R1
-        BSTA,UN COUT
-        LODI,R1 LF
-        LODZ,R1
-        BSTA,UN COUT
+        BSTA,UN CRLF
         RETC,UN
 
 ; ─── PRTSTR / PRTSTR_IP ───────────────────────────────────────────────────────
@@ -2269,29 +2236,23 @@ DO_ERROR:
         STRA,R0 RUNFLG  ; clear run
         LODI,R0 $FF
         STRA,R0 SWSP  ; clear GOSUB stack
-        LODI,R1 A'?'
-        LODZ,R1
+        LODI,R0 A'?'
         BSTA,UN COUT
-        LODA,R1 SC0
-        ADDI,R1 A'0'
-        LODZ,R1
+        LODA,R0 SC0
+        ADDI,R0 A'0'
         BSTA,UN COUT
         LODA,R0 SC1
         COMI,R0 $01
         BCTA,EQ DE_IN
         BCTA,UN DE_NL
 DE_IN:
-        LODI,R1 SP
-        LODZ,R1
+        LODI,R0 SP
         BSTA,UN COUT
-        LODI,R1 A'I'
-        LODZ,R1
+        LODI,R0 A'I'
         BSTA,UN COUT
-        LODI,R1 A'N'
-        LODZ,R1
+        LODI,R0 A'N'
         BSTA,UN COUT
-        LODI,R1 SP
-        LODZ,R1
+        LODI,R0 SP
         BSTA,UN COUT
         LODA,R0 CURH
         STRA,R0 EXPH
@@ -2299,12 +2260,7 @@ DE_IN:
         STRA,R0 EXPL
         BSTA,UN PRINT_S16                ; [+1]
 DE_NL:
-        LODI,R1 CR
-        LODZ,R1
-        BSTA,UN COUT
-        LODI,R1 LF
-        LODZ,R1
-        BSTA,UN COUT
+        BSTA,UN CRLF
         BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
 
         END
