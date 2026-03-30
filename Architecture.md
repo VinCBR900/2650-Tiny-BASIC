@@ -1,568 +1,342 @@
 # uBASIC2650 — Architecture Design Document
-# Version: v1.3
-# Updated: Session 5 — 2026-03-27
-#
-# History:
-#   v1.0  Draft — initial arch plan before source analysis
-#   v1.1  Post session 2 — shunting-yard parser, SW call stack for GOSUB
-#   v1.2  Post session 4 — correct auto-inc understanding, INC_TMP strategy
-#   v1.3  Post session 5 — ZBSR placement strategy, correct indexed addr,
-#         SW call stack design, register bank decision, ROM/RAM layout,
-#         reduced feature set, reference links added
+## Version: v1.50
+## Updated: Session 7 — 2026-03-28
+
+## Change history:
+   v1.0  Initial
+   v1.1  Shunting-yard, SW call stack
+   v1.2  INC_TMP strategy, register bank decision
+   v1.3  ZBSR placement, SW call stack design, ROM/RAM layout
+   v1.4  WinArcadia platform adopted; PIPBUG 2 I/O addresses (WRONG)
+   v1.5  Corrected to PIPBUG 1 (WinArcadia uses original PIPBUG, not PIPBUG 2)
+         COUT=$02B4 CHIN=$0286 CRLF=$008A (confirmed working)
+         Clarified EPROM size targets: 2732=4K primary, 2716=2K stretch
+         ZBSR: can only call addresses +/-64 bytes (page-0, or top of 8k memory page)
+         CHIN is non-blocking in WinArcadia (return immediately if no char)
 
 ================================================================================
-## REFERENCE DOCUMENTS
+## SECTION 1 — REFERENCE DOCUMENTS
 
   2650 User Manual (online):
     https://amigan.yatho.com/2650UM.html
 
-  2650 Addressing Modes (wikibooks):
+  2650 Addressing Modes:
     https://en.wikibooks.org/wiki/Signetics_2650_%26_2636_programming/2650_processor#Indexed_addressing
 
-  2650 Indexed Branching (wikibooks):
+  2650 Indexed Branching:
     https://en.wikibooks.org/wiki/Signetics_2650_%26_2636_programming/Indexed_branching
 
   uBASIC6502 v1.1 reference implementation:
     https://raw.githubusercontent.com/VinCBR900/65c02-Tiny-BASIC/refs/heads/main/uBASIC6502.asm
 
-  uBASIC2650 baseline v0.4 (original port, buggy):
-    https://raw.githubusercontent.com/VinCBR900/2650-Tiny-BASIC/refs/heads/main/uBASIC2650.asm
-
   Project repository:
     https://github.com/VinCBR900/2650-Tiny-BASIC
 
-================================================================================
-## TOOLCHAIN
+  WinArcadia 2650 emulator (validated reference):
+    http://amigan.1emu.net/releases/
 
-  Assembler: tools/asm2650.c  (header v1.2, internal comment says core v1.3)
-  Simulator: tools/sim2650.c  (header v1.2, SIM_VER string "1.4")
-
-  Build:
-    gcc -Wall -O2 -o tools/asm2650 tools/asm2650.c
-    gcc -Wall -O2 -o tools/sim2650 tools/sim2650.c
-
-  Assemble + run:
-    ./tools/asm2650 src/uBASIC2650.asm ubasic.hex
-    ./tools/sim2650 --allow-ram-image ubasic.hex
-
-  CRITICAL ASSEMBLER RULE: Semicolons are COMMENTS, not statement separators.
-  Every instruction must be on its own line.
-
-  NOTE: asm2650.c and sim2650.c have been updated in the GitHub repository.
-  Always pull latest before a session and update version numbers here.
+  Python asm2650.py 2650Assembler (validated reference):
+    https://ztpe.nl/2650/development/as2650-a-2650-assembler/
 
 ================================================================================
-## PRIORITY: CODE SIZE OVER EXECUTION SPEED
+## SECTION 2 — TOOLCHAIN
 
-  The primary optimisation goal is minimum ROM bytes. Speed is irrelevant.
-  Every design decision should ask "which uses fewer bytes?" not "which is faster?"
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  REFERENCE PLATFORM:  WinArcadia v36.04 in PIPBUG mode (Ctrl+4)         │
+  │  CROSS TOOLS:         asm2650.c (assembler), sim2650.c (simulator)       │
+  │  ASSEMBLER ORACLE:    asm2650.py (validates asm2650.c byte encoding)      │
+  └──────────────────────────────────────────────────────────────────────────┘
 
-================================================================================
-## FEATURE SET
+  WinArcadia usage:
+    Ctrl+4                     select PIPBUG machine
+    Ctrl+/                     toggle debugger
+    Tab                        activate debugger input
+    ASM <filename>             assemble (file in Projects/ subdirectory)
+    G 0C00                     run from $0C00
+    T                          CPU trace
+    S                          single step
+    DIS <addr1> <addr2>        disassemble
+    = <label>                  show label address
+    E <addr> <val>             poke memory
 
-  REMOVED (size reduction): GOSUB, RETURN, POKE, PEEK(), USR(), CHR$()
+  Cross-assembler: asm2650.c
+    Build: gcc -Wall -O2 -o tools/asm2650 tools/asm2650.c
+    Produces Intel HEX output.
 
-  Statements: PRINT  IF..THEN  GOTO  LIST  RUN  NEW  INPUT  REM  END  LET
-  Operators:  + - * /   = < > <= >= <>   unary- unary+   ( )
-  Variables:  A-Z (signed 16-bit each)
-  Numbers:    -32768 .. 32767
-  Lines:      1 .. 32767 (not range-checked — accepted as-is)
+  Assembler oracle: asm2650.py
+    Usage: python3 tools/asm2650.py src/foo.asm /tmp/foo_py.hex
+    Diff against asm2650.c output to find encoding bugs:
+      diff <(./tools/asm2650 src/foo.asm /dev/stdout) \
+           <(python3 tools/asm2650.py src/foo.asm /dev/stdout)
 
-================================================================================
-## MEMORY MAP — PAGE 0 LAYOUT (aligned with 2650 page architecture)
+  Simulator: sim2650.c
+    Build: gcc -Wall -O2 -o tools/sim2650 tools/sim2650.c
+    Run:   ./tools/sim2650 --allow-ram-image image.hex
+    Compare output against WinArcadia to find execution bugs.
 
-  The 2650 addresses 32768 bytes (15-bit) across four 8192-byte pages.
-  Non-branch instructions address within the CURRENT PAGE only (13-bit direct).
-  Cross-page access for data requires indirect addressing (LODA,R0 *addr).
+  ═══ 2.2 Sim2650 Known Bugs ═══
 
-  DESIGN DECISION: Place both ROM and RAM within page 0 ($0000-$1FFF)
-  This allows all non-branch instructions to address everything directly
-  without needing indirect addressing or page-crossing complexities.
+  BUG-SIM-01 [CRITICAL]: ZBSR is NOP
+    Line ~207:  if(opcode==0xBB){ push_ras(cpu.IAR); cpu.IAR=pop_ras(); return; }
+    Fix to:     if(opcode==0xBB){ push_ras(cpu.IAR); cpu.IAR=(unsigned short)fetch()&0x7F; return; }
 
-  $0000-$13FF  ROM  5120 bytes  (code + constant tables)
-  $1400-$1BFF  RAM  2048 bytes  (interpreter state + program store)
-  $1C00-$1FFF  (unmapped or future expansion)
+  BUG-SIM-02: No entry-point flag (always starts at $0000)
+    Add: -e <hex_addr> flag to set IAR before running.
+    Workaround for tests: place BCTA,UN MAIN at $0000.
 
-  NOTE: The first few bytes of ROM ($0000 onward) hold the ZBSR jump table
-  (frequently called short subroutines). The first instruction at $0000 is
-  an unconditional BCTA to INIT, placed after the last jump table entry.
-  INIT is placed after the jump table and frequent subroutines in ROM.
+  BUG-SIM-03: No PIPBUG ROM stub
+    COUT/CHIN/CRLF hits unmapped memory.
+    Fix: Add COUT/CHIN/CRLF functioanlity translation to host OS to simulator.
 
-================================================================================
-## ROM LAYOUT — ZBSR JUMP TABLE AT BASE
+  ═══ 2.3 One-line Assembly Rules (CRITICAL) ═══
 
-  The 2650 ZBSR instruction calls the subroutine whose address is stored at
-  the current RAS top — a 1-byte relative branch to a subroutine within the
-  first ~63 bytes of ROM. Frequently called short subroutines (PUTCH, GETCH,
-  WSKIP, CHECK_CR) are placed here to benefit from BSTR,UN (2-byte relative
-  call) instead of BSTA,UN (3-byte absolute call) when called from within
-  ±63 bytes of ROM start.
-
-  ROM structure:
-    $0000  BCTA,UN INIT          ; 3 bytes — jump past the table
-    $0003  PUTCH:  WRTD,R1       ; 1 byte
-                   ZBRR          ; 1 byte — return (ZBRR pops RAS)
-    $0005  GETCH:  REDE,R1       ; 1 byte
-                   ZBRR          ; 1 byte
-    $0007  WSKIP:  [skip-spaces code, ≤63 bytes]
-    ...
-    $nnnn  INIT:   [cold start and REPL]
-    ...
-    $13FF  [end of ROM]
-
-  Calls to PUTCH/GETCH from within ±63 bytes: BSTR,UN PUTCH (2 bytes).
-  Calls from anywhere in ROM: BSTA,UN PUTCH (3 bytes).
-  Conditional calls (e.g. "if error, print"): always BSTA,UN (BSTR is UN only).
+  - Semicolons (;) are COMMENTS — not statement separators.
+  - Every instruction must be on its own line.
+  - No exceptions.
 
 ================================================================================
-## RAM MAP
+## SECTION 3 — DEVELOPMENT PLATFORM: PIPBUG 1 (WinArcadia)
 
-  All 16-bit values stored big-endian (hi byte at lower address).
+  WinArcadia emulates the ORIGINAL PIPBUG (not PIPBUG 2, not BINBUG).
+  These are the CONFIRMED correct addresses for WinArcadia's built-in PIPBUG:
 
-  $1400  IPH     Interpreter pointer hi   — walk pointer for IBUF / PROG
-  $1401  IPL     Interpreter pointer lo
-  $1402  PEH     Program end pointer hi   — one past last stored PROG byte
-  $1403  PEL     Program end pointer lo
-  $1404  RUNFLG  $01=running $00=immediate
-  $1405  GOTOFLG $01=GOTO pending
-  $1406  GOTOH   GOTO target line hi
-  $1407  GOTOL   GOTO target line lo
-  $1408  CURH    Current executing line hi (for error reporting)
-  $1409  CURL    Current executing line lo
-  $140A  LNUMH   Scratch line number hi
-  $140B  LNUML   Scratch line number lo
-  $140C  SC0     General scratch byte 0
-  $140D  SC1     General scratch byte 1
-  $140E  ERRFLG  $00=ok; non-zero=error
-  $140F  NEGFLG  Sign flag (number parsing, mul/div sign tracking)
-  $1410  EXPH    Expression result hi
-  $1411  EXPL    Expression result lo
-  $1412  TMPH    Temp/walk pointer hi   (used as indirect base for prog store walk)
-  $1413  TMPL    Temp/walk pointer lo
-  $1414  RELOP   Relational operator code 1-6
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  COUT = $02B4   BSTA,UN $02B4   R0 → terminal     CONFIRMED WORKING    │
+  │  CHIN = $0286   BSTA,UN $0286   terminal → R0      NON-BLOCKING         │
+  │  CRLF = $008A   BSTA,UN $008A   prints CR+LF                            │
+  └─────────────────────────────────────────────────────────────────────────┘
 
-  ; ── Software call stack (see §CALL STRATEGY) ─────────────────────────────
-  $1415  SW_STKPTR_H  SW stack pointer cell hi   (points into SW_STK)
-  $1416  SW_STKPTR_L  SW stack pointer cell lo
-  $1417  TEMP_RET_H   Temp return address hi     (used during SW_RETURN)
-  $1418  TEMP_RET_L   Temp return address lo
-  $1419  SW_STK       SW call stack: 64 bytes    ($1419-$1458)
-                      Supports 32 nested SW calls (2 bytes each)
+  CHIN is non-blocking in WinArcadia: it returns immediately with an
+  undefined value if no character is waiting. For the BASIC INPUT statement,
+  a polling loop is needed. For all other purposes (validation tests, PRINT,
+  etc.) this is not a problem as we only output.
 
-  $1459-$145F  (free — 7 bytes)
-  $1460  IBUF    Input line buffer 64 bytes       ($1460-$149F)
-  $14A0  VARS    A-Z variables 52 bytes           ($14A0-$14D3)
-                 A=$14A0:$14A1 .. Z=$14D2:$14D3
-  $14D4-$14FF  (free — 44 bytes)
-  $1500  PROG    Program store base
-  $1C00  PROGLIM One past end of program store    (1792 bytes available)
+  PIPBUG memory map (WinArcadia PIPBUG machine):
+    $0000–$03FF   PIPBUG ROM (1K, read-only, built-in)
+    $0440–$0fFF   User program RAM — OUR CODE STARTS HERE
+    
+  User program entry:
+    ORG $0440
+    Run via PIPBUG command:  G 440
 
-  Program store record format:
-    [LINE_HI][LINE_LO][BODY_LEN][body bytes...]
-    Sorted ascending by line number.
-    Big-endian. Record size = 3 + BODY_LEN.
+  ZBSR instruction and page-0 RAM:
+    ZBSR *offset jumps to absolute address = 0 + SIGNED 128 bit offset
+    Addresses $0000–$003F are inside PIPBUG ROM in WinArcadia — read-only.
+    If that range is ROM, ZBSR is effectively reserved for standalone Phase 2
+    (where we own the ROM from $0000 and place our jump table there).
+
+  Phase 2 — Standalone (after BASIC is working):
+    We replace PIPBUG I/O with our own bit-bang serial routines.
+    ROM starts at $0000. ZBSR jump table placed at base of ROM.
+    COUT/CHIN replaced by bitbang PUTCH/GETCH using FLAG/SENSE pins.
 
 ================================================================================
-## REGISTER ALLOCATION
+## SECTION 4 — EPROM SIZE TARGETS
 
-  R0   Primary accumulator. Destination for all ALU operations in Z/I/R/A
-       modes (except: A-mode writes to Rn, Z-mode reads from Rn writes to R0).
-       Freely clobbered. Used for all arithmetic and comparisons.
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  PRIMARY TARGET:  2732 EPROM = 4096 bytes  (period-correct 4K part)     │
+  │  STRETCH TARGET:  2716 EPROM = 2048 bytes  (period-correct 2K part)     │
+  └──────────────────────────────────────────────────────────────────────────┘
 
-  R1   I/O register. WRTD,R1 = putchar. REDE,R1 = getchar.
-       Also secondary scratch for character handling.
-       Convention: loaded with char immediately before PUTCH/GETCH calls.
+  These are EPROM sizes, not RAM sizes. The code fits in one chip.
+  Both parts were widely available in 1977–1980, which is the target era.
 
-  R2   Index register for fixed-base indexed addressing (see §INDEXED ADDRESSING).
-       Also general scratch when indexing not active.
+  Current status:
+    uBASIC2650.asm v1.1 = 4108 bytes  ← 12 bytes OVER the 4K target!
+    Must save ≥ 13 bytes to fit a 2732 at all.
+    Recursive parser rewrite saves ~573 bytes → comfortably fits 2732.
+    Getting to 2716 (2K) requires ~2060 additional bytes of savings.
+    2716 target is aspirational; focus first on 2732 then evaluate 2716.
 
-  R3   SW call stack pointer. Indexes into SW_STK space.
-       Also used as loop counter for BRNR,R3 / BIRR,R3 counted loops.
-       NOTE: when R3 is used as a loop counter, SW calls cannot be made
-       within that loop. Design code sections to not mix these uses.
+  Size history:
+    Baseline v0.4 (buggy port):        ~4100 bytes (estimated)
+    v1.0 fresh arch, all features:      5783 bytes  (over ROM)
+    v1.1 feature strip + INC_*:         4108 bytes  (12 bytes over 2732)
+    Target v1.2 (recursive parser):   <3500 bytes   (fits 2732, good margin)
+    Stretch (2716):                    <2048 bytes   (very aggressive)
 
-  REGISTER BANK (RS bit in PSL): see §REGISTER BANK DECISION.
-
-================================================================================
-## REGISTER BANK DECISION
-
-  The 2650 RS bit (PSL bit 4) switches between register banks 0 and 1.
-  Bank 1 gives access to R1', R2', R3' (R0 is always shared).
-  PPSL $10 = switch to bank 1. CPSL $10 = switch back to bank 0.
-
-  DECISION: Register bank switching is NOT used in v1.x.
-
-  Rationale:
-    - PPSL/CPSL each cost 2 bytes. Eliminating one BSTA saves 3 bytes.
-      Net saving from bank switch = 3 - (2+2) = -1 byte per elimination.
-      It costs MORE bytes to use bank switching than BSTA for most cases.
-    - The primary benefit (avoiding RAM saves) is marginal since our
-      subroutines are designed to not require register preservation.
-    - Adds mental complexity to track which bank is active.
-    - Future consideration: if a specific hot path needs 7 registers
-      simultaneously, bank switching could help. Document and revisit then.
+  Simulation target ROM was set to 5120 bytes to give initial headroom
+  during development — larger than EPROM target to avoid premature constraint.
 
 ================================================================================
-## INDEXED ADDRESSING — CORRECT UNDERSTANDING (verified by simulation)
+## SECTION 5 — INSTRUCTION SET REFERENCE
 
-  The 2650 has THREE forms of absolute addressing (encoded in idxctl bits):
+  ═══ 7.1 Register Set ═══
 
-  1. LODA,R0 addr         — plain absolute (3 bytes). R0 = mem[addr].
-  2. LODA,R0 *addr        — indirect absolute (3 bytes). R0 = mem[mem[addr]].
-  3. LODA,Rn addr,Rn      — indexed (3 bytes). Rn = mem[addr + Rn].
-  4. LODA,Rn addr,Rn+     — pre-increment indexed. Rn++; Rn = mem[addr + Rn].
-  5. LODA,Rn addr,Rn-     — pre-decrement indexed. Rn--; Rn = mem[addr + Rn].
+    R0  Primary accumulator. Destination for all load instructions.
+        Source/destination for all ALU immediate/register instructions.
+    R1  Secondary register. WRTD,R1=serial out, REDE,R1=serial in (Phase 2).
+        Also used as index in ADDZ,R1 / SUBZ,R1 etc.
+    R2  Index register for indexed addressing. Unchanged by plain load.
+        Pre-incremented by LODA,R0 BASE,R2+ before the memory access.
+    R3  DUAL USE: (a) loop counter for BRNR/BIRR, (b) SW call stack index.
+        Never mix these uses in the same code path.
 
-  CRITICAL: In indexed mode, Rn is BOTH the index register AND the destination.
-  There is no way to use R2 as index with R0 as destination in one instruction.
-  (The wikibook example `loda,r0 $1F00,r2+` appears to show this, but the
-  confirmed assembler/simulator behaviour is: ,R2 sets idxctl bits but the
-  DESTINATION is always Rn from the opcode field, not R0.)
-  Write LODA,R2 addr,R2 to use R2 as both index and destination.
+  ═══ 7.2 Addressing Modes (Verified) ═══
 
-  CONFIRMED USEFUL PATTERNS:
+    Z     LODZ Rn           1 byte   R0 = Rn
+    I     LODI,Rn n         2 bytes  Rn = n (immediate)
+    R     LODR,Rn off       2 bytes  Rn = mem[PC+off]  (±63 relative)
+    A     LODA,Rn addr      3 bytes  Rn = mem[addr]
+    A*    LODA,Rn *addr     3 bytes  Rn = mem[ mem[addr]:mem[addr+1] ]
+    A,R2  LODA,R0 addr,R2   3 bytes  R0 = mem[addr+R2], R2 unchanged
+    A,R2+ LODA,R0 addr,R2+  3 bytes  R2++, then R0 = mem[addr+R2]
+    A,R2- LODA,R0 addr,R2-  3 bytes  R2--, then R0 = mem[addr+R2]
 
-  Pattern A — Single indexed load (random access):
-    ; Load VARS[R2] hi byte into R2, then copy to R0:
-    LODI,R2 offset         ; 2 bytes: R2 = (letter-'A')*2
-    LODA,R2 VARS,R2        ; 3 bytes: R2 = VARS[offset]  (hi byte value)
-    LODZ,R0                ; 1 byte:  R0 = R2  (copy result to accumulator)
+  KEY RULE — INDEXED LODA (confirmed by WinArcadia assembler warning):
+    The first register field is ALWAYS R0 (destination).
+    The index register is the SECOND field (R2 typically).
+    LODA,R2 BASE,R2 is INVALID — WinArcadia rejects it.
+    Think of it as: 6502 LDA BASE,Y  where R2=Y, R0=A.
+    R2 is UNCHANGED by a plain indexed load.
+    R2 is incremented/decremented by R2+/R2- BEFORE the memory access.
 
-  Pattern B — Sequential byte printing (R2 as combined value+index):
-    LODI,R2 0              ; 2 bytes: start index
-  LOOP:
-    LODA,R2 STRBUF,R2      ; 3 bytes: R2 = STRBUF[R2]
-    COMI,R2 NUL            ; 2 bytes: NUL check (COMI Rn uses Rn not R0)
-    BCTA,EQ DONE           ; 3 bytes
-    WRTD,R2                ; 1 byte:  print R2 (char is in R2)
-    ADDI,R2 1              ; 2 bytes: next index (R2 = char+1, only works if
-                           ;          chars are sequential — NOT generally useful)
-    BCTR,UN LOOP           ; 2 bytes
+  ═══ 7.3 ZBSR / ZBRR ═══
 
-  Pattern C — Indexed store (STRA,Rn BASE,Rn stores Rn, not R0):
-    STRA,R2 OUTBUF,R2      ; stores R2 to OUTBUF+R2
+    ZBSR *offset    2 bytes ($BB + offset)
+      Pushes current IAR to RAS, jumps to absolute address = offset byte.
+      Range: $00–$7F only (7-bit positive offset = first 128 bytes of memory).
+      Used in Phase 2 standalone to call short routines at ROM base.
+      In Phase 1 (PIPBUG): $0000–$007F is PIPBUG ROM — cannot place stubs there.
 
-  LIMITATION: Indexed addressing is primarily useful for RANDOM ACCESS
-  to fixed-base tables (VARS, DIVTAB) where one load per invocation suffices.
-  Sequential byte walking over variable-base pointers (program store) still
-  requires indirect addressing via LODA,R0 *TMPH with INC_TMP subroutine.
+  ═══ 7.4 CC Semantics ═══
 
-  INDIRECT ADDRESSING (LODA,R0 *addr):
-    Most flexible for walking unknown-base pointers.
-    Used for program store traversal where base changes dynamically.
-    Cost: LODA,R0 *TMPH (3 bytes) + BSTA,UN INC_TMP (3 bytes) = 6 bytes/byte.
+    After ADD (ADDI/ADDA/ADDZ):
+      No carry, result any    → CC=GT
+      Carry, result = 0       → CC=EQ
+      Carry, result ≠ 0       → CC=LT
 
-================================================================================
-## CC SEMANTICS (from sim2650.c — verified by instruction_microtests.py)
+    After SUB (SUBI/SUBA/SUBZ):
+      No borrow, result ≠ 0   → CC=GT
+      No borrow, result = 0   → CC=EQ
+      Borrow                  → CC=LT
 
-  set_cc(result):
-    result=0  → CC=EQ ($80 in PSL)   Branch: BCTA,EQ / BCFA,EQ (inverse)
-    result>0  → CC=GT ($40 in PSL)   Branch: BCTA,GT / BCFA,GT
-    result<0  → CC=LT ($00 in PSL)   Branch: BCTA,LT / BCFA,LT
+    16-BIT CARRY PROPAGATION IDIOM:
+      LODA,R0 PTR_LO
+      ADDI,R0 1
+      STRA,R0 PTR_LO
+      BCTA,GT skip_hi_inc     ; GT = no carry → skip
+      LODA,R0 PTR_HI
+      ADDI,R0 1
+      STRA,R0 PTR_HI
+    skip_hi_inc:
 
-  set_cc_add(result) — after ADDI/ADDA/ADDZ:
-    C=0                  → CC=GT  (no carry — the common case)
-    C=1 and result=0     → CC=EQ  (carry, wrapped exactly to zero)
-    C=1 and result≠0     → CC=LT  (carry with non-zero result)
+    16-BIT BORROW PROPAGATION IDIOM:
+      LODA,R0 PTR_LO
+      SUBI,R0 1
+      STRA,R0 PTR_LO
+      BCFA,LT skip_hi_dec     ; NOT LT = no borrow → skip (covers EQ too)
+      LODA,R0 PTR_HI
+      SUBI,R0 1
+      STRA,R0 PTR_HI
+    skip_hi_dec:
 
-  set_cc_sub(result) — after SUBI/SUBA/SUBZ:
-    C=1 (no borrow) and result≠0 → CC=GT
-    C=1 (no borrow) and result=0 → CC=EQ
-    C=0 (borrow occurred)         → CC=LT
-
-  *** CRITICAL IDIOMS — GET THESE WRONG AND ARITHMETIC IS SILENTLY BROKEN ***
-
-  16-bit ADD with carry propagation to hi byte:
-    LODA,R0 PTR_L
-    ADDI,R0 1
-    STRA,R0 PTR_L
-    BCTA,GT skip_hi_inc    ← GT = C=0 = no carry → skip
-    LODA,R0 PTR_H
-    ADDI,R0 1
-    STRA,R0 PTR_H
-  skip_hi_inc:
-
-  16-bit SUB with borrow propagation to hi byte:
-    LODA,R0 ACC_L
-    SUBA,R0 VAL_L
-    STRA,R0 ACC_L
-    BCFA,LT skip_hi_dec    ← BCFA,LT = branch if NOT LT = C=1 = no borrow
-    LODA,R0 ACC_H          ← only reach here if C=0 (borrow)
-    SUBI,R0 1
-    STRA,R0 ACC_H
-  skip_hi_dec:
-
-  *** NEVER use BCTA,GT for borrow skip — it misses CC=EQ (zero result,    ***
-  *** no borrow) and subtracts an extra 1 from the hi byte. This was        ***
-  *** BUG-02 in the original v0.4 port and cost significant debugging time. ***
+    *** NEVER use BCTA,GT for borrow skip — misses the CC=EQ case ***
+    *** This was BUG-02 in v0.4 and caused silent arithmetic errors ***
+Note: 
+  - LODZ,R0 is not supported and the assembler should replace with $60 and warn.
+  - ANDZ,R0 is not supported and triggers a HALT encoded as $00.  This too should warn. 
 
 ================================================================================
-## SUBROUTINE CALLING STRATEGY — THREE TIERS
+## SECTION 8 — SOFTWARE CALL STACK
+  HW stack limited to 8 pushes.  Can still use for shallow branches.
+  HW RAS budget: 8 slots. Reserve 2 for interrupts. Max safe depth = 6.
+ 
+  SW stack enables recursion but has Byte size overhead - hopefully
+  overall size gain with recursive subroutines like PRINT_S16.
+  Uses R3 as index, SW_STKPTR as base, TEMP_RET as workspace.
+  All SW-called routines end with BCTA,UN SW_RETURN (not RETC,UN).
+  All SW-callers use inline push + BCTA,UN to target (not BSTA).
+  Note SW push can be any addres, not necessarily imemdiately after.
 
-  Priority: smallest code size. Use the cheapest call mechanism that is safe.
-
-  === TIER 1: Hardware RAS — BSTA,UN / BSTR,UN / BSTA,cc ===
-  Use for: non-recursive subroutines where call depth stays ≤ 6.
-  Cost: BSTA,UN = 3 bytes absolute. BSTR,UN = 2 bytes relative (±63).
-  Return: RETC,UN = 1 byte (always unconditional for speed and size).
-  Conditional call: BSTA,cc addr (3 bytes) — only for EQ/GT/LT/UN.
-                   BSTR,cc offset (2 bytes) — conditional relative, ±63 bytes.
-
-  Reserve 2 RAS slots for interrupts (see §INTERRUPT CONSIDERATION).
-  Maximum safe call depth = 6 (8-slot RAS minus 2 interrupt reserve).
-
-  HW RAS subroutines that CALL others must count total depth:
-    REPL[1] → STMT_EXEC[2] → DO_xxx[3] → PARSE_EXPR[4] → PARSE_FACTOR[5]
-                                                         → INC_TMP[6]  ← safe limit
-
-  === TIER 2: BSTR,UN for nearby utility routines ===
-  Use for: PUTCH, GETCH, WSKIP, UPCASE, CHECK_CR when called from within ±63
-  bytes of the target. Saves 1 byte vs BSTA,UN.
-  Targets at ROM base ($0000-$003F) benefit from this from many call sites.
-
-  === TIER 3: Software Call Stack — BCTA/BCTR only, no BSTA/RETC ===
-  Use for: recursive routines (PARSE_EXPR, PARSE_TERM, PARSE_FACTOR, PRT16).
-  The HW RAS is NOT used — all branching uses BCTA,UN or BCTR,UN.
-  See §SOFTWARE CALL STACK for full design.
-
-  TAIL CALLS: Any subroutine may end with BCTA,UN next_sub instead of
-  RETC,UN + call. Avoids one RAS slot and saves 1-2 bytes.
-  Example: PARSE_FACTOR tail-calls GET_VARPTR instead of BSTA + RETC.
-
-================================================================================
-## SOFTWARE CALL STACK — DESIGN AND USAGE
-
-  PURPOSE: Enable recursion (PARSE_EXPR→PARSE_FACTOR→PARSE_EXPR for parens,
-  PRT16 recursive digit extraction) without overflowing the 8-slot HW RAS.
-
-  The SW call stack uses R3 as stack pointer and RAM for storage.
-  SW calls use BCTA,UN (branch) NOT BSTA (which would push HW RAS).
-  RETC,UN is NEVER used in SW-called routines — return is via SW_RETURN.
-
-  === MEMORY ===
-    SW_STKPTR  EQU $1415  ; 2-byte RAM cell holding pointer into SW_STK
-    TEMP_RET   EQU $1417  ; 2-byte workspace for return address during SW_RETURN
-    SW_STK     EQU $1419  ; 64 bytes = 32 nested calls
-
-  === INITIALISATION (in RESET) ===
-    LODI,R3 0             ; R3 = SW stack index = 0 (empty)
-    LODI,R0 >SW_STK
-    STRA,R0 SW_STKPTR     ; SW_STKPTR_H = >SW_STK
-    LODI,R0 <SW_STK
-    STRA,R0 SW_STKPTR+1   ; SW_STKPTR_L = <SW_STK
-
-  === SW_JSR — CALLER SNIPPET (can be macro or inline) ===
-  Equivalent to JSR TARGET with return to RETADDR.
-  The caller chooses RETADDR — it does not have to be the next instruction,
-  enabling computed jumps and tail-call optimisation.
-
-    ; Push RETADDR hi byte
+ 
+  ─── SW_JSR inline (14 bytes per call site) ───
     LODI,R0 >RETADDR
-    STRA,R0 *SW_STKPTR,R3+     ; store to SW_STK[R3], then R3++
-
-    ; Push RETADDR lo byte
+    STRA,R0 *SW_STKPTR,R3+
     LODI,R0 <RETADDR
-    STRA,R0 *SW_STKPTR,R3+     ; store to SW_STK[R3], then R3++
+    STRA,R0 *SW_STKPTR,R3+
+    BCTA,UN  TARGET
+  RETADDR:
 
-    BCTA,UN TARGET             ; branch to target (NO BSTA — HW stack untouched)
-
-  RETADDR:                     ; execution resumes here after SW_RETURN
-
-  NOTE: For assembly tail calls, simply jump to the next routine without
-  pushing a return address. The last routine in the chain pops and returns
-  to the PREVIOUSLY pushed address. This saves 8 bytes per tail call site.
-
-  === SW_RETURN — SHARED RETURN HANDLER ===
-  The LAST instruction of any SW-called subroutine is: BCTA,UN SW_RETURN
-  (or BCTR,UN SW_RETURN if within 63 bytes — saves 1 byte).
-
+  ─── SW_RETURN shared handler ───
   SW_RETURN:
-    LODA,R0 *SW_STKPTR,-R3     ; pre-decrement R3, load SW_STK[R3] → R0 (lo byte)
-    STRA,R0 TEMP_RET+1         ; store lo byte to TEMP_RET+1
-
-    LODA,R0 *SW_STKPTR,-R3     ; pre-decrement R3, load SW_STK[R3] → R0 (hi byte)
-    STRA,R0 TEMP_RET           ; store hi byte to TEMP_RET
-
-    BCTA,UN *TEMP_RET          ; indirect branch to popped address (NO RETC)
-
-  NOTE: RETC,UN is NEVER used in SW_RETURN. RETC would pop the HW RAS which
-  may contain stale addresses. BCTA,UN *TEMP_RET is the correct return.
-
-  === WHAT THE -R3 SYNTAX MEANS ===
-  LODA,R0 *SW_STKPTR,-R3: idxctl=2 (pre-decrement Rn then index).
-  Since Rn=3: R3--; eff = mem[SW_STKPTR] + R3; R0 = mem[eff].
-  CORRECTION: this uses R3 as index, result goes to R0. Verify assembler
-  syntax for pre-decrement with separate index/dest — may need SUBI,R3 1 first.
-
-  === HW vs SW STACK SUMMARY ===
-  | Situation                          | Mechanism      | Cost per call |
-  |------------------------------------|----------------|---------------|
-  | Short leaf routine, near           | BSTR,UN (rel)  | 2 bytes       |
-  | Short leaf routine, anywhere       | BSTA,UN (abs)  | 3 bytes       |
-  | Conditional call                   | BSTA,cc (abs)  | 3 bytes       |
-  | Recursive / deep call              | SW_JSR inline  | 14 bytes      |
-  | Return from HW routine             | RETC,UN        | 1 byte        |
-  | Return from SW routine             | BCTA SW_RETURN | 3 bytes       |
+    LODA,R0 *SW_STKPTR,-R3
+    STRA,R0 TEMP_RET_L
+    LODA,R0 *SW_STKPTR,-R3
+    STRA,R0 TEMP_RET_H
+    BCTA,UN *TEMP_RET_H
 
 ================================================================================
-## INTERRUPT CONSIDERATION
+## SECTION 9 — PARSER
 
-  The 2650 interrupt mechanism forces a BSTA to a device-determined address,
-  pushing the current PC onto the HW RAS. This uses 1 RAS slot.
-  A BREAK-key interrupt handler is planned for a future version.
+  Recursive descent (NOT shunting-yard) with SW call stack for recursion.
+  Saves ~67 bytes vs shunting-yard. Avoids operator precedence table.
 
-  DESIGN RULE: Reserve 2 HW RAS slots at all times to accommodate:
-    - 1 slot for the interrupt BSTA
-    - 1 slot for the interrupt handler to call one subroutine
-  Maximum safe HW call depth = 6 (not 8).
-
-================================================================================
-## RECURSIVE EXPRESSION PARSER — CALL DEPTH ANALYSIS
-
-  Recursive descent: PARSE_EXPR → PARSE_TERM → PARSE_FACTOR → PARSE_EXPR (parens)
-
-  Using SW call stack for all recursive calls:
-    REPL[HW1] → STMT_EXEC[HW2] → DO_xxx[HW3] → PARSE_EXPR[SW]
-    PARSE_EXPR[SW] → PARSE_TERM[HW4] → PARSE_FACTOR[HW5]
-    PARSE_FACTOR for parens: BCTA,UN PARSE_EXPR (no HW push — SW_JSR inline)
-
-  HW depth stays at 5 max (leaving 3 slots spare for interrupts + 1 extra).
-  SW depth is unlimited (bounded only by SW_STK size: 32 levels).
-
-  The 6502 version achieves compactness through recursive descent because
-  JSR/RTS is 3+1 = 4 bytes vs SW_JSR inline which costs 14 bytes.
-  HOWEVER: recursive descent allows sharing PARSE_EXPR code for parens,
-  unary operators, and nested expressions — saving code vs a flat shunting-yard.
-
-  COMPARISON for uBASIC2650:
-    Recursive descent + SW stack:
-      PARSE_EXPR: ~50 bytes
-      PARSE_TERM: ~50 bytes  
-      PARSE_FACTOR: ~80 bytes
-      SW_JSR inline at 2 sites: ~28 bytes
-      SW_RETURN: ~15 bytes
-      Total: ~223 bytes
-
-    Shunting-yard (iterative):
-      PARSE_EXPR: ~150 bytes
-      APPLY_OP: ~120 bytes
-      GET_PREC: ~20 bytes
-      Total: ~290 bytes
-
-  VERDICT: Recursive descent saves ~67 bytes. USE RECURSIVE DESCENT.
+  Grammar:
+    expr   ::= term   { ('+' | '-') term }
+    term   ::= unary  { ('*' | '/') unary }
+    unary  ::= ['-']  factor
+    factor ::= var | number | '(' expr ')'
 
 ================================================================================
-## RECURSIVE PRT16 — DESIGN
+## SECTION 10 — FEATURE SET
 
-  The 6502 PRT16 uses hardware stack to recurse, printing digits in order
-  by unwinding the recursion. On the 2650, use SW stack:
+  Included: PRINT  IF..THEN  GOTO  LIST  RUN  NEW  INPUT  REM  END  LET
+  TBD:  GOSUB  RETURN  POKE  PEEK()  USR()  CHR$()
 
-  ; PRT16 — print signed 16-bit T0 as decimal
-  ; Input: EXPH:EXPL = value
-  ; Uses: SW stack for recursion (handles leading zeros by not printing them)
-  ;
-  PRT16:
-    ; Check sign
-    LODA,R0 EXPH
-    COMI,R0 $80
-    BCTA,LT PRT16_POS
-    LODI,R1 '-'
-    WRTD,R1              ; print minus
-    [negate EXPH:EXPL]
-  PRT16_POS:
-    ; Divide EXPH:EXPL by 10 → quotient in EXPH:EXPL, remainder in SC0
-    [divide]
-    ; If quotient != 0, recursive call to print higher digits
-    LODA,R0 EXPH
-    COMI,R0 0
-    BCTA,GT PRT16_REC
-    LODA,R0 EXPL
-    COMI,R0 0
-    BCTA,EQ PRT16_DIGIT   ; quotient=0, just print this digit
-  PRT16_REC:
-    [SW_JSR PRT16 with RETADDR=PRT16_DIGIT]
-    BCTA,UN PRT16
-  PRT16_DIGIT:
-    LODA,R1 SC0           ; remainder = digit
-    ADDI,R1 '0'
-    WRTD,R1
-    BCTA,UN SW_RETURN
+  Variables:  A–Z, signed 16-bit (-32768..32767)
+  Line numbers: 1–32767 (not checked)
 
 ================================================================================
-## PROGRAM STORE — FIND_LINE + FIND_INS MERGED
+## SECTION 11 — VALIDATION TEST SUITE
 
-  FIND_LINE and FIND_INS are nearly identical (both walk sorted records).
-  Merged into one routine with SC0 flag:
-    SC0=$00 → find exact match (FIND_LINE behaviour)
-    SC0=$01 → find insertion point (FIND_INS behaviour)
-  Returns TMPH:TMPL at result. ERRFLG=$00 if exact match found (FIND_LINE mode).
-  Saves ~110 bytes vs two separate routines.
+  File: src/validation_test.asm (v1.2, 555 bytes, 0 errors)
+
+  Validates TWO things simultaneously:
+    (A) asm2650.c byte encoding — diff its hex output vs asm2650.py
+    (B) sim2650.c execution — compare its output vs WinArcadia
+
+  Expected WinArcadia output:  ABCDEFGHIJKLM<CR><LF>
+  (Letter M may come from the skip-pass path in T13 if $0062 is PIPBUG ROM)
+
+  Tests:
+    T01 'A'  LODI / STRA / LODA round-trip
+    T02 'B'  ADDI, SUBI, ADDZ, SUBZ arithmetic
+    T03 'C'  CC after ADD (carry cases: GT / EQ / LT)
+    T04 'D'  CC after SUB (borrow cases: GT / EQ / LT)
+    T05 'E'  16-bit pointer increment (INC_IP/INC_TMP idiom)
+    T06 'F'  Indexed LODA,R0 BASE,R2 and LODA,R0 BASE,R2+
+    T07 'G'  Indirect LODA,R0 *addr + HI/LO operator encoding
+    T08 'H'  Branches: BCTA, BCFA, BCTR, BCFR
+    T09 'I'  BSTA,UN call + ZBRR as 1-byte return
+    T10 'J'  BRNR and BIRR counted loops
+    T11 'K'  Register bank switching (PPSL/CPSL $10)
+    T12 'L'  PSL COM flag: signed vs unsigned compare
+    T13 'M'  ZBSR *offset (graceful skip-pass if page-0 is ROM)
 
 ================================================================================
-## KEYWORD MATCHING — INDEXED BRANCH TABLE
+## SECTION 12 — SUBROUTINE HEADER CONVENTION
 
-  Current: sequential COMI/BCTA dispatch (~60 bytes for 10 keywords).
-  Improved: use BXA (indexed branch) with R2 as token offset.
-    Build a branch table: DW HANDLER1, DW HANDLER2, ...
-    R2 = (token-1) * 2
-    BCTA,UN JMPTAB,R2  ; jumps to mem[JMPTAB + R2]
-  OR: use token as index into BIRA/BDRA counted branch series.
-  BXA $BF: indexed absolute branch from a table. Saves ~30 bytes.
+  Every subroutine must have a header:
 
-================================================================================
-## SUBROUTINE HEADER CONVENTION (from uBASIC6502 style)
-
-  Every subroutine must have a header comment:
-  ; ─── ROUTINE_NAME ─────────────────────────
+  ; ─── NAME ─────────────────────────────────────────────────────────────────
   ; Purpose: one-line description
-  ; In:  register/memory inputs
-  ; Out: register/memory outputs
-  ; Clobbers: list of modified registers/cells
-  ; Depth: HW stack depth when called (for budget tracking)
+  ; In:      register/RAM inputs
+  ; Out:     register/RAM outputs, CC state if relevant
+  ; Clobbers: all modified registers and RAM cells
+  ; Depth:   HW RAS depth when called
+  ; Size:    byte count (fill after assembly)
 
 ================================================================================
-## SHARED INCREMENT SUBROUTINES (INC_TMP / INC_IP / INC_EXP)
+## SECTION 13 — KNOWN BUGS FIXED
 
-  Each 16-bit pointer increment inline costs 19 bytes (7 instructions).
-  Shared subroutine body: 17 bytes. Breakeven at 2 call sites.
-  Each call: BSTA,UN INC_xxx = 3 bytes. Saving: 16 bytes per additional site.
-
-  Current implementation (4108 bytes) has:
-    INC_TMP: 23 call sites → (23×3 + 17) vs (23×19) = 86 vs 437 = saves 351 bytes
-    INC_IP:  23 call sites → saves 351 bytes
-    INC_EXP: 10 call sites → saves 113 bytes
-  Total saving from INC_ subroutines: ~815 bytes (confirmed in current build).
-
-  Also provide DEC_TMP for backwards memory moves in STORE_LINE / DELETE_LINE.
+  BUG-01: RAS overflow on recursive descent — fixed, SW call stack used
+  BUG-02: BCTA,GT for SUB borrow skip — fixed, always BCFA,LT
+  BUG-03: 369 bytes inline pointer-increments — fixed, INC_TMP/INC_IP/INC_EXP
+  BUG-04: Semicolons as statement separators — fixed, one instruction per line
+  BUG-05: ADDA,R1 R0 invalid — fixed, use ADDZ,R1
+  BUG-06: COUT=$0007 (PIPBUG 2 addr) — fixed, COUT=$02B4 (PIPBUG 1)
+  BUG-07: LODA,R2 BASE,R2 invalid (R0 required) — fixed, LODA,R0 BASE,R2
 
 ================================================================================
-## SIZE TRACKING (session fingerprint)
-
-  Assembled size after each major session:
-    Baseline v0.4 (original buggy port):       ~4000+ bytes (estimated)
-    v1.0 fresh arch, full features:             5783 bytes (OVER ROM)
-    v1.1 after feature removal + INC_ routines: 4108 bytes (fits ROM)
-    Target for v1.2 (recursive parser, merged): < 3500 bytes
-    Aspirational:                               < 3072 bytes
-    ROM limit:                                    5120 bytes ($0000-$13FF)
-
-  Session continuity check: assemble at session start and confirm byte count
-  matches the last recorded value in the trace log.
-
-================================================================================
-## COMPARISON: uBASIC6502 v1.1 vs uBASIC2650
-
-  uBASIC6502: 2017 bytes for full-feature BASIC (POKE/PEEK/USR/CHR$/GOSUB).
-  uBASIC2650 target: ~3000-3500 bytes for reduced feature set.
-
-  WHY THE 2650 NEEDS MORE BYTES:
-  1. Zero-page instructions (6502: 2 bytes vs 2650: 3 bytes for RAM access)
-     ~150 ZP accesses × 1 byte extra = ~150 bytes overhead
-  2. No (zp),Y equivalent: 2650 has no instruction using R as pointer AND
-     separate index register; all indirect goes through RAM pointer cells
-  3. Hardware data stack (6502: PHA=1 byte vs 2650: STRA=3 bytes per save)
-  4. JSR/RTS = 3+1=4 bytes vs SW_JSR = 14 bytes + SW_RETURN = 3 bytes
-  Irreducible structural overhead: ~600-1000 bytes vs 6502.
-
-================================================================================
-END OF ARCHITECTURE DOCUMENT v1.3
+END OF ARCHITECTURE DOCUMENT v1.5
