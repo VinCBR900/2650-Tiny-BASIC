@@ -3,16 +3,16 @@
 ## Updated: Session 7 — 2026-03-28
 
 ## Change history:
-   v1.0  Initial
-   v1.1  Shunting-yard, SW call stack
-   v1.2  INC_TMP strategy, register bank decision
-   v1.3  ZBSR placement, SW call stack design, ROM/RAM layout
-   v1.4  WinArcadia platform adopted; PIPBUG 2 I/O addresses (WRONG)
-   v1.5  Corrected to PIPBUG 1 (WinArcadia uses original PIPBUG, not PIPBUG 2)
-         COUT=$02B4 CHIN=$0286 CRLF=$008A (confirmed working)
-         Clarified EPROM size targets: 2732=4K primary, 2716=2K stretch
-         ZBSR: can only call addresses +/-64 bytes (page-0, or top of 8k memory page)
-         CHIN is non-blocking in WinArcadia (return immediately if no char)
+ -  v1.0  Initial
+ -  v1.1  Shunting-yard, SW call stack
+ -  v1.2  INC_TMP strategy, register bank decision
+ -  v1.3  ZBSR placement, SW call stack design, ROM/RAM layout
+ -  v1.4  WinArcadia platform adopted; PIPBUG 2 I/O addresses (WRONG)
+ -  v1.5  Corrected to PIPBUG 1 (WinArcadia uses original PIPBUG, not PIPBUG 2)
+ -        COUT=$02B4 CHIN=$0286 CRLF=$008A (confirmed working)
+ -        Clarified EPROM size targets: 2732=4K primary, 2716=2K stretch
+ -        ZBSR: can only call addresses +/-64 bytes (page-0, or top of 8k memory page)
+ -        CHIN is blocking 
 
 ================================================================================
 ## SECTION 1 — REFERENCE DOCUMENTS
@@ -101,16 +101,11 @@
   These are the CONFIRMED correct addresses for WinArcadia's built-in PIPBUG:
 
   ┌─────────────────────────────────────────────────────────────────────────┐
-  │  COUT = $02B4   BSTA,UN $02B4   R0 → terminal     CONFIRMED WORKING    │
-  │  CHIN = $0286   BSTA,UN $0286   terminal → R0      NON-BLOCKING         │
+  │  COUT = $02B4   BSTA,UN $02B4   R0 → terminal     CONFIRMED WORKING     │
+  │  CHIN = $0286   BSTA,UN $0286   terminal → R0     cONFIRMED BLOCKING    │
   │  CRLF = $008A   BSTA,UN $008A   prints CR+LF                            │
   └─────────────────────────────────────────────────────────────────────────┘
-
-  CHIN is non-blocking in WinArcadia: it returns immediately with an
-  undefined value if no character is waiting. For the BASIC INPUT statement,
-  a polling loop is needed. For all other purposes (validation tests, PRINT,
-  etc.) this is not a problem as we only output.
-
+  
   PIPBUG memory map (WinArcadia PIPBUG machine):
     $0000–$03FF   PIPBUG ROM (1K, read-only, built-in)
     $0440–$0fFF   User program RAM — OUR CODE STARTS HERE
