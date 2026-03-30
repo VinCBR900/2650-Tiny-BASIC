@@ -23,6 +23,9 @@
  *              (previously returned without fetching, leaving PC wrong).
  *   BUG-SIM-06 FIXED: --pipbug implicitly enables --allow-ram-image so the
  *              user program hex (loaded at $0440+) is accepted without error.
+ *   NOTE: Emu2650.cs ADD/SUB CC uses sign-based SetCCFor — this is WRONG per
+ *         the 2650 datasheet. sim2650 carry-based set_cc_add/set_cc_sub are
+ *         correct and intentionally differ from Emu2650.cs on those opcodes.
  *
  * Changes v1.4 -> v1.5:
  *   BUG-SIM-01 FIXED: ZBSR fetches signed 7-bit operand as page-relative target
@@ -40,12 +43,12 @@
  * PSL: CC1[7] CC0[6] IDC[5] RS[4] WC[3] OVF[2] COM[1] C[0]
  * PSU: S[7] F[6] II[5] - - SP[2:0]
  *
- * PIPBUG 1 memory map:
+ * PIPBUG 1 memory map (Motorola MK3880 / Signetics reference board):
  *   $0000-$03FF  PIPBUG ROM  (1 kB, read-only)
  *   $0400-$043F  PIPBUG RAM  (64 B, stack/scratch)
  *   $0440-$1BFF  User RAM    (program+data, writable)
  *   COUT  $02B4  putchar(R0)
- *   CHIN  $0286  R0 = getchar_nonblocking() — 0 if no key
+ *   CHIN  $0286  R0 = getchar() — blocking, waits for keypress
  *   CRLF  $008A  print CR LF
  * ============================================================================ */
 
@@ -53,22 +56,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <sys/select.h>   /* for non-blocking CHIN */
 
 #define SIM_VER   "1.6"
 #define MEM_SIZE  0x8000
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
 #define DEF_ROM_START 0x0000
-#define DEF_ROM_END   0x0fff
-#define DEF_RAM_START 0x1000
-#define DEF_RAM_END   0x1fFF
+#define DEF_ROM_END   0x13FF
+#define DEF_RAM_START 0x1400
+#define DEF_RAM_END   0x1BFF
 
 /* PIPBUG 1 memory map */
 #define PB_ROM_START  0x0000
 #define PB_ROM_END    0x03FF   /* 1 kB Pipbug ROM */
 #define PB_RAM_START  0x0400   /* 64 B Pipbug RAM + user area */
-#define PB_RAM_END    0x1fFF
+#define PB_RAM_END    0x1BFF
 
 /* Active map (set at startup) */
 static unsigned short ROM_START_A = DEF_ROM_START;
@@ -159,16 +161,6 @@ static unsigned char fetch(void) {
 }
 
 /* --- I/O ------------------------------------------------------------------- */
-/* io_in_nb: non-blocking read — returns 0x00 if no char available (like CHIN) */
-static unsigned char io_in_nb(void) {
-    /* Use select() to check if stdin has data without blocking */
-    fd_set fds; struct timeval tv = {0,0};
-    FD_ZERO(&fds); FD_SET(0, &fds);
-    if (select(1, &fds, NULL, NULL, &tv) <= 0) return 0x00;
-    int c = getchar();
-    return c == EOF ? 0x00 : (unsigned char)c;
-}
-/* io_in: blocking read (used only by REDE/REDD/REDC hardware I/O opcodes) */
 static unsigned char io_in(void)       { int c = getchar(); return c==EOF ? 0 : (unsigned char)c; }
 static void          io_out(unsigned char v) { putchar(v); fflush(stdout); }
 
@@ -179,7 +171,7 @@ static void pb_ret(void) {
     cpu.PSU = (cpu.PSU & ~PSU_SP) | (cpu.SP & 7);
 }
 static void pb_cout(void) { io_out(R(0)); pb_ret(); }
-static void pb_chin(void) { R(0) = io_in_nb(); pb_ret(); }   /* non-blocking: 0 = no key */
+static void pb_chin(void) { R(0) = io_in(); pb_ret(); }   /* blocking: waits for keypress */
 static void pb_crlf(void) { io_out('\r'); io_out('\n'); pb_ret(); }
 
 /* --- CC -------------------------------------------------------------------- */
