@@ -1,7 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
 ; Version: v1.1-pipbug
-; Build:   python3 asm2650.py uBASIC2650.asm ubasic.hex
-;          sim2650 --pipbug -rx test.bas ubasic.hex
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Program loads at $0440.  All RAM EQUs remain at $1400+ (plenty of room).
