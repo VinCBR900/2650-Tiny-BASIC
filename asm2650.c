@@ -278,18 +278,63 @@ static void assemble_line(char *line){
         emit(pc,(unsigned char)(base|r));pc++; if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;} return;
     }
     /*
-     * BXA/BXSA not orthogonol, only works on R3
-     * Check later properly encoded i.e. assembly is not not asking for R0-2 usage
+     * BXA/BSXA are non-orthogonal: index register is fixed to R3 in hardware.
+     * Accept optional explicit R3 and warn when omitted.
+     * Reject R0-R2 and reject autoincrement/decrement suffixes.
+     * Also accept BSX as alias for BSXA.
     */
-    if(strcmp(mn,"BXA")==0||strcmp(mn,"BSXA")==0){
-        int ind=0; char *a=ops[0]; if(*a=='*'){ind=1;a++;} int ok,v=eval_expr(a,&ok);
-        emit(pc,(strcmp(mn,"BXA")==0)?0x9F:0xBF);pc++;
-        if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;} return;
+    if(strcmp(mn,"BXA")==0||strcmp(mn,"BSXA")==0||strcmp(mn,"BSX")==0){
+        int ind=0, ok=0, v=0;
+        int is_bsx = (strcmp(mn,"BSXA")==0||strcmp(mn,"BSX")==0);
+        char *addr_s = ops[0];
+        char *reg_s = NULL;
+
+        if(nops>=2 && ops[1][0]) {
+            if(reg_val(ops[0])>=0){ reg_s = ops[0]; addr_s = ops[1]; } /* BXA R3,ADDR */
+            else { addr_s = ops[0]; reg_s = ops[1]; }                   /* BXA ADDR,R3 */
+        }
+
+        if(reg_s){
+            int r = -1;
+            if(reg_s[0]=='R' && reg_s[1]>='0' && reg_s[1]<='3') r = reg_s[1]-'0';
+            if(r < 0){ fprintf(stderr,"ERROR line %d: %s register must be R3\n",lineno,mn); errors++; return; }
+            if(reg_s[2]=='+' || reg_s[2]=='-'){
+                fprintf(stderr,"ERROR line %d: %s does not support auto +/- on R3\n",lineno,mn);
+                errors++; return;
+            }
+            if(r != 3){ fprintf(stderr,"ERROR line %d: %s only supports R3\n",lineno,mn); errors++; return; }
+        } else if(pass==2) {
+            fprintf(stderr,"WARN line %d: %s register omitted, defaulting to R3\n",lineno,mn);
+        }
+
+        if(*addr_s=='*'){ind=1;addr_s++;}
+        v=eval_expr(addr_s,&ok);
+        emit(pc,is_bsx?0xBF:0x9F);pc++;
+        if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;}
+        return;
     }
     /* 2650 silicon constraints on Z-mode register-to-register instructions */
-    if(strcmp(mn,"ANDZ")==0&&nops>=1){int r=reg_val(ops[0]); if(r==0&&pass==2){fprintf(stderr,"WARN line %d: ANDZ,R0 not valid (would emit HALT $40); use IORZ,R0\n",lineno);}}
-    if(strcmp(mn,"STRZ")==0&&nops>=1){int r=reg_val(ops[0]); if(r==0&&pass==2){fprintf(stderr,"WARN line %d: STRZ,R0 not valid (would emit NOP $C0)\n",lineno);}}
-    if(strcmp(mn,"LODZ")==0&&nops>=1){int r=reg_val(ops[0]); if(r==0&&pass==2){fprintf(stderr,"WARN line %d: LODZ,R0 result undefined per 2650 manual; use IORZ,R0 to clear R0\n",lineno);}}
+    if(strcmp(mn,"ANDZ")==0&&nops>=1){
+        int r=reg_val(ops[0]);
+        if(r==0){
+            if(pass==2) fprintf(stderr,"WARN line %d: ANDZ,R0 replaced with HALT ($40)\n",lineno);
+            emit(pc,0x40); pc++; return;
+        }
+    }
+    if(strcmp(mn,"STRZ")==0&&nops>=1){
+        int r=reg_val(ops[0]);
+        if(r==0){
+            if(pass==2) fprintf(stderr,"WARN line %d: STRZ,R0 replaced with NOP ($C0)\n",lineno);
+            emit(pc,0xC0); pc++; return;
+        }
+    }
+    if(strcmp(mn,"LODZ")==0&&nops>=1){
+        int r=reg_val(ops[0]);
+        if(r==0){
+            if(pass==2) fprintf(stderr,"WARN line %d: LODZ,R0 replaced with $60 (IORZ,R0)\n",lineno);
+            emit(pc,0x60); pc++; return;
+        }
+    }
     struct { const char *pfx; int base; int no_imm; } alu[]={{"LOD",0x00,0},{"EOR",0x20,0},{"AND",0x40,0},{"IOR",0x60,0},{"ADD",0x80,0},{"SUB",0xA0,0},{"COM",0xE0,0},{"STR",0xC0,1},{NULL,0,0}};
     for(int i=0;alu[i].pfx;i++){
         int plen=strlen(alu[i].pfx);
