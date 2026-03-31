@@ -1,7 +1,8 @@
 /* ============================================================================
- * asm2650_v1.2.c  (assembler core version 1.3)
+ * asm2650.c  Assembler core version 1.3
  * Signetics 2650 cross-assembler — from project repo
  * Build: gcc -Wall -O2 -o asm2650 asm2650_v1.2.c
+ * Signetics Syntax
  * ============================================================================ */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +26,20 @@ static int  pass   = 0;
 static int  errors = 0;
 static int  lineno = 0;
 
-static void upcase(char *s){ for(;*s;s++) *s=(char)toupper((unsigned char)*s); }
+static void upcase(char *s){
+    /* Upcase the assembler line but preserve content inside single-quoted literals.
+     * Handles both 'x' and A'x' (Signetics ASCII) so A'u' stays 0x75 not 0x55. */
+    for(;*s;s++){
+        if(*s=='\''){
+            s++;                        /* skip opening quote */
+            if(*s && *s!='\'') s++;     /* skip the literal char — preserve its case */
+            if(*s=='\'') s++;           /* skip closing quote */
+            s--;                        /* outer loop will s++ */
+        } else {
+            *s=(char)toupper((unsigned char)*s);
+        }
+    }
+}
 static char *skip_ws(char *s){ while(*s==' '||*s=='\t') s++; return s; }
 
 static void emit(int addr, unsigned char b){
@@ -66,12 +80,20 @@ static int eval_expr(char *s, int *ok){
     else if(*s=='%'){ s++; while(*s=='0'||*s=='1') val=val*2+(*s++-'0'); }
     else if(isdigit((unsigned char)*s)){ while(isdigit((unsigned char)*s)) val=val*10+(*s++-'0'); }
     else if(isalpha((unsigned char)*s)||*s=='_'){
-        char nm[32]; int i=0;
-        while((isalnum((unsigned char)*s)||*s=='_')&&i<31) nm[i++]=*s++;
-        nm[i]=0;
-        int lv=label_find(nm);
-        if(lv==UNDEF){ if(pass==2){fprintf(stderr,"ERROR line %d: undefined '%s'\n",lineno,nm); errors++;} *ok=0; return 0; }
-        val=lv;
+        /* A'x' — Signetics ASCII character literal (asm2650.py ASCII token) */
+        if(toupper((unsigned char)*s)=='A' && *(s+1)=='\''){
+            s+=2; /* skip A' */
+            val=(unsigned char)*s;
+            if(*s) s++;
+            if(*s=='\'') s++; /* skip closing ' */
+        } else {
+            char nm[32]; int i=0;
+            while((isalnum((unsigned char)*s)||*s=='_')&&i<31) nm[i++]=*s++;
+            nm[i]=0;
+            int lv=label_find(nm);
+            if(lv==UNDEF){ if(pass==2){fprintf(stderr,"ERROR line %d: undefined '%s'\n",lineno,nm); errors++;} *ok=0; return 0; }
+            val=lv;
+        }
     } else if(*s=='\''){
         s++; val = (unsigned char)*s;
         if(*s) s++;
@@ -84,10 +106,20 @@ static int eval_expr(char *s, int *ok){
 }
 
 static int split_ops(char *s, char ops[][64], int maxops){
+    /* Split on commas, but treat single-quoted chars ('x' and A'x') as atomic tokens
+     * so that A',' is not split at the comma inside the quotes. */
     int n=0; s=skip_ws(s);
     while(*s&&n<maxops){
         int i=0;
-        while(*s&&*s!=','&&*s!=';'&&i<63) ops[n][i++]=*s++;
+        while(*s&&*s!=','&&*s!=';'&&i<63){
+            if(*s=='\''){ /* 'x' literal — copy opening quote, char, closing quote */
+                if(i<63) ops[n][i++]=*s++;          /* opening ' */
+                if(*s&&i<63) ops[n][i++]=*s++;       /* the char itself */
+                if(*s=='\''&&i<63) ops[n][i++]=*s++; /* closing ' */
+            } else {
+                ops[n][i++]=*s++;
+            }
+        }
         ops[n][i]=0;
         for(int j=i-1;j>=0&&(ops[n][j]==' '||ops[n][j]=='\t');j--) ops[n][j]=0;
         n++; if(*s==',') s++; s=skip_ws(s);
@@ -131,18 +163,29 @@ static void assemble_line(char *line){
     char *p=buf; while(*p){ if(*p==';'){*p=0;break;} p++; }
     p=skip_ws(buf); if(!*p) return;
     char lbl[32]="";
+    int had_colon=0;
     if(!isspace((unsigned char)buf[0])&&buf[0]){
         int i=0;
         while((isalnum((unsigned char)*p)||*p=='_')&&i<31) lbl[i++]=*p++;
-        lbl[i]=0; if(*p==':') p++; p=skip_ws(p);
+        lbl[i]=0;
+        if(*p==':'){
+            had_colon=1;
+            p++;
+        }
+        p=skip_ws(p);
         if(pass==1) label_define(lbl,pc);
     }
+    /* Python parseline: "LABEL: anything" is treated as a label-only line;
+     * the text after the colon is the comment and NO instruction is assembled.
+     * Replicate this: if a colon was present, return after defining the label. */
+    if(had_colon){ return; }
     if(!*p) return;
     char mn[16]=""; int mi=0;
     while((isalpha((unsigned char)*p)||isdigit((unsigned char)*p))&&mi<15) mn[mi++]=*p++;
     mn[mi]=0; p=skip_ws(p); if(*p==',') p++; p=skip_ws(p);
-    char ops[6][64]={"","","","","",""};
-    int nops=split_ops(p,ops,6);
+    char ops[64][64];
+    for(int _i=0;_i<64;_i++) ops[_i][0]=0;
+    int nops=split_ops(p,ops,64);
 
     if(strcmp(mn,"ORG")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok){pc=v; if(pass==1&&*lbl) label_define(lbl,pc);} return; }
     if(strcmp(mn,"EQU")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok) label_define(lbl,v); return; }
