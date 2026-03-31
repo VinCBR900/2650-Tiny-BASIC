@@ -277,6 +277,10 @@ static void assemble_line(char *line){
         char *addr_s=ops[1]; int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
         emit(pc,(unsigned char)(base|r));pc++; if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;} return;
     }
+    /*
+     * BXA/BXSA not orthogonol, only works on R3
+     * Check later properly encoded i.e. assembly is not not asking for R0-2 usage
+    */
     if(strcmp(mn,"BXA")==0||strcmp(mn,"BSXA")==0){
         int ind=0; char *a=ops[0]; if(*a=='*'){ind=1;a++;} int ok,v=eval_expr(a,&ok);
         emit(pc,(strcmp(mn,"BXA")==0)?0x9F:0xBF);pc++;
