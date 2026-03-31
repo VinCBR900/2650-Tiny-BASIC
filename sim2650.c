@@ -280,7 +280,11 @@ static void execute(void) {
     if (op == 0xC0) { return; }                        /* NOP */
     if (op == 0x12) { R(0)=cpu.PSU; set_cc(R(0)); return; }  /* SPSU */
     if (op == 0x13) { R(0)=cpu.PSL; set_cc(R(0)); return; }  /* SPSL */
-    if (op == 0x92) { cpu.PSU=(R(0)&~PSU_S); return; }       /* LPSU */
+    if (op == 0x92) {                                         /* LPSU */
+        /* Manual: only F, II and SP are loaded; preserve external S bit. */
+        cpu.PSU = (cpu.PSU & PSU_S) | (R(0) & (PSU_F | PSU_II | PSU_SP));
+        return;
+    }
     if (op == 0x93) { cpu.PSL=R(0); return; }                 /* LPSL */
 
     /* RETC / RETE */
@@ -318,28 +322,48 @@ static void execute(void) {
 
     /* RRR */
     if (op>=0x50&&op<=0x53){
-        unsigned char r=R(rn), b0=r&1;
-        if(cpu.PSL&PSL_WC){ r=(r>>1)|((cpu.PSL&PSL_C)?0x80:0); if(b0)cpu.PSL|=PSL_C;else cpu.PSL&=~PSL_C; }
+        unsigned char r=R(rn), old=r, b0=r&1;
+        if(cpu.PSL&PSL_WC){
+            r=(r>>1)|((cpu.PSL&PSL_C)?0x80:0);
+            if(b0)cpu.PSL|=PSL_C;else cpu.PSL&=~PSL_C;
+            if(((old^r)&0x80)!=0) cpu.PSL|=PSL_OVF; else cpu.PSL&=~PSL_OVF;
+            if(r&0x20) cpu.PSL|=PSL_IDC; else cpu.PSL&=~PSL_IDC;
+        }
         else r=(r>>1)|(b0<<7);
         R(rn)=r; set_cc(r); return;
     }
 
     /* RRL */
     if (op>=0xD0&&op<=0xD3){
-        unsigned char r=R(rn), b7=(r>>7)&1;
-        if(cpu.PSL&PSL_WC){ r=(r<<1)|((cpu.PSL&PSL_C)?1:0); if(b7)cpu.PSL|=PSL_C;else cpu.PSL&=~PSL_C; }
+        unsigned char r=R(rn), old=r, b7=(r>>7)&1;
+        if(cpu.PSL&PSL_WC){
+            r=(r<<1)|((cpu.PSL&PSL_C)?1:0);
+            if(b7)cpu.PSL|=PSL_C;else cpu.PSL&=~PSL_C;
+            if(((old^r)&0x80)!=0) cpu.PSL|=PSL_OVF; else cpu.PSL&=~PSL_OVF;
+            if(r&0x20) cpu.PSL|=PSL_IDC; else cpu.PSL&=~PSL_IDC;
+        }
         else r=(r<<1)|b7;
         R(rn)=r; set_cc(r); return;
     }
 
     /* ZBRR */
-    if (op==0x9B){ cpu.IAR=pop_ras(); return; }
+    if (op==0x9B){
+        unsigned char ob=fetch();
+        int ind=(ob&0x80)?1:0;
+        int off=ob&0x7F; if(off&0x40) off|=~0x7F;
+        unsigned short t=(unsigned short)((cpu.IAR & 0x6000) | (off & 0x1FFF));
+        if(ind) t=resolve(t,1);
+        cpu.IAR=t;
+        return;
+    }
 
     /* ZBSR — signed 7-bit page-relative call */
     if (op==0xBB){
         unsigned char ob=fetch();
+        int ind=(ob&0x80)?1:0;
         int off=ob&0x7F; if(off&0x40) off|=~0x7F;
-        unsigned short target=(unsigned short)((cpu.IAR & 0x6000)+off) & 0x7FFF;
+        unsigned short target=(unsigned short)((cpu.IAR & 0x6000) | (off & 0x1FFF));
+        if(ind) target=resolve(target,1);
         push_ras(cpu.IAR);
         cpu.IAR=target;
         return;
@@ -366,21 +390,32 @@ static void execute(void) {
     if(op>=0xB8&&op<=0xBA){ BS_BODY_R(!test_cc(op&3)); return; } /* BSFR */
     if(op>=0xBC&&op<=0xBE){ BS_BODY_A(!test_cc(op&3)); return; } /* BSFA */
 
-    /* BSNR/BSNA */
-    if(op>=0x78&&op<=0x7B){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; int s=(cpu.PSU&PSU_S)?1:0; if(s!=(R(rn)&1))cpu.IAR=t; return; }
-    if(op>=0x7C&&op<=0x7F){ int ind; unsigned short t=fetch_abs_br(&ind); int s=(cpu.PSU&PSU_S)?1:0; if(s!=(R(rn)&1))cpu.IAR=t; return; }
+    /* BSNR/BSNA — branch to subroutine if register != 0 */
+    if(op>=0x78&&op<=0x7B){
+        int ind,off=fetch_rel(&ind);
+        unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF;
+        if(ind) t=resolve(t,1);
+        if(R(rn)!=0){ push_ras(cpu.IAR); cpu.IAR=t; }
+        return;
+    }
+    if(op>=0x7C&&op<=0x7F){
+        int ind; unsigned short t=fetch_abs_br(&ind);
+        if(ind) t=resolve(t,1);
+        if(R(rn)!=0){ push_ras(cpu.IAR); cpu.IAR=t; }
+        return;
+    }
 
     /* BRNR/BRNA — decrement, branch if != 0 */
-    if(op>=0x58&&op<=0x5B){ int ind,off=fetch_rel(&ind); R(rn)--; set_cc(R(rn)); if(R(rn)!=0){cpu.IAR=(unsigned short)(cpu.IAR+off)&0x7FFF;} return; }
-    if(op>=0x5C&&op<=0x5F){ int ind; unsigned short t=fetch_abs_br(&ind); R(rn)--; set_cc(R(rn)); if(R(rn)!=0)cpu.IAR=t; return; }
+    if(op>=0x58&&op<=0x5B){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0){cpu.IAR=t;} return; }
+    if(op>=0x5C&&op<=0x5F){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0)cpu.IAR=t; return; }
 
     /* BIRR/BIRA — increment, branch if != 0 */
-    if(op>=0xD8&&op<=0xDB){ int ind,off=fetch_rel(&ind); R(rn)++; set_cc(R(rn)); if(R(rn)!=0){cpu.IAR=(unsigned short)(cpu.IAR+off)&0x7FFF;} return; }
-    if(op>=0xDC&&op<=0xDF){ int ind; unsigned short t=fetch_abs_br(&ind); R(rn)++; set_cc(R(rn)); if(R(rn)!=0)cpu.IAR=t; return; }
+    if(op>=0xD8&&op<=0xDB){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); R(rn)++; if(R(rn)!=0){cpu.IAR=t;} return; }
+    if(op>=0xDC&&op<=0xDF){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); R(rn)++; if(R(rn)!=0)cpu.IAR=t; return; }
 
-    /* BDRR/BDRA — decrement, branch if >= 0 signed */
-    if(op>=0xF8&&op<=0xFB){ int ind,off=fetch_rel(&ind); R(rn)--; set_cc(R(rn)); if((signed char)R(rn)>=0){cpu.IAR=(unsigned short)(cpu.IAR+off)&0x7FFF;} return; }
-    if(op>=0xFC&&op<=0xFF){ int ind; unsigned short t=fetch_abs_br(&ind); R(rn)--; set_cc(R(rn)); if((signed char)R(rn)>=0)cpu.IAR=t; return; }
+    /* BDRR/BDRA — decrement, branch if != 0 */
+    if(op>=0xF8&&op<=0xFB){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0){cpu.IAR=t;} return; }
+    if(op>=0xFC){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0)cpu.IAR=t; return; }
 
     /* BXA/BSXA */
     if(op==0x9F||op==0xBF){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); t=(t+R(rn))&0x7FFF; if(op==0xBF)push_ras(cpu.IAR); cpu.IAR=t; return; }
