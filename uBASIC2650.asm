@@ -296,7 +296,7 @@ SE_TN:
         COMI,R0 10
         BCTA,EQ DO_GOTO
 SE_SYNERR:
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 SE_RET:
         RETC,UN
@@ -406,7 +406,7 @@ DL_EQ:
         LODA,R0 *IPH
         COMI,R0 A'='
         BCTA,EQ DL_EQC
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DL_EQC:
         BSTA,UN INC_IP
@@ -415,7 +415,7 @@ DL_EX:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DL_STORE
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DL_STORE:
         ; address = VARS + (SC0 - 'A') * 2
@@ -468,7 +468,7 @@ DIN_PR:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DL_STORE
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 
 ; ─── DO_IF ────────────────────────────────────────────────────────────────────
@@ -481,7 +481,7 @@ DO_IF:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DIF_LS
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DIF_LS:
         LODA,R0 EXPH
@@ -492,14 +492,14 @@ DIF_LS:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DIF_RP
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DIF_RP:
         BSTA,UN PARSE_EXPR               ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DIF_EVAL
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DIF_EVAL:
         ; signed 16-bit compare: TMPH:TMPL (left) vs EXPH:EXPL (right)
@@ -534,13 +534,13 @@ DIF_TH:
         BSTA,UN GETCI_UC                 ; [+1]  must be A'T'
         COMI,R0 A'T'
         BCTA,EQ DIF_TH2
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DIF_TH2:
         BSTA,UN GETCI_UC                 ; [+1]  must be A'H'
         COMI,R0 A'H'
         BCTA,EQ DIF_EW
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DIF_EW:
         BSTA,UN EATWORD                  ; [+1]
@@ -559,7 +559,7 @@ DIF_EW:
         BCTA,EQ DIF_CLE  ; <=
         COMI,R0 6
         BCTA,EQ DIF_CGE  ; >=
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 
 DIF_CEQ:
@@ -604,7 +604,7 @@ DO_GOTO:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DG_OK
-        LODI,R0 0
+        EORZ R0 ; clear R0
         BCTA,UN DO_ERROR
 DG_OK:
         LODA,R0 EXPH
@@ -1421,7 +1421,7 @@ GET_PREC_SC0:
         BCTA,EQ GP_HIGH
         COMI,R0 A'/'
         BCTA,EQ GP_HIGH
-        LODI,R0 0
+        EORZ R0 ; clear R0
         RETC,UN
 GP_LOW:
         LODI,R0 1
