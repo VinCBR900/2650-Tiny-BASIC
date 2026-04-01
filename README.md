@@ -1,54 +1,21 @@
 # 2650-Tiny-BASIC
 
-Signetics 2650 Tiny BASIC **WORK IN PRGRESS**.
+Signetics 2650 Tiny BASIC **WORK IN PRGRESS**, do not use.
 
-## Current behavior notes
+##  Notes
 
-- Program line numbers are 16-bit values constrained to `1..32767` and are stored/sorted as unsigned 16-bit values.
-- Program-memory insertions enforce `PROGLIM`; when insertion would exceed capacity, interpreter reports `?1`.
-- Runtime `GOTO` to missing line reports `?2`.
-- Runtime malformed stored-line records report `?3` and stop `RUN`.
-- Expression parser supports:
-  - `+`, `-`, `*`, `/`
-  - parentheses `(...)`
-  - unary `+` and unary `-`
-  - precedence: unary > `*`/`/` > `+`/`-`
-- Numeric arithmetic uses 16-bit two's-complement wraparound semantics.
-  - Example: `32767+1` => `-32768`
+First attempt at writing a Signetics 2650 Tiny BASIC Interpreter in Claude with help from CODEX.
 
-## Instruction micro-tests (simulator semantics)
+So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Archtectural Challanges are: 
 
-A targeted simulator micro-test suite lives at `tests/instruction_microtests.py`.
+- 8 level hardware stack.  Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
+  - Option is to use SW stack but that add 10-20 bytes of overhead each call, so best be worth it...  
+- Although it has nice features like auto-increment and decrement, and branch on condition code, these are not size optimized
+  - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes  
+- 8kbyte memory pages - shouldn't matter here as expect max 4kbyte ROM, 4kbyte RAM
+  
+The biggest challange is that, unlike MOS 6502, Claude, Gemini and CODEX dont really know the 2650 CPU architecture, probably because training data is limited.
 
-It exercises parser-sensitive instruction semantics directly:
+So they all **confidently** write code that is plain wrong.
 
-- `COMI` + `BCTA,EQ/GT/LT`
-- `SUBI` + `BCTA,EQ/GT/LT`
-- `ADDI` wrap/non-wrap carry+zero branch expectations
-- `ADDI` zero-without-carry branch expectation (`GT` fast-path)
-- `BSTA`/`RETC` nested return-stack behavior
-- conditional `BSTA` non-taken path (must not push RAS)
-
-Run it with:
-
-```bash
-python3 tests/instruction_microtests.py
-```
-
-For end-to-end regression probing of the current uBASIC `RUN`/`LIST` behavior
-on the simulator, use:
-
-```bash
-python3 tests/ubasic_run_list_regression.py
-```
-
-## Regression scenarios
-
-See `regression_scenarios.md` for manual scenarios covering:
-
-- replace with longer/shorter lines,
-- delete first/middle/last lines,
-- sorted inserts,
-- out-of-memory insert handling,
-- bad-`GOTO` and malformed-record runtime defenses,
-- expression precedence/parentheses/unary handling.
+The original aim was to get a working 2kbyte Tiny BASIC, but at this rate 4kbyte is more likely. 
