@@ -144,7 +144,7 @@ RESET:
         STRA,R0 PEL
         LODI,R0 $FF
         STRA,R0 SWSP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 RUNFLG
         STRA,R0 GOTOFLG
         ; clear A-Z variables (52 bytes) using IPH:IPL as scratch pointer
@@ -154,7 +154,7 @@ RESET:
         STRA,R0 IPL
         LODI,R3 $34
 CLRV:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 *IPH
         BSTA,UN INC_IP
 CLRV_NC:
@@ -309,7 +309,7 @@ DO_END:
         LODA,R0 RUNFLG
         COMI,R0 $00
         BCTA,EQ DE_HALT
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 RUNFLG
         RETC,UN
 DE_HALT:
@@ -336,7 +336,7 @@ DP_ITEM:
         LODA,R0 *IPH
         COMI,R0 DQ
         BCTA,EQ DP_STRING
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 NEGFLG  ; clear CHR$ flag before parse
         BSTA,UN PARSE_EXPR               ; [+1]
         LODA,R0 ERRFLG
@@ -517,7 +517,7 @@ DIF_EVAL:
         SUBA,R0 TMPL
         BCTA,LT DIF_LT
         BCTA,GT DIF_GT
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 SC1
         BCTA,UN DIF_TH  ; EQ
 DIF_LT:
@@ -677,7 +677,7 @@ DLS_RET:
 DO_RUN:
         LODI,R0 $01
         STRA,R0 RUNFLG
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 GOTOFLG
         LODI,R0 <PROG
         STRA,R0 TMPH
@@ -751,7 +751,7 @@ DR_CD:
         STRA,R0 TMPL
         BCTA,UN DR_LP
 DR_GOTO:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 GOTOFLG
         LODA,R0 GOTOH
         STRA,R0 LNUMH
@@ -765,7 +765,7 @@ DR_GOTO:
         BSTA,UN DO_ERROR  ; [+1] undefined line — returns to REPL
         BCTA,UN DR_LP
 DR_STOP:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 RUNFLG
 DR_RET:
         RETC,UN
@@ -774,7 +774,7 @@ DR_RET:
 ; If IP starts with a digit, parse and store/delete the numbered line.
 ; Returns ERRFLG=$01 if handled as a numbered line, $00 if immediate.
 TRY_STORE_LINE:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         LODA,R0 *IPH
         COMI,R0 A'0'
@@ -1095,7 +1095,7 @@ FL_LH:
         SUBA,R0 LNUML
         BCTA,LT FL_ADV
         BCTA,GT FL_RET
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN  ; exact match
 FL_ADV:
@@ -1193,7 +1193,7 @@ FI_RET:
 PARSE_EXPR:
         LODI,R0 $FF
         STRA,R0 STKIDX
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
 
 PX_ATOM:
@@ -1401,7 +1401,7 @@ PX_DONE:
         STRA,R0 EXPH
         LODA,R0 VALSL
         STRA,R0 EXPL
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 
@@ -1585,7 +1585,7 @@ AO_SLN:
 ; (adds 1 more level). Unary - and + handled by PARSE_EXPR before calling here.
 ; CHR$ result: sets NEGFLG=$01 so DO_PRINT outputs EXPL as a character.
 PARSE_FACTOR:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 NEGFLG  ; clear CHR$ flag
         LODA,R0 *IPH
         BSTA,UN UPCASE  ; [+1]
@@ -1624,7 +1624,7 @@ PF_LVN:
 PF_LVN2:
         LODA,R0 *TMPH
         STRA,R0 EXPL
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 
@@ -1647,7 +1647,7 @@ PRO_EQ:
 PRO_EQN:
         LODI,R0 1
         STRA,R0 RELOP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 
@@ -1662,7 +1662,7 @@ PRO_LTN:
         BCTA,EQ PRO_NE
         LODI,R0 3
         STRA,R0 RELOP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 PRO_LE:
@@ -1670,7 +1670,7 @@ PRO_LE:
 PRO_LEN:
         LODI,R0 5
         STRA,R0 RELOP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 PRO_NE:
@@ -1678,7 +1678,7 @@ PRO_NE:
 PRO_NEN:
         LODI,R0 2
         STRA,R0 RELOP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 PRO_GT:
@@ -1690,7 +1690,7 @@ PRO_GTN:
         BCTA,EQ PRO_GE
         LODI,R0 4
         STRA,R0 RELOP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 PRO_GE:
@@ -1698,14 +1698,14 @@ PRO_GE:
 PRO_GEN:
         LODI,R0 6
         STRA,R0 RELOP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         RETC,UN
 
 ; ─── PARSE_S16 ────────────────────────────────────────────────────────────────
 ; Parse optional leading '-' then decimal digits → EXPH:EXPL. ERRFLG=$00 if digits.
 PARSE_S16:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 NEGFLG
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
@@ -1741,7 +1741,7 @@ PS16_RET:
 ; ─── PARSE_U16 ────────────────────────────────────────────────────────────────
 ; Parse unsigned decimal digits → EXPH:EXPL. ERRFLG=$00 if ≥1 digit.
 PARSE_U16:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
         LODI,R0 $01
@@ -1764,7 +1764,7 @@ PU16_DNC:
         STRA,R0 TMPH
         LODA,R0 EXPL
         STRA,R0 TMPL  ; TMPH:TMPL = old EXP
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
         LODI,R3 10
@@ -1790,7 +1790,7 @@ PU16_MNC:
         ADDI,R0 1
         STRA,R0 EXPH
 PU16_DIG_NC:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG  ; success: at least one digit
         BCTA,UN PU16_LP
 PU16_DONE:
@@ -1799,7 +1799,7 @@ PU16_DONE:
 ; ─── MUL16 ────────────────────────────────────────────────────────────────────
 ; Signed TMPH:TMPL × EXPH:EXPL → EXPH:EXPL  (16-bit two's complement wrap)
 MUL16:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 NEGFLG
         ; abs(left) TMPH:TMPL
         LODA,R0 TMPH
@@ -1847,7 +1847,7 @@ MU_RA:
         STRA,R0 SC0
         LODA,R0 EXPL
         STRA,R0 SC1
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
 MU_LP:
@@ -1897,7 +1897,7 @@ MU_RET:
 ; Signed TMPH:TMPL ÷ EXPH:EXPL → EXPH:EXPL  (truncate toward zero)
 ; ERRFLG=$01 and DO_ERROR called on divide-by-zero.
 DIV16:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 ERRFLG
         LODA,R0 EXPH
         COMI,R0 $00
@@ -1906,7 +1906,7 @@ DIV16:
         COMI,R0 $00
         BCTA,EQ DV_ZERO
 DV_NZ:
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 NEGFLG
         ; abs(dividend) TMPH:TMPL
         LODA,R0 TMPH
@@ -1953,7 +1953,7 @@ DV_VA:
         STRA,R0 SC0  ; divisor hi
         LODA,R0 EXPL
         STRA,R0 SC1  ; divisor lo
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL  ; quotient = 0
 DV_LP:
@@ -2028,7 +2028,7 @@ PS16P_NZ:
         STRA,R0 TMPH
         LODI,R0 >DIVTAB
         STRA,R0 TMPL
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 NEGFLG  ; leading-zero flag
 PS16P_DIVLP:
         ; load next divisor pair from DIVTAB
@@ -2296,7 +2296,7 @@ DO_ERROR:
         STRA,R0 SC0                      ; save error code
         LODA,R0 RUNFLG
         STRA,R0 SC1  ; save run state
-        LODI,R0 $00
+        EORZ R0 ; clear R0
         STRA,R0 RUNFLG  ; clear run
         LODI,R0 $FF
         STRA,R0 SWSP  ; clear GOSUB stack
