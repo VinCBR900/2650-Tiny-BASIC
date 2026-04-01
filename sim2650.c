@@ -1,5 +1,5 @@
 /* ============================================================================
- * sim2650.c  (internal version 1.6)
+ * sim2650.c  (internal version 1.7)
  * Signetics 2650 simulator for uBASIC2650 / PIPBUG 1 project
  * Build: gcc -Wall -O2 -o sim2650 sim2650.c
  *
@@ -15,6 +15,15 @@
  *                        · ROM-protect only $0000-$03FF
  *                        · Entry default $0440 (after Pipbug 1kB+64B)
  *                        · Intercept COUT=$02B4  CHIN=$0286  CRLF=$008A
+ *
+ * Changes v1.6 -> v1.7  (2650 manual compliance corrections):
+ *   BUG-SIM-07 FIXED: Corrected CC encoding to match manual:
+ *              POS=01 ($40), ZERO=00 ($00), NEG=10 ($80).
+ *   BUG-SIM-08 FIXED: TPSU/TPSL/TMI now set CC as specified:
+ *              EQ if all tested bits are 1, otherwise LT.
+ *   BUG-SIM-09 FIXED: ADD/SUB now update IDC from bit-3 carry/borrow.
+ *   BUG-SIM-10 FIXED: CPSU/PPSU no longer modify PSU.S (sense) or
+ *              reserved PSU bits; only F/II/SP are software-controlled.
  *
  * Changes v1.5 -> v1.6  (Pipbug 1 integration):
  *   BUG-SIM-04 FIXED: Memory map corrected for Pipbug: ROM $0000-$03FF (1kB),
@@ -57,7 +66,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER   "1.6"
+#define SIM_VER   "1.7"
 #define MEM_SIZE  0x8000
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
@@ -111,9 +120,9 @@ static int ri(int n) {
 #define PSL_OVF 0x04
 #define PSL_COM 0x02
 #define PSL_C   0x01
-#define CC_NEG  0x00
+#define CC_NEG  0x80
 #define CC_POS  0x40
-#define CC_ZERO 0x80
+#define CC_ZERO 0x00
 #define COND_EQ 0
 #define COND_GT 1
 #define COND_LT 2
@@ -240,8 +249,11 @@ static unsigned short resolve(unsigned short base, int ind) {
 
 /* --- ALU ------------------------------------------------------------------- */
 static unsigned char alu_add(unsigned char a, unsigned char b, int wc) {
-    unsigned int s = a + b + (wc && (cpu.PSL & PSL_C) ? 1 : 0);
+    int carry_in = (wc && (cpu.PSL & PSL_C)) ? 1 : 0;
+    unsigned int s = a + b + carry_in;
+    unsigned int lo = (a & 0x0F) + (b & 0x0F) + carry_in;
     if (s > 255) cpu.PSL |= PSL_C; else cpu.PSL &= ~PSL_C;
+    if (lo > 0x0F) cpu.PSL |= PSL_IDC; else cpu.PSL &= ~PSL_IDC;
     unsigned char r = s & 0xFF;
     if ((!(a&0x80)&&!(b&0x80)&&(r&0x80))||((a&0x80)&&(b&0x80)&&!(r&0x80)))
         cpu.PSL |= PSL_OVF; else cpu.PSL &= ~PSL_OVF;
@@ -250,9 +262,12 @@ static unsigned char alu_add(unsigned char a, unsigned char b, int wc) {
 static unsigned char alu_sub(unsigned char a, unsigned char b, int wb) {
     /* C=1 means no borrow input; borrow output: C=0 means borrow occurred */
     int borrow_in = (wb && !(cpu.PSL & PSL_C)) ? 1 : 0;
-    unsigned int d = (unsigned int)a - (unsigned int)b - borrow_in;
-    /* Set C=1 if no borrow (result fits in 0..255 and a >= b+borrow_in) */
-    if ((int)d >= 0) cpu.PSL |= PSL_C; else cpu.PSL &= ~PSL_C;
+    int d = (int)a - (int)b - borrow_in;
+    int lo = (int)(a & 0x0F) - (int)(b & 0x0F) - borrow_in;
+    /* Set C=1 if no borrow (result fits in 0..255 and a >= b+borrow_in). */
+    if (d >= 0) cpu.PSL |= PSL_C; else cpu.PSL &= ~PSL_C;
+    /* IDC follows low-nibble borrow for subtraction: 1=no borrow, 0=borrow. */
+    if (lo >= 0) cpu.PSL |= PSL_IDC; else cpu.PSL &= ~PSL_IDC;
     unsigned char r = (unsigned char)(d & 0xFF);
     if (((a&0x80)&&!(b&0x80)&&!(r&0x80))||(!(a&0x80)&&(b&0x80)&&(r&0x80)))
         cpu.PSL |= PSL_OVF; else cpu.PSL &= ~PSL_OVF;
@@ -294,14 +309,15 @@ static void execute(void) {
     /* CPSU/CPSL/PPSU/PPSL */
     if (op>=0x74&&op<=0x77){
         unsigned char m=fetch();
-        switch(op){ case 0x74:cpu.PSU&=~m;break; case 0x75:cpu.PSL&=~m;break;
-                    case 0x76:cpu.PSU|=m;break;  case 0x77:cpu.PSL|=m;break; }
+        unsigned char pm = m & (PSU_F | PSU_II | PSU_SP); /* SW-writable PSU fields only */
+        switch(op){ case 0x74:cpu.PSU&=~pm;break; case 0x75:cpu.PSL&=~m;break;
+                    case 0x76:cpu.PSU|=pm;break;  case 0x77:cpu.PSL|=m;break; }
         return;
     }
 
     /* TPSU / TPSL */
-    if (op==0xB4){ set_cc(cpu.PSU & fetch()); return; }
-    if (op==0xB5){ set_cc(cpu.PSL & fetch()); return; }
+    if (op==0xB4){ unsigned char m=fetch(); cpu.PSL=(cpu.PSL&~PSL_CC)|(((cpu.PSU&m)==m)?CC_ZERO:CC_NEG); return; }
+    if (op==0xB5){ unsigned char m=fetch(); cpu.PSL=(cpu.PSL&~PSL_CC)|(((cpu.PSL&m)==m)?CC_ZERO:CC_NEG); return; }
 
     /* DAR */
     if (op>=0x94&&op<=0x97){
@@ -314,9 +330,7 @@ static void execute(void) {
     /* TMI */
     if (op>=0xF4&&op<=0xF7){
         unsigned char m=fetch(), res=R(rn)&m;
-        if(res==m) cpu.PSL=(cpu.PSL&~PSL_CC)|CC_POS;
-        else if(res==0) cpu.PSL=(cpu.PSL&~PSL_CC)|CC_ZERO;
-        else cpu.PSL=(cpu.PSL&~PSL_CC)|CC_NEG;
+        cpu.PSL=(cpu.PSL&~PSL_CC)|((res==m)?CC_ZERO:CC_NEG);
         return;
     }
 
