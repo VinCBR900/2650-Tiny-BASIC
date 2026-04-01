@@ -1,36 +1,91 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.1-pipbug
+; Version: v1.2-fixed6  (debug session fixes applied)
 ;
-; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
-;   Program loads at $0440.  All RAM EQUs remain at $1400+ (plenty of room).
-;   I/O via Pipbug ROM calls (replaces direct WRTD/REDE hardware instructions):
+; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, RAM $0400-$1BFF)
+;   Program loads at $0440.  All RAM EQUs at $1500+ (clear of code).
+;   I/O via Pipbug ROM calls:
 ;     COUT $02B4  — putchar: R0 = char to print
 ;     CHIN $0286  — getchar blocking: returns R0=ASCII
 ;     CRLF $008A  — print CR+LF
 ;
-; CC SEMANTICS (set_cc_add / set_cc_sub from sim2650):
-;   ADD: no-carry->GT  carry+zero->EQ  carry+nonzero->LT
-;   SUB: no-borrow+nonzero->GT  no-borrow+zero->EQ  borrow->LT
-;   Carry  skip idiom: BCTA,GT lbl   (GT = C=0 = no carry)
-;   Borrow skip idiom: BCFA,LT lbl   (NOT LT = C=1 = no borrow — covers GT+EQ)
-;   NEVER use BCTA,GT for borrow skip — misses the zero-result case.
+; ─── BUG FIX LOG ──────────────────────────────────────────────────────────────
 ;
-; 16-bit pointer advance inline pattern (preserves R1):
-;   LODA,R0 PTR_L; ADDI,R0 1; STRA,R0 PTR_L; BCTA,GT lbl; LODA,R0 PTR_H; ADDI,R0 1; STRA,R0 PTR_H; lbl:
+; BUG-ASM-01  FIXED  </>  operators reversed in LODI lines  (60 occurrences)
+;   asm2650 defines: > = LOW byte, < = HIGH byte (opposite of source convention)
+;   All LODI,R0 >SYM / <SYM pairs were swapped throughout.
+;   Exception: PROGLIM free-space check lines 795/798 were already correct.
 ;
-; DO_ERROR convention: LODI,R0 <code>; BCTA,UN DO_ERROR
-;   DO_ERROR saves RUNFLG, clears state, then BCTA,UN REPL (kills full RAS).
+; BUG-ASM-02  FIXED  Same-line LABEL: INSTRUCTION silently dropped (11 lines)
+;   asm2650 had_colon logic defines label then discards the rest of the line.
+;   Affected: UC_DO, UC_RET, EW_DS, DIF_CEQ..DIF_CGE (6 lines), GP_LOW, GP_HIGH.
+;   Fix: split each into two lines (label alone, then instruction).
 ;
-; I/O CONVENTION (Pipbug):
-;   Output: call BSTA,UN PUTCH with char already in R1 
-;   Input:  BSTA,UN GETKEY — waits until press, returns char in R0
-;   RDLINE: fills IBUF using GETKEY; echoes via COUT; result in R1 at each step
+; BUG-ASM-03  FIXED  RAM variables overlap code ($1400-$14B1)
+;   Code assembled to $0440-$14B1; RAM vars started at $1400.
+;   Writes to ERRFLG ($140E) were corrupting the first byte of INC_IP.
+;   Fix: shifted all 31 RAM EQUs from $14xx to $15xx.
 ;
+; BUG-ASM-04  FIXED  GETCI_UC returns IPL instead of character
+;   INC_IP clobbers R0 with new IPL value.  GETCI_UC called UPCASE then
+;   INC_IP, so caller received IPL not the uppercased char — breaking all
+;   keyword scanning in STMT_EXEC.
+;   Fix: save R0 via STRZ,R1 before INC_IP, restore via LODZ,R1 after.
+;
+; BUG-ASM-05  FIXED  Array index stores R0 not R1 (15 occurrences)
+;   Every array access used pattern:
+;     LODI,R1 >ARRAY  /  ADDZ,R1  /  STRA,R0 TMPL  (WRONG: stored index, not sum)
+;   Should be STRA,R1 TMPL to store the computed address low byte.
+;   All 15 occurrences fixed (VALSH, VALSL, OPSTK, SWSTK, VARS indexing).
+;
+; BUG-ASM-06  FIXED  Sign checks use COMI $80 (6 occurrences + zero checks)
+;   COMI,R0 $80; BCTA,LT is backwards on 2650:
+;     - Values < $80 (positive): subtraction borrows -> CC_POS, BCTA,LT NOT taken.
+;     - Values >= $80 (negative): no borrow -> CC_NEG, BCTA,LT taken (wrong way).
+;   All 6 occurrences in PRINT_S16, MUL16, DIV16, TRY_STORE_LINE changed to:
+;     ANDI,R0 $80; BCTA,EQ  (test bit 7 directly; EQ if clear = positive).
+;   Zero-checks (COMI $00; BCTA,GT) also fixed: COMI $00 always gives CC_NEG
+;   (no borrow ever), so BCTA,GT (CC_POS) never fires.  Fixed by using CC
+;   set by LODA directly (CC_ZERO=0, CC_POS=positive, CC_NEG=negative/>=128).
+;
+; ─── KNOWN REMAINING BUGS (still being investigated) ──────────────────────────
+;
+; BUG-ASM-07  PENDING  PARSE_U16 digit-range check wrong
+;   COMI A'9'+1; BCTA,LT PU16_DIG fires for non-digits, not digits.
+;   2650 subtract: no-borrow (R0 >= ':') -> CC_NEG -> BCTA,LT taken (wrong).
+;   Need to restructure range check using SUBI or unsigned compare idiom.
+;
+; BUG-ASM-08  PENDING  NUL flood after EOF in simulator
+;   After input exhausted CHIN returns 0 forever; RDLINE echoes NULs endlessly.
+;   Cosmetic in simulator (real hardware CHIN blocks waiting for keypress).
+;
+; BUG-ASM-09  PENDING  IP pointer walks past PROGLIM ($1C00)
+;   After NUL flood fills IBUF, INC_IP walks IP past $1BFF into unmapped space.
+;   Triggered by BUG-ASM-08; will likely resolve once EOF handling is correct.
+;
+; ─── CC SEMANTICS (sim2650 set_cc_add / set_cc_sub) ──────────────────────────
+;   ADD/ADDI: no-carry -> CC_POS  carry+zero -> CC_ZERO  carry+nonzero -> CC_NEG
+;   SUB/SUBI: no-borrow -> CC_NEG  borrow+zero -> CC_ZERO  borrow+nonzero -> CC_POS
+;   LODA/ANDI/etc (set_cc): zero -> CC_ZERO  signed>0 -> CC_POS  signed<0 -> CC_NEG
+;   Carry  skip: BCTA,GT (CC_POS = no carry)
+;   Borrow skip: BCFA,LT (NOT CC_NEG = borrow occurred, covers CC_POS + CC_ZERO)
+;   Sign test:   ANDI,R0 $80; BCTA,EQ (EQ/CC_ZERO = bit7 clear = positive)
+;   Nonzero test: use CC from LODA/ANDI directly; BCTA,GT for positive nonzero
+;
+; ─── ARCHITECTURE NOTES ───────────────────────────────────────────────────────
 ; RAS DEPTH BUDGET:
-;   REPL(1) -> STMT_EXEC(2) -> DO_xxx(3) -> PARSE_EXPR(4) -> PARSE_FACTOR(5)
-;     -> UPCASE(6)  [max 6 — safe within 8-level hardware RAS]
-;   COUT/CHIN are intercepted by sim (or are short ROM calls) — they push
-;   one level (BSTA) and pop on return: net depth = caller+1 at call site only.
+;   REPL(1)->STMT_EXEC dispatch->DO_xxx(2)->PARSE_EXPR(3)->PARSE_FACTOR(4)
+;   ->PARSE_S16(5)->PARSE_U16(6)->WSKIP(7)  max 7, safe within 8-level RAS.
+;
+; ARRAY INDEXING PATTERN (correct form):
+;   LODI,R1 >ARRAY   ; R1 = low byte of array base address
+;   ADDZ,R1          ; R1 = R1 + R0 (index) — no carry possible for our arrays
+;   STRA,R1 TMPL     ; store computed low byte (NOT STRA,R0!)
+;   LODI,R0 <ARRAY   ; R0 = high byte of array base address
+;   STRA,R0 TMPH     ; TMPH:TMPL now points to ARRAY[index]
+;
+; INC_IP/INC_TMP/INC_EXP: all clobber R0 — never call with R0 holding data.
+;
+; PIPBUG intercepts (sim): COUT=$02B4  CHIN=$0286  CRLF=$008A  entry=$0440
 
 ; ─── ASCII ────────────────────────────────────────────────────────────────────
 CR      EQU     $0D
@@ -46,36 +101,36 @@ CHIN    EQU     $0286   ; getchar non-blocking: R0=0 if no key
 CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 
 ; ─── RAM $1400–$1BFF ──────────────────────────────────────────────────────────
-IPH     EQU     $1400   ; interpreter pointer hi
-IPL     EQU     $1401   ; interpreter pointer lo
-PEH     EQU     $1402   ; program end pointer hi
-PEL     EQU     $1403   ; program end pointer lo
-RUNFLG  EQU     $1404   ; $01=running $00=immediate
-GOTOFLG EQU     $1405   ; $01=GOTO/GOSUB pending
-GOTOH   EQU     $1406   ; pending target line hi
-GOTOL   EQU     $1407   ; pending target line lo
-CURH    EQU     $1408   ; current line hi  (error reporting)
-CURL    EQU     $1409   ; current line lo
-LNUMH   EQU     $140A   ; scratch line number hi
-LNUML   EQU     $140B   ; scratch line number lo
-SC0     EQU     $140C   ; scratch byte 0
-SC1     EQU     $140D   ; scratch byte 1
-ERRFLG  EQU     $140E   ; error flag $00=ok
-NEGFLG  EQU     $140F   ; sign / CHR$ flag
-EXPH    EQU     $1410   ; expression result hi
-EXPL    EQU     $1411   ; expression result lo
-TMPH    EQU     $1412   ; temp 16-bit hi
-TMPL    EQU     $1413   ; temp 16-bit lo
-OPSTK   EQU     $1414   ; operator stack [8]  $1414-$141B
-VALSH   EQU     $141C   ; value stack hi  [8]  $141C-$1423
-VALSL   EQU     $1424   ; value stack lo  [8]  $1424-$142B
-STKIDX  EQU     $142C   ; parser stack top ($FF=empty)
-SWSP    EQU     $142D   ; SW call stack pointer ($FF=empty)
-SWSTK   EQU     $142E   ; SW call stack 8×2 bytes  $142E-$143D
-RELOP   EQU     $143E   ; relational op 1-6
-IBUF    EQU     $1440   ; input buffer 64 bytes  $1440-$147F
-VARS    EQU     $1480   ; A-Z variables 2 bytes each  $1480-$14B3
-PROG    EQU     $14C0   ; program store base
+IPH     EQU     $1500   ; interpreter pointer hi
+IPL     EQU     $1501   ; interpreter pointer lo
+PEH     EQU     $1502   ; program end pointer hi
+PEL     EQU     $1503   ; program end pointer lo
+RUNFLG  EQU     $1504   ; $01=running $00=immediate
+GOTOFLG EQU     $1505   ; $01=GOTO/GOSUB pending
+GOTOH   EQU     $1506   ; pending target line hi
+GOTOL   EQU     $1507   ; pending target line lo
+CURH    EQU     $1508   ; current line hi  (error reporting)
+CURL    EQU     $1509   ; current line lo
+LNUMH   EQU     $150A   ; scratch line number hi
+LNUML   EQU     $150B   ; scratch line number lo
+SC0     EQU     $150C   ; scratch byte 0
+SC1     EQU     $150D   ; scratch byte 1
+ERRFLG  EQU     $150E   ; error flag $00=ok
+NEGFLG  EQU     $150F   ; sign / CHR$ flag
+EXPH    EQU     $1510   ; expression result hi
+EXPL    EQU     $1511   ; expression result lo
+TMPH    EQU     $1512   ; temp 16-bit hi
+TMPL    EQU     $1513   ; temp 16-bit lo
+OPSTK   EQU     $1514   ; operator stack [8]  $1514-$151B
+VALSH   EQU     $151C   ; value stack hi  [8]  $151C-$1523
+VALSL   EQU     $1524   ; value stack lo  [8]  $1524-$152B
+STKIDX  EQU     $152C   ; parser stack top ($FF=empty)
+SWSP    EQU     $152D   ; SW call stack pointer ($FF=empty)
+SWSTK   EQU     $152E   ; SW call stack 8×2 bytes  $152E-$153D
+RELOP   EQU     $153E   ; relational op 1-6
+IBUF    EQU     $1540   ; input buffer 64 bytes  $1540-$157F
+VARS    EQU     $1580   ; A-Z variables 2 bytes each  $1580-$15B3
+PROG    EQU     $15C0   ; program store base
 PROGLIM EQU     $1C00   ; one past end of program store
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
@@ -83,9 +138,9 @@ PROGLIM EQU     $1C00   ; one past end of program store
 
 ; ─── RESET / ENTRY ────────────────────────────────────────────────────────────
 RESET:
-        LODI,R0 >PROG
-        STRA,R0 PEH
         LODI,R0 <PROG
+        STRA,R0 PEH
+        LODI,R0 >PROG
         STRA,R0 PEL
         LODI,R0 $FF
         STRA,R0 SWSP
@@ -93,9 +148,9 @@ RESET:
         STRA,R0 RUNFLG
         STRA,R0 GOTOFLG
         ; clear A-Z variables (52 bytes) using IPH:IPL as scratch pointer
-        LODI,R0 >VARS
-        STRA,R0 IPH
         LODI,R0 <VARS
+        STRA,R0 IPH
+        LODI,R0 >VARS
         STRA,R0 IPL
         LODI,R3 $34
 CLRV:
@@ -104,9 +159,9 @@ CLRV:
         BSTA,UN INC_IP
 CLRV_NC:
         BRNR,R3 CLRV
-        LODI,R0 >BANNER
-        STRA,R0 IPH
         LODI,R0 <BANNER
+        STRA,R0 IPH
+        LODI,R0 >BANNER
         STRA,R0 IPL
         BSTA,UN PRTSTR
 
@@ -117,9 +172,9 @@ REPL:
         LODI,R0 SP
         BSTA,UN COUT
         BSTA,UN RDLINE
-        LODI,R0 >IBUF
-        STRA,R0 IPH
         LODI,R0 <IBUF
+        STRA,R0 IPH
+        LODI,R0 >IBUF
         STRA,R0 IPL
         BSTA,UN TRY_STORE_LINE
         LODA,R0 ERRFLG
@@ -175,9 +230,9 @@ STMT_EXEC:
         STRA,R0 SC1  ; [+1] char2 uppercase, IP advanced
 
         ; scan KW_TAB with TMPH:TMPL as pointer
-        LODI,R0 >KW_TAB
-        STRA,R0 TMPH
         LODI,R0 <KW_TAB
+        STRA,R0 TMPH
+        LODI,R0 >KW_TAB
         STRA,R0 TMPL
 SE_SCAN:
         LODA,R0 *TMPH
@@ -261,9 +316,9 @@ DE_HALT:
         HALT
 
 DO_NEW:
-        LODI,R0 >PROG
-        STRA,R0 PEH
         LODI,R0 <PROG
+        STRA,R0 PEH
+        LODI,R0 >PROG
         STRA,R0 PEL
         RETC,UN
 
@@ -368,10 +423,10 @@ DL_STORE:
         SUBI,R0 A'A'  ; 0-25
         STRA,R0 SC1
         ADDA,R0 SC1  ; *2  (SC1 = index, R0 = index*2)
-        LODI,R1 <VARS
+        LODI,R1 >VARS
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VARS
+        STRA,R1 TMPL
+        LODI,R0 <VARS
         BCTA,GT DL_NC
         ADDI,R0 1
 DL_NC:
@@ -405,9 +460,9 @@ DIN_PR:
         LODI,R0 SP
         BSTA,UN COUT
         BSTA,UN RDLINE                   ; [+1]
-        LODI,R0 >IBUF
-        STRA,R0 IPH
         LODI,R0 <IBUF
+        STRA,R0 IPH
+        LODI,R0 >IBUF
         STRA,R0 IPL
         BSTA,UN PARSE_S16                ; [+1]
         LODA,R0 ERRFLG
@@ -507,27 +562,33 @@ DIF_EW:
         LODI,R0 0
         BCTA,UN DO_ERROR
 
-DIF_CEQ: LODA,R0 SC1
+DIF_CEQ:
+        LODA,R0 SC1
         COMI,R0 $00
         BCTA,EQ DIF_TRUE
         BCTA,UN DIF_FALSE
-DIF_CNE: LODA,R0 SC1
+DIF_CNE:
+        LODA,R0 SC1
         COMI,R0 $00
         BCFA,EQ DIF_TRUE
         BCTA,UN DIF_FALSE
-DIF_CLT: LODA,R0 SC1
+DIF_CLT:
+        LODA,R0 SC1
         COMI,R0 $FF
         BCTA,EQ DIF_TRUE
         BCTA,UN DIF_FALSE
-DIF_CGT: LODA,R0 SC1
+DIF_CGT:
+        LODA,R0 SC1
         COMI,R0 $01
         BCTA,EQ DIF_TRUE
         BCTA,UN DIF_FALSE
-DIF_CLE: LODA,R0 SC1
+DIF_CLE:
+        LODA,R0 SC1
         COMI,R0 $01
         BCFA,EQ DIF_TRUE
         BCTA,UN DIF_FALSE
-DIF_CGE: LODA,R0 SC1
+DIF_CGE:
+        LODA,R0 SC1
         COMI,R0 $FF
         BCFA,EQ DIF_TRUE
         BCTA,UN DIF_FALSE
@@ -566,9 +627,9 @@ DG_RET:
 ; DO_RUN saves this in SC0:SC1 before calling STMT_EXEC.
 ; DO_GOSUB reads SC0:SC1 and pushes to SWSTK[SWSP].
 DO_LIST:
-        LODI,R0 >PROG
-        STRA,R0 TMPH
         LODI,R0 <PROG
+        STRA,R0 TMPH
+        LODI,R0 >PROG
         STRA,R0 TMPL
 DLS_LP:
         LODA,R0 TMPH
@@ -618,9 +679,9 @@ DO_RUN:
         STRA,R0 RUNFLG
         LODI,R0 $00
         STRA,R0 GOTOFLG
-        LODI,R0 >PROG
-        STRA,R0 TMPH
         LODI,R0 <PROG
+        STRA,R0 TMPH
+        LODI,R0 >PROG
         STRA,R0 TMPL
 DR_LP:
         LODA,R0 RUNFLG
@@ -650,9 +711,9 @@ DR_N2:
         BSTA,UN INC_TMP
 DR_N3:
         ; copy body to IBUF
-        LODI,R0 >IBUF
-        STRA,R0 IPH
         LODI,R0 <IBUF
+        STRA,R0 IPH
+        LODI,R0 >IBUF
         STRA,R0 IPL
         COMI,R3 $00
         BCTA,EQ DR_CD
@@ -674,9 +735,9 @@ DR_CD:
         LODA,R0 TMPL
         STRA,R0 SC1
         ; execute line
-        LODI,R0 >IBUF
-        STRA,R0 IPH
         LODI,R0 <IBUF
+        STRA,R0 IPH
+        LODI,R0 >IBUF
         STRA,R0 IPL
         BSTA,UN STMT_EXEC                ; [+1]
         ; check GOTO/GOSUB/RETURN flag
@@ -731,8 +792,8 @@ TSL_NUM:
 TSL_GOT:
         ; validate 1..32767
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTA,LT TSL_RNG
+        ANDI,R0 $80               ; test sign bit (CC_NEG if set)
+        BCTA,EQ TSL_RNG
         LODI,R0 $01
         STRA,R0 ERRFLG
         RETC,UN  ; >=32768 silently ignore
@@ -1003,9 +1064,9 @@ DL2_PNC:
 FIND_LINE:
         LODI,R0 $01
         STRA,R0 ERRFLG
-        LODI,R0 >PROG
-        STRA,R0 TMPH
         LODI,R0 <PROG
+        STRA,R0 TMPH
+        LODI,R0 >PROG
         STRA,R0 TMPL
 FL_LP:
         LODA,R0 TMPH
@@ -1064,9 +1125,9 @@ FL_RET:
 ; Find sorted insertion point for LNUMH:LNUML.
 ; Returns TMPH:TMPL = address where new record should be inserted.
 FIND_INS:
-        LODI,R0 >PROG
-        STRA,R0 TMPH
         LODI,R0 <PROG
+        STRA,R0 TMPH
+        LODI,R0 >PROG
         STRA,R0 TMPL
 FI_LP:
         LODA,R0 TMPH
@@ -1158,10 +1219,10 @@ PX_LPN:
         LODA,R0 STKIDX
         ADDI,R0 1
         STRA,R0 STKIDX
-        LODI,R1 <OPSTK
+        LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >OPSTK
+        STRA,R1 TMPL
+        LODI,R0 <OPSTK
         BCTA,GT PX_LPNCA
         ADDI,R0 1
 PX_LPNCA:
@@ -1204,10 +1265,10 @@ PX_PUSHV:
         LODA,R0 STKIDX
         ADDI,R0 1
         STRA,R0 STKIDX
-        LODI,R1 <VALSH
+        LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSH
+        STRA,R1 TMPL
+        LODI,R0 <VALSH
         BCTA,GT PX_VHN
         ADDI,R0 1
 PX_VHN:
@@ -1215,10 +1276,10 @@ PX_VHN:
         LODA,R0 EXPH
         STRA,R0 *TMPH
         LODA,R0 STKIDX
-        LODI,R1 <VALSL
+        LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSL
+        STRA,R1 TMPL
+        LODI,R0 <VALSL
         BCTA,GT PX_VLN
         ADDI,R0 1
 PX_VLN:
@@ -1246,10 +1307,10 @@ PX_REDLP:
         BCTA,EQ PX_PUSHOP  ; only 1 value
         ; get top op from OPSTK[STKIDX-1]
         SUBI,R0 1
-        LODI,R1 <OPSTK
+        LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >OPSTK
+        STRA,R1 TMPL
+        LODI,R0 <OPSTK
         BCTA,GT PX_TOPNC
         ADDI,R0 1
 PX_TOPNC:
@@ -1271,10 +1332,10 @@ PX_PUSHOP:
         BSTA,UN INC_IP
 PX_PON:
         LODA,R0 STKIDX
-        LODI,R1 <OPSTK
+        LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >OPSTK
+        STRA,R1 TMPL
+        LODI,R0 <OPSTK
         BCTA,GT PX_OPN
         ADDI,R0 1
 PX_OPN:
@@ -1293,10 +1354,10 @@ PX_RPLP:
         COMI,R0 $00
         BCTA,EQ PX_RPDONE  ; guard
         SUBI,R0 1
-        LODI,R1 <OPSTK
+        LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >OPSTK
+        STRA,R1 TMPL
+        LODI,R0 <OPSTK
         BCTA,GT PX_RPNCA2
         ADDI,R0 1
 PX_RPNCA2:
@@ -1322,10 +1383,10 @@ PX_RALL_LP:
         COMI,R0 $00
         BCTA,EQ PX_DONE
         SUBI,R0 1
-        LODI,R1 <OPSTK
+        LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >OPSTK
+        STRA,R1 TMPL
+        LODI,R0 <OPSTK
         BCTA,GT PX_RANC
         ADDI,R0 1
 PX_RANC:
@@ -1362,9 +1423,11 @@ GET_PREC_SC0:
         BCTA,EQ GP_HIGH
         LODI,R0 0
         RETC,UN
-GP_LOW:  LODI,R0 1
+GP_LOW:
+        LODI,R0 1
         RETC,UN
-GP_HIGH: LODI,R0 2
+GP_HIGH:
+        LODI,R0 2
         RETC,UN
 
 ; ─── APPLY_OP ─────────────────────────────────────────────────────────────────
@@ -1374,10 +1437,10 @@ GP_HIGH: LODI,R0 2
 APPLY_OP:
         ; load right value: VALSH/VALSL[STKIDX]
         LODA,R0 STKIDX
-        LODI,R1 <VALSH
+        LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSH
+        STRA,R1 TMPL
+        LODI,R0 <VALSH
         BCTA,GT AO_RHN
         ADDI,R0 1
 AO_RHN:
@@ -1385,10 +1448,10 @@ AO_RHN:
         LODA,R0 *TMPH
         STRA,R0 EXPH  ; right.hi
         LODA,R0 STKIDX
-        LODI,R1 <VALSL
+        LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSL
+        STRA,R1 TMPL
+        LODI,R0 <VALSL
         BCTA,GT AO_RLN
         ADDI,R0 1
 AO_RLN:
@@ -1399,10 +1462,10 @@ AO_RLN:
         ; load left value: VALSH/VALSL[STKIDX-1]
         LODA,R0 STKIDX
         SUBI,R0 1
-        LODI,R1 <VALSH
+        LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSH
+        STRA,R1 TMPL
+        LODI,R0 <VALSH
         BCTA,GT AO_LHN
         ADDI,R0 1
 AO_LHN:
@@ -1411,10 +1474,10 @@ AO_LHN:
         STRA,R0 NEGFLG  ; left.hi → NEGFLG temp
         LODA,R0 STKIDX
         SUBI,R0 1
-        LODI,R1 <VALSL
+        LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSL
+        STRA,R1 TMPL
+        LODI,R0 <VALSL
         BCTA,GT AO_LLN
         ADDI,R0 1
 AO_LLN:
@@ -1489,10 +1552,10 @@ AO_STORE:
         ; write EXPH:EXPL to VALSH/VALSL[STKIDX-1]; STKIDX--
         LODA,R0 STKIDX
         SUBI,R0 1
-        LODI,R1 <VALSH
+        LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSH
+        STRA,R1 TMPL
+        LODI,R0 <VALSH
         BCTA,GT AO_SHN
         ADDI,R0 1
 AO_SHN:
@@ -1501,10 +1564,10 @@ AO_SHN:
         STRA,R0 *TMPH
         LODA,R0 STKIDX
         SUBI,R0 1
-        LODI,R1 <VALSL
+        LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VALSL
+        STRA,R1 TMPL
+        LODI,R0 <VALSL
         BCTA,GT AO_SLN
         ADDI,R0 1
 AO_SLN:
@@ -1547,10 +1610,10 @@ PF_LVNCA:
         SUBI,R0 A'A'  ; 0-25
         STRA,R0 SC1
         ADDA,R0 SC1  ; *2
-        LODI,R1 <VARS
+        LODI,R1 >VARS
         ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 >VARS
+        STRA,R1 TMPL
+        LODI,R0 <VARS
         BCTA,GT PF_LVN
         ADDI,R0 1
 PF_LVN:
@@ -1740,8 +1803,8 @@ MUL16:
         STRA,R0 NEGFLG
         ; abs(left) TMPH:TMPL
         LODA,R0 TMPH
-        COMI,R0 $80
-        BCTA,LT MU_LA
+        ANDI,R0 $80               ; test sign bit (CC_NEG if set)
+        BCTA,EQ MU_LA
         LODA,R0 TMPH
         EORI,R0 $FF
         STRA,R0 TMPH
@@ -1760,8 +1823,8 @@ MUL16:
 MU_LA:
         ; abs(right) EXPH:EXPL
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTA,LT MU_RA
+        ANDI,R0 $80               ; test sign bit (CC_NEG if set)
+        BCTA,EQ MU_RA
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
@@ -1847,8 +1910,8 @@ DV_NZ:
         STRA,R0 NEGFLG
         ; abs(dividend) TMPH:TMPL
         LODA,R0 TMPH
-        COMI,R0 $80
-        BCTA,LT DV_DA
+        ANDI,R0 $80               ; test sign bit (CC_NEG if set)
+        BCTA,EQ DV_DA
         LODA,R0 TMPH
         EORI,R0 $FF
         STRA,R0 TMPH
@@ -1867,8 +1930,8 @@ DV_NZ:
 DV_DA:
         ; abs(divisor) EXPH:EXPL
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTA,LT DV_VA
+        ANDI,R0 $80               ; test sign bit (CC_NEG if set)
+        BCTA,EQ DV_VA
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
@@ -1939,8 +2002,8 @@ DV_ZERO:
 ; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
 PRINT_S16:
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTA,LT PS16P_POS
+        ANDI,R0 $80               ; test sign bit (CC_NEG if set)
+        BCTA,EQ PS16P_POS
         LODI,R0 A'-'
         BSTA,UN COUT
         ; negate
@@ -1952,20 +2015,18 @@ PRINT_S16:
         STRA,R0 EXPL
         BSTA,UN INC_EXP
 PS16P_POS:
-        LODA,R0 EXPH
-        COMI,R0 $00
-        BCTA,GT PS16P_NZ
-        LODA,R0 EXPL
-        COMI,R0 $00
-        BCTA,GT PS16P_NZ
+        LODA,R0 EXPH                     ; CC set by value
+        BCTA,GT PS16P_NZ              ; non-zero high byte
+        LODA,R0 EXPL                     ; CC set by value
+        BCTA,GT PS16P_NZ              ; non-zero low byte
         LODI,R0 A'0'
         BSTA,UN COUT
         RETC,UN
 
 PS16P_NZ:
-        LODI,R0 >DIVTAB
-        STRA,R0 TMPH
         LODI,R0 <DIVTAB
+        STRA,R0 TMPH
+        LODI,R0 >DIVTAB
         STRA,R0 TMPL
         LODI,R0 $00
         STRA,R0 NEGFLG  ; leading-zero flag
@@ -2045,9 +2106,9 @@ GETKEY:
 ; Uses GETKEY (via CHIN) for blocking input. Char received in R0 at each step;
 ; saved to R1 for storage/echo so R0 is free for pointer arithmetic.
 RDLINE:
-        LODI,R0 >IBUF
-        STRA,R0 IPH
         LODI,R0 <IBUF
+        STRA,R0 IPH
+        LODI,R0 >IBUF
         STRA,R0 IPL
 RL_LP:
         BSTA,UN GETKEY          ; [+1] blocking — R0 = char
@@ -2135,8 +2196,10 @@ WS_ADV:
 ; Read *IPH uppercase into R0, advance IP.
 GETCI_UC:
         LODA,R0 *IPH
-        BSTA,UN UPCASE                   ; [+1]
-        BSTA,UN INC_IP
+        BSTA,UN UPCASE                   ; [+1]  R0 = uppercased char
+        STRZ,R1                          ; save char into R1 (INC_IP clobbers R0)
+        BSTA,UN INC_IP                   ; advance IP
+        LODZ,R1                          ; restore char into R0
 GETCI_UC_RET:
         RETC,UN
 
@@ -2147,8 +2210,10 @@ UPCASE:
         COMI,R0 A'z'+1
         BCTA,LT UC_DO
         BCTA,UN UC_RET
-UC_DO:  SUBI,R0 32
-UC_RET: RETC,UN
+UC_DO:
+        SUBI,R0 32
+UC_RET:
+        RETC,UN
 
 ; ─── EATWORD ──────────────────────────────────────────────────────────────────
 ; Skip [A-Za-z$] at IP.
@@ -2159,7 +2224,8 @@ EATWORD:
         BCTA,LT EW_DS
         COMI,R0 A'Z'+1
         BCTA,LT EW_ADV
-EW_DS:  COMI,R0 A'$'
+EW_DS:
+        COMI,R0 A'$'
         BCTA,EQ EW_ADV
         RETC,UN
 EW_ADV:
