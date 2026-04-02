@@ -54,39 +54,6 @@ COUT    EQU     $02B4   ; putchar: R0 = char to output
 CHIN    EQU     $0286   ; getchar non-blocking: R0=0 if no key
 CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 
-; ─── RAM $1400–$1BFF ──────────────────────────────────────────────────────────
-IPH     EQU     $1400   ; interpreter pointer hi
-IPL     EQU     $1401   ; interpreter pointer lo
-PEH     EQU     $1402   ; program end pointer hi
-PEL     EQU     $1403   ; program end pointer lo
-RUNFLG  EQU     $1404   ; $01=running $00=immediate
-GOTOFLG EQU     $1405   ; $01=GOTO/GOSUB pending
-GOTOH   EQU     $1406   ; pending target line hi
-GOTOL   EQU     $1407   ; pending target line lo
-CURH    EQU     $1408   ; current line hi  (error reporting)
-CURL    EQU     $1409   ; current line lo
-LNUMH   EQU     $140A   ; scratch line number hi
-LNUML   EQU     $140B   ; scratch line number lo
-SC0     EQU     $140C   ; scratch byte 0
-SC1     EQU     $140D   ; scratch byte 1
-ERRFLG  EQU     $140E   ; error flag $00=ok
-NEGFLG  EQU     $140F   ; sign / CHR$ flag
-EXPH    EQU     $1410   ; expression result hi
-EXPL    EQU     $1411   ; expression result lo
-TMPH    EQU     $1412   ; temp 16-bit hi
-TMPL    EQU     $1413   ; temp 16-bit lo
-OPSTK   EQU     $1414   ; operator stack [8]  $1414-$141B
-VALSH   EQU     $141C   ; value stack hi  [8]  $141C-$1423
-VALSL   EQU     $1424   ; value stack lo  [8]  $1424-$142B
-STKIDX  EQU     $142C   ; parser stack top ($FF=empty)
-SWSP    EQU     $142D   ; SW call stack pointer ($FF=empty)
-SWSTK   EQU     $142E   ; SW call stack 8×2 bytes  $142E-$143D
-RELOP   EQU     $143E   ; relational op 1-6
-IBUF    EQU     $1440   ; input buffer 64 bytes  $1440-$147F
-VARS    EQU     $1480   ; A-Z variables 2 bytes each  $1480-$14B3
-PROG    EQU     $14C0   ; program store base
-PROGLIM EQU     $1C00   ; one past end of program store
-
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
         ORG     $0440
 
@@ -2269,5 +2236,38 @@ DE_IN:
 DE_NL:
         BSTA,UN CRLF
         BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
+ROMEND:
 
+; ─── RAM - Moved to end of program, romize later ──────────────────────────────────────────────────────────
+IPH:     RES 1 ;     $1400   ; interpreter pointer hi
+IPL:     RES 1 ;     $1401   ; interpreter pointer lo
+PEH:     RES 1 ;     $1402   ; program end pointer hi
+PEL:     RES 1 ;     $1403   ; program end pointer lo
+RUNFLG:  RES 1 ;     $1404   ; $01=running $00=immediate
+GOTOFLG: RES 1 ;     $1405   ; $01=GOTO/GOSUB pending
+GOTOH:   RES 1 ;     $1406   ; pending target line hi
+GOTOL:   RES 1 ;     $1407   ; pending target line lo
+CURH:    RES 1 ;     $1408   ; current line hi  (error reporting)
+CURL:    RES 1 ;     $1409   ; current line lo
+LNUMH:   RES 1 ;     $140A   ; scratch line number hi
+LNUML:   RES 1 ;     $140B   ; scratch line number lo
+SC0:     RES 1 ;     $140C   ; scratch byte 0
+SC1:     RES 1 ;     $140D   ; scratch byte 1
+ERRFLG:  RES 1 ;     $140E   ; error flag $00=ok
+NEGFLG:  RES 1 ;     $140F   ; sign / CHR$ flag
+EXPH:    RES 1 ;     $1410   ; expression result hi
+EXPL:    RES 1 ;     $1411   ; expression result lo
+TMPH:    RES 1 ;     $1412   ; temp 16-bit hi
+TMPL:    RES 1 ;     $1413   ; temp 16-bit lo
+OPSTK:   RES 8 ;     $1414   ; operator stack [8]  $1414-$141B
+VALSH:   RES 8 ;     $141C   ; value stack hi  [8]  $141C-$1423
+VALSL:   RES 8 ;     $1424   ; value stack lo  [8]  $1424-$142B
+STKIDX:  RES 1 ;     $142C   ; parser stack top ($FF=empty)
+SWSP:    RES 1 ;     $142D   ; SW call stack pointer ($FF=empty)
+SWSTK:   RES 16 ;     $142E   ; SW call stack 8×2 bytes  $142E-$143D
+RELOP:   RES 6 ;     $143E   ; relational op 1-6
+IBUF:    RES 64 ;     $1440   ; input buffer 64 bytes  $1440-$147F
+VARS:    RES 52 ;     $1480   ; A-Z variables 2 bytes each  $1480-$14B3
+PROG:    RES 1 ;     $14C0   ; program store base
+PROGLIM: EQU     $8000   ; one past end of program store
         END
