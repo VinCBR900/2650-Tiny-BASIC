@@ -49,18 +49,53 @@
 ;
 ; ─── KNOWN REMAINING BUGS (still being investigated) ──────────────────────────
 ;
-; BUG-ASM-07  PENDING  PARSE_U16 digit-range check wrong
-;   COMI A'9'+1; BCTA,LT PU16_DIG fires for non-digits, not digits.
-;   2650 subtract: no-borrow (R0 >= ':') -> CC_NEG -> BCTA,LT taken (wrong).
-;   Need to restructure range check using SUBI or unsigned compare idiom.
+; ─── SIMULATOR CORRECTION NOTE ───────────────────────────────────────────────
+; sim2650 v1.7 corrected CC encoding to match 2650 datasheet:
+;   v1.6 (wrong): CC_NEG=$00, CC_POS=$40, CC_ZERO=$80
+;   v1.7 (correct): CC_NEG=$80, CC_POS=$40, CC_ZERO=$00
+;   This also corrected COM (compare): uses signed comparison per datasheet.
+;   Impact: BUG-ASM-06 COMI $80 + BCTA,LT would work with v1.7 BUT ONLY for
+;   COMI (COM uses signed compare: $00 > $80 signed → CC_POS → LT not taken).
+;   Our ANDI,R0 $80 fix is still correct and more robust.
+;   BUG-ASM-07 (digit range check) was a false alarm — digit check correct in v1.7.
 ;
-; BUG-ASM-08  PENDING  NUL flood after EOF in simulator
+; ─── WORKING (confirmed with sim v1.7) ───────────────────────────────────────
+;   PRINT <literal>        e.g. PRINT 42, PRINT 0, PRINT 100, PRINT 32767
+;   PRINT <expr>           e.g. PRINT 1+1 → 2
+;   LET A=5 / PRINT A+B   variable read/write in immediate mode (A+B=8)
+;   Numbered line storage  e.g. 10 PRINT 7  (line stored in PROG area)
+;   RUN single-line prog   e.g. RUN → executes stored line(s), prints result
+;   Error reporting        ?0 IN 0 (syntax error with line number)
+;
+; ─── KNOWN REMAINING BUGS (still being investigated) ──────────────────────────
+;
+; BUG-ASM-07  PENDING  PRINT -42 outputs 0 instead of -42
+;   Unary minus in PARSE_EXPR (PX_UNEG) path: negation of EXPH:EXPL appears
+;   correct (EXPH=$FF, EXPL=$D6 = -42) but output is 0.
+;   Suspect: INC_EXP or PX_PUSHV clobbering values, or PRINT_S16 PS16P_POS
+;   zero-check not correctly branching with new CC semantics.
+;   Next step: trace $0CE4-$0CED area (INC_EXP return + what follows).
+;
+; BUG-ASM-08  PENDING  PRINT 10*3 outputs nothing (multiply broken)
+;   MUL16 is reached but apparently returns wrong result or traps.
+;   Next step: trace MUL16 for 10*3.
+;
+; BUG-ASM-09  PENDING  PRINT 100/4 outputs 1 instead of 25
+;   DIV16 returns wrong result. Next step: trace DIV16 for 100/4.
+;
+; BUG-ASM-10  PENDING  PRINT A in numbered-line RUN outputs 0
+;   After RUN, LET A=6 executes but PRINT A reads 0.
+;   Variable store (DL_STORE) writes correctly in immediate mode but may
+;   not work when IP is in PROG area (different addressing context).
+;   Next step: trace DL_STORE during RUN to check VARS write address.
+;
+; BUG-ASM-11  PENDING  NUL flood after EOF in simulator
 ;   After input exhausted CHIN returns 0 forever; RDLINE echoes NULs endlessly.
 ;   Cosmetic in simulator (real hardware CHIN blocks waiting for keypress).
 ;
-; BUG-ASM-09  PENDING  IP pointer walks past PROGLIM ($1C00)
+; BUG-ASM-12  PENDING  WARN: unmap wr $1C00 (IP walks past PROGLIM)
 ;   After NUL flood fills IBUF, INC_IP walks IP past $1BFF into unmapped space.
-;   Triggered by BUG-ASM-08; will likely resolve once EOF handling is correct.
+;   Triggered by BUG-ASM-11; will resolve once EOF handling is correct.
 ;
 ; ─── CC SEMANTICS (sim2650 set_cc_add / set_cc_sub) ──────────────────────────
 ;   ADD/ADDI: no-carry -> CC_POS  carry+zero -> CC_ZERO  carry+nonzero -> CC_NEG
