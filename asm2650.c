@@ -1,8 +1,19 @@
 /* ============================================================================
- * asm2650.c  Assembler core version 1.3
+ * asm2650.c  Assembler core version 1.4
  * Signetics 2650 cross-assembler — from project repo
- * Build: gcc -Wall -O2 -o asm2650 asm2650_v1.2.c
+ * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  * Signetics Syntax
+ *
+ * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
+ *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1480 = $14
+ *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1480 = $80
+ *
+ * Changes v1.3 -> v1.4:
+ *   BUG-ASM-01 FIXED: Same-line label+instruction now assembled correctly.
+ *     Previously "LABEL: OPCODE operands" would define the label but silently
+ *     drop the instruction (early return after colon). Now the instruction on
+ *     the same line as a label is assembled normally. Label-only lines (colon
+ *     followed by nothing or whitespace) still work as before.
  * ============================================================================ */
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,22 +174,19 @@ static void assemble_line(char *line){
     char *p=buf; while(*p){ if(*p==';'){*p=0;break;} p++; }
     p=skip_ws(buf); if(!*p) return;
     char lbl[32]="";
-    int had_colon=0;
     if(!isspace((unsigned char)buf[0])&&buf[0]){
         int i=0;
         while((isalnum((unsigned char)*p)||*p=='_')&&i<31) lbl[i++]=*p++;
         lbl[i]=0;
         if(*p==':'){
-            had_colon=1;
             p++;
         }
         p=skip_ws(p);
         if(pass==1) label_define(lbl,pc);
     }
-    /* Python parseline: "LABEL: anything" is treated as a label-only line;
-     * the text after the colon is the comment and NO instruction is assembled.
-     * Replicate this: if a colon was present, return after defining the label. */
-    if(had_colon){ return; }
+    /* v1.4 FIX: allow "LABEL: OPCODE operands" on one line.
+     * After defining the label, continue to assemble any instruction that follows.
+     * A colon with nothing after it (label-only line) is handled by the !*p check. */
     if(!*p) return;
     char mn[16]=""; int mi=0;
     while((isalpha((unsigned char)*p)||isdigit((unsigned char)*p))&&mi<15) mn[mi++]=*p++;
