@@ -51,7 +51,7 @@ DQ      EQU     $22
 
 ; ─── PIPBUG 1 I/O entry points ────────────────────────────────────────────────
 COUT    EQU     $02B4   ; putchar: R0 = char to output
-CHIN    EQU     $0286   ; getchar non-blocking: R0=0 if no key
+CHIN    EQU     $0286   ; getchar: blocking: R0 =  key
 CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
