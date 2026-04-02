@@ -188,7 +188,7 @@ static void set_cc(unsigned char r) {
     cpu.PSL &= ~PSL_CC;
     if      (r == 0)                  cpu.PSL |= CC_ZERO;
     else if ((signed char)r > 0)      cpu.PSL |= CC_POS;
-    /* else CC_NEG = 0 already */
+    else                              cpu.PSL |= CC_NEG; 
 }
 static void set_cc_add(unsigned char r) {
     int c = (cpu.PSL & PSL_C) ? 1 : 0;
