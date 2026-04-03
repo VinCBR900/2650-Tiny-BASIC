@@ -1,5 +1,5 @@
 /* ============================================================================
- * asm2650.c  Assembler core version 1.4
+ * asm2650.c  Assembler core version 1.5
  * Signetics 2650 cross-assembler — from project repo
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  * Signetics Syntax
@@ -7,6 +7,13 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1480 = $14
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1480 = $80
+ *
+ * Changes v1.4 -> v1.5:
+ *   RES directive added as alias for DS (reserve N zero bytes, define label).
+ *     Usage: LABEL: RES N  — identical to DS N, suits ROM/RAM split layout.
+ *   EORZ already handled by general EOR group (EORZ Rn = opcode $20+n).
+ *     EORZ R0 = $20 (R0 XOR R0 = 0, clears R0, 1 byte vs 2 for LODI R0 $00).
+ *     No special-case needed; confirmed correct against 2650 datasheet.
  *
  * Changes v1.3 -> v1.4:
  *   BUG-ASM-01 FIXED: Same-line label+instruction now assembled correctly.
@@ -197,7 +204,7 @@ static void assemble_line(char *line){
 
     if(strcmp(mn,"ORG")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok){pc=v; if(pass==1&&*lbl) label_define(lbl,pc);} return; }
     if(strcmp(mn,"EQU")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok) label_define(lbl,v); return; }
-    if(strcmp(mn,"DS" )==0){ int ok,n=eval_expr(ops[0],&ok); if(ok){for(int i=0;i<n;i++){emit(pc,0);pc++;}} return; }
+    if(strcmp(mn,"DS")==0||strcmp(mn,"RES")==0){ int ok,n=eval_expr(ops[0],&ok); if(ok){for(int i=0;i<n;i++){emit(pc,0);pc++;}} return; }
     if(strcmp(mn,"DB" )==0){ for(int i=0;i<nops;i++){int ok,v=eval_expr(ops[i],&ok); emit(pc,(unsigned char)(v&0xFF));pc++;} return; }
     if(strcmp(mn,"DW" )==0){ for(int i=0;i<nops;i++){int ok,v=eval_expr(ops[i],&ok); emit(pc,(unsigned char)((v>>8)&0xFF));pc++; emit(pc,(unsigned char)(v&0xFF));pc++;} return; }
     if(strcmp(mn,"END")==0) return;

@@ -1,7 +1,23 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.2-pipbug
+; Version: v1.3-pipbug
 ;
 ; Change history:
+;   v1.3  BUG-BASIC-03 FIXED: PF_LOADVAR read stale SC0 (held STMT_EXEC token)
+;           instead of saving the variable letter. Fixed: STRA,R0 SC0 before INC_IP.
+;         BUG-BASIC-04 FIXED: PRINT_S16 PS16P_FPRINT used EORZ,R0 after printing
+;           first digit, clearing NEGFLG (leading-zero flag) → multi-digit numbers
+;           like 100 printed as "1". Fixed: LODI,R0 1 / STRA,R0 NEGFLG.
+;         BUG-BASIC-05 FIXED: PARSE_S16 PS16_NEG used EORZ,R0 for NEGFLG in the
+;           minus-sign path, so negation was never applied. Fixed: LODI,R0 1.
+;         BUG-BASIC-06 FIXED: PARSE_U16 ERRFLG initialised to 0 ("success") with
+;           comment "assume failure". Fixed: LODI,R0 1.
+;         BUG-ASM-10 FIXED: ORG $1500 added before DS variable block to pin
+;           variable addresses regardless of code size.
+;         BUG-ASM-04 FIXED: GETCI_UC STRZ,R1/LODZ,R1 sandwich preserves char
+;           across INC_IP call which clobbered R0 with new IPL.
+;         BUG-ASM-06 FIXED: All 6 COMI,R0 $80 / BCT,LT sign-check patterns
+;           replaced with ANDI,R0 $80 / BCT,EQ (test bit 7 directly).
+;         4 assembler syntax errors fixed: LDAI→LODI, 2×BCTR→BCTA, BSTR→BSTA.
 ;   v1.2  BUG-BASIC-01 FIXED: All < / > HI/LO operators corrected throughout.
 ;           66 lines had < (HIGH) and > (LOW) swapped. Convention is:
 ;             <ADDR = HIGH byte (bits 15:8),  >ADDR = LOW byte (bits 7:0)
@@ -700,8 +716,8 @@ TSL_NUM:
 TSL_GOT:
         ; validate 1..32767
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTR,LT TSL_RNG
+        ANDI,R0 $80
+        BCTR,EQ TSL_RNG
         EORZ,R0 ; Clear R0
         STRA,R0 ERRFLG
         RETC,UN  ; >=32768 silently ignore
@@ -1509,10 +1525,12 @@ PF_NUM:
 
 PF_LOADVAR:
         ; load variable value from VARS
-        ; consume the variable character
+        ; BUG-BASIC-03 FIX: R0 still has uppercased var letter from LODA/UPCASE above.
+        ; Save it to SC0 BEFORE INC_IP clobbers R0 via GETCI_UC side-effects.
+        ; The old LODA,R0 SC0 below was reading a stale token value from STMT_EXEC.
+        STRA,R0 SC0              ; save variable letter (A-Z)
         BSTA,UN INC_IP
 PF_LVNCA:
-        LODA,R0 SC0
         SUBI,R0 A'A'  ; 0-25
         STRA,R0 SC1
         ADDA,R0 SC1  ; *2
@@ -1621,8 +1639,8 @@ PARSE_S16:
 PS16_NEG:
         BSTA,UN INC_IP
 PS16_NN:
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG
+        LODI,R0 1               ; BUG-BASIC-05 FIX: NEGFLG=1 = "negate result"
+        STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, skipping negation
 PS16_UN:
         BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 ERRFLG
@@ -1650,8 +1668,8 @@ PARSE_U16:
         EORZ,R0 ; Clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG  ; assume failure
+        LODI,R0 1               ; BUG-BASIC-06 FIX: ERRFLG=1 = "no digits yet" (failure)
+        STRA,R0 ERRFLG          ; was EORZ,R0 meaning "success" before any digit seen
 PU16_LP:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
@@ -1709,8 +1727,8 @@ MUL16:
         STRA,R0 NEGFLG
         ; abs(left) TMPH:TMPL
         LODA,R0 TMPH
-        COMI,R0 $80
-        BCTA,LT MU_LA
+        ANDI,R0 $80
+        BCTA,EQ MU_LA
         LODA,R0 TMPH
         EORI,R0 $FF
         STRA,R0 TMPH
@@ -1729,8 +1747,8 @@ MUL16:
 MU_LA:
         ; abs(right) EXPH:EXPL
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTA,LT MU_RA
+        ANDI,R0 $80
+        BCTA,EQ MU_RA
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
@@ -1816,8 +1834,8 @@ DV_NZ:
         STRA,R0 NEGFLG
         ; abs(dividend) TMPH:TMPL
         LODA,R0 TMPH
-        COMI,R0 $80
-        BCTA,LT DV_DA
+        ANDI,R0 $80
+        BCTA,EQ DV_DA
         LODA,R0 TMPH
         EORI,R0 $FF
         STRA,R0 TMPH
@@ -1836,8 +1854,8 @@ DV_NZ:
 DV_DA:
         ; abs(divisor) EXPH:EXPL
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTA,LT DV_VA
+        ANDI,R0 $80
+        BCTA,EQ DV_VA
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
@@ -1908,8 +1926,8 @@ DV_ZERO:
 ; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
 PRINT_S16:
         LODA,R0 EXPH
-        COMI,R0 $80
-        BCTA,LT PS16P_POS
+        ANDI,R0 $80
+        BCTA,EQ PS16P_POS
         LODI,R0 A'-'
         BSTA,UN COUT
         ; negate
@@ -1992,8 +2010,8 @@ PS16P_FPRINT:
         LODZ,R3                 ; R0 = R3 (digit value 0-9)
         ADDI,R0 A'0'            ; R0 = ASCII digit
         BSTA,UN COUT
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG
+        LODI,R0 1               ; BUG-BASIC-04 FIX: NEGFLG=1 = "digits active, print all"
+        STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, suppressing subsequent digits
         BCTA,UN PS16P_DIVLP
 PS16P_LAST:
         LODA,R0 EXPL
