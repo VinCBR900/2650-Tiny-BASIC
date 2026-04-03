@@ -9,10 +9,10 @@
  -  v1.3  ZBSR placement, SW call stack design, ROM/RAM layout
  -  v1.4  WinArcadia platform adopted; PIPBUG 2 I/O addresses (WRONG)
  -  v1.5  Corrected to PIPBUG 1 (WinArcadia uses original PIPBUG, not PIPBUG 2)
- -        COUT=$02B4 CHIN=$0286 CRLF=$008A (confirmed working)
- -        Clarified EPROM size targets: 2732=4K primary, 2716=2K stretch
- -        ZBSR: can only call addresses +/-64 bytes (page-0, or top of 8k memory page)
- -        CHIN is blocking 
+     - COUT=$02B4 CHIN=$0286 CRLF=$008A (confirmed working)
+     - Clarified EPROM size targets: 2732=4K primary, 2716=2K stretch
+     - ZBSR: can only call addresses +/-64 bytes (page-0, or top of 8k memory page)
+     - CHIN is blocking 
 
 ================================================================================
 ## SECTION 1 — REFERENCE DOCUMENTS
@@ -41,12 +41,6 @@
 ================================================================================
 ## SECTION 2 — TOOLCHAIN
 
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  REFERENCE PLATFORM:  WinArcadia v36.04 in PIPBUG mode (Ctrl+4)         │
-  │  CROSS TOOLS:         asm2650.c (assembler), sim2650.c (simulator)       │
-  │  ASSEMBLER ORACLE:    asm2650.py (validates asm2650.c byte encoding)      │
-  └──────────────────────────────────────────────────────────────────────────┘
-
   WinArcadia usage:
     Ctrl+4                     select PIPBUG machine
     Ctrl+/                     toggle debugger
@@ -60,97 +54,76 @@
     E <addr> <val>             poke memory
 
   Cross-assembler: asm2650.c
+  
     Build: gcc -Wall -O2 -o tools/asm2650 tools/asm2650.c
+  
     Produces Intel HEX output.
 
   Assembler oracle: asm2650.py
+  
     Usage: python3 tools/asm2650.py src/foo.asm /tmp/foo_py.hex
+  
     Diff against asm2650.c output to find encoding bugs:
+    
       diff <(./tools/asm2650 src/foo.asm /dev/stdout) \
            <(python3 tools/asm2650.py src/foo.asm /dev/stdout)
 
   Simulator: sim2650.c
     Build: gcc -Wall -O2 -o tools/sim2650 tools/sim2650.c
+    
     Run:   ./tools/sim2650 --allow-ram-image image.hex
+    
     Compare output against WinArcadia to find execution bugs.
-
-  ═══ 2.2 Sim2650 Known Bugs ═══
-
-  BUG-SIM-01 [CRITICAL]: ZBSR is NOP
-    Line ~207:  if(opcode==0xBB){ push_ras(cpu.IAR); cpu.IAR=pop_ras(); return; }
-    Fix to:     if(opcode==0xBB){ push_ras(cpu.IAR); cpu.IAR=(unsigned short)fetch()&0x7F; return; }
-
-  BUG-SIM-02: No entry-point flag (always starts at $0000)
-    Add: -e <hex_addr> flag to set IAR before running.
-    Workaround for tests: place BCTA,UN MAIN at $0000.
-
-  BUG-SIM-03: No PIPBUG ROM stub
-    COUT/CHIN/CRLF hits unmapped memory.
-    Fix: Add COUT/CHIN/CRLF functioanlity translation to host OS to simulator.
-
-  ═══ 2.3 One-line Assembly Rules (CRITICAL) ═══
-
-  - Semicolons (;) are COMMENTS — not statement separators.
-  - Every instruction must be on its own line.
-  - No exceptions.
-
+  
 ================================================================================
 ## SECTION 3 — DEVELOPMENT PLATFORM: PIPBUG 1 (WinArcadia)
 
   WinArcadia emulates the ORIGINAL PIPBUG (not PIPBUG 2, not BINBUG).
   These are the CONFIRMED correct addresses for WinArcadia's built-in PIPBUG:
 
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │  COUT = $02B4   BSTA,UN $02B4   R0 → terminal     CONFIRMED WORKING     │
-  │  CHIN = $0286   BSTA,UN $0286   terminal → R0     cONFIRMED BLOCKING    │
-  │  CRLF = $008A   BSTA,UN $008A   prints CR+LF                            │
-  └─────────────────────────────────────────────────────────────────────────┘
+  - COUT = $02B4   BSTA,UN $02B4   R0 → terminal     CONFIRMED WORKING    │
+  - CHIN = $0286   BSTA,UN $0286   terminal → R0     CONFIRMED BLOCKING    
+  -  CRLF = $008A   BSTA,UN $008A   prints CR+LF                            
   
   PIPBUG memory map (WinArcadia PIPBUG machine):
-    $0000–$03FF   PIPBUG ROM (1K, read-only, built-in)
-    $0440–$0fFF   User program RAM — OUR CODE STARTS HERE
+   - $0000–$03FF   PIPBUG ROM (1K, read-only, built-in)
+   - $0440–$0fFF   User program RAM — OUR CODE STARTS HERE
     
   User program entry:
-    ORG $0440
-    Run via PIPBUG command:  G 440
-
-  ZBSR instruction and page-0 RAM:
-    ZBSR *offset jumps to absolute address = 0 + SIGNED 128 bit offset
-    Addresses $0000–$003F are inside PIPBUG ROM in WinArcadia — read-only.
-    If that range is ROM, ZBSR is effectively reserved for standalone Phase 2
-    (where we own the ROM from $0000 and place our jump table there).
-
+   - ORG $0440
+   - Run via PIPBUG command:  G 440
+  
   Phase 2 — Standalone (after BASIC is working):
-    We replace PIPBUG I/O with our own bit-bang serial routines.
-    ROM starts at $0000. ZBSR jump table placed at base of ROM.
-    COUT/CHIN replaced by bitbang PUTCH/GETCH using FLAG/SENSE pins.
+   - We replace PIPBUG I/O with our own bit-bang serial routines.
+   - ROM starts at $0000. ZBSR jump table placed at base of ROM.
+   - COUT/CHIN replaced by bitbang PUTCH/GETCH using FLAG/SENSE pins.
 
 ================================================================================
 ## SECTION 4 — EPROM SIZE TARGETS
-
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  PRIMARY TARGET:  2732 EPROM = 4096 bytes  (period-correct 4K part)     │
-  │  STRETCH TARGET:  2716 EPROM = 2048 bytes  (period-correct 2K part)     │
-  └──────────────────────────────────────────────────────────────────────────┘
-
-  These are EPROM sizes, not RAM sizes. The code fits in one chip.
-  Both parts were widely available in 1977–1980, which is the target era.
+  
+  -  PRIMARY TARGET:  2732 EPROM = 4096 bytes  (period-correct 4K part)     │
+  -  STRETCH TARGET:  2716 EPROM = 2048 bytes  (period-correct 2K part)     │
+ 
+ These are EPROM sizes, not RAM sizes. The code fits in one chip.
+ 
+ Both parts were widely available in 1977–1980, which is the target era.
 
   Current status:
-    uBASIC2650.asm v1.1 = 4108 bytes  ← 12 bytes OVER the 4K target!
-    Must save ≥ 13 bytes to fit a 2732 at all.
-    Recursive parser rewrite saves ~573 bytes → comfortably fits 2732.
-    Getting to 2716 (2K) requires ~2060 additional bytes of savings.
-    2716 target is aspirational; focus first on 2732 then evaluate 2716.
+    - uBASIC2650.asm v1.1 = 4108 bytes  ← 12 bytes OVER the 4K target!
+    - Must save ≥ 13 bytes to fit a 2732 at all.
+    - Recursive parser rewrite saves ~573 bytes → comfortably fits 2732.
+    - Getting to 2716 (2K) requires ~2060 additional bytes of savings.
+    - 2716 target is aspirational; focus first on 2732 then evaluate 2716.
 
   Size history:
-    Baseline v0.4 (buggy port):        ~4100 bytes (estimated)
-    v1.0 fresh arch, all features:      5783 bytes  (over ROM)
-    v1.1 feature strip + INC_*:         4108 bytes  (12 bytes over 2732)
-    Target v1.2 (recursive parser):   <3500 bytes   (fits 2732, good margin)
-    Stretch (2716):                    <2048 bytes   (very aggressive)
+    - Baseline v0.4 (buggy port):        ~4100 bytes (estimated)
+    - v1.0 fresh arch, all features:      5783 bytes  (over ROM)
+    - v1.1 feature strip + INC_*:         4108 bytes  (12 bytes over 2732)
+    - Target v1.2 (recursive parser):   <3500 bytes   (fits 2732, good margin)
+    - Stretch (2716):                    <2048 bytes   (very aggressive)
 
   Simulation target ROM was set to 5120 bytes to give initial headroom
+  
   during development — larger than EPROM target to avoid premature constraint.
 
 ================================================================================
@@ -283,33 +256,6 @@ Note:
   Line numbers: 1–32767 (not checked)
 
 ================================================================================
-## SECTION 11 — VALIDATION TEST SUITE
-
-  File: src/validation_test.asm (v1.2, 555 bytes, 0 errors)
-
-  Validates TWO things simultaneously:
-    (A) asm2650.c byte encoding — diff its hex output vs asm2650.py
-    (B) sim2650.c execution — compare its output vs WinArcadia
-
-  Expected WinArcadia output:  ABCDEFGHIJKLM<CR><LF>
-  (Letter M may come from the skip-pass path in T13 if $0062 is PIPBUG ROM)
-
-  Tests:
-    T01 'A'  LODI / STRA / LODA round-trip
-    T02 'B'  ADDI, SUBI, ADDZ, SUBZ arithmetic
-    T03 'C'  CC after ADD (carry cases: GT / EQ / LT)
-    T04 'D'  CC after SUB (borrow cases: GT / EQ / LT)
-    T05 'E'  16-bit pointer increment (INC_IP/INC_TMP idiom)
-    T06 'F'  Indexed LODA,R0 BASE,R2 and LODA,R0 BASE,R2+
-    T07 'G'  Indirect LODA,R0 *addr + HI/LO operator encoding
-    T08 'H'  Branches: BCTA, BCFA, BCTR, BCFR
-    T09 'I'  BSTA,UN call + ZBRR as 1-byte return
-    T10 'J'  BRNR and BIRR counted loops
-    T11 'K'  Register bank switching (PPSL/CPSL $10)
-    T12 'L'  PSL COM flag: signed vs unsigned compare
-    T13 'M'  ZBSR *offset (graceful skip-pass if page-0 is ROM)
-
-================================================================================
 ## SECTION 12 — SUBROUTINE HEADER CONVENTION
 
   Every subroutine must have a header:
@@ -322,16 +268,3 @@ Note:
   ; Depth:   HW RAS depth when called
   ; Size:    byte count (fill after assembly)
 
-================================================================================
-## SECTION 13 — KNOWN BUGS FIXED
-
-  BUG-01: RAS overflow on recursive descent — fixed, SW call stack used
-  BUG-02: BCTA,GT for SUB borrow skip — fixed, always BCFA,LT
-  BUG-03: 369 bytes inline pointer-increments — fixed, INC_TMP/INC_IP/INC_EXP
-  BUG-04: Semicolons as statement separators — fixed, one instruction per line
-  BUG-05: ADDA,R1 R0 invalid — fixed, use ADDZ,R1
-  BUG-06: COUT=$0007 (PIPBUG 2 addr) — fixed, COUT=$02B4 (PIPBUG 1)
-  BUG-07: LODA,R2 BASE,R2 invalid (R0 required) — fixed, LODA,R0 BASE,R2
-
-================================================================================
-END OF ARCHITECTURE DOCUMENT v1.5
