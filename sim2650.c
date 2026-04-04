@@ -1,14 +1,15 @@
 /* ============================================================================
- * sim2650.c  (internal version 1.7)
- * Signetics 2650 simulator for uBASIC2650 / PIPBUG 1 project
+ * sim2650.c  —  Signetics 2650 simulator for uBASIC2650 / PIPBUG 1 project
+ * Version: 1.8
  * Build: gcc -Wall -O2 -o sim2650 sim2650.c
  *
- * Usage: sim2650 [-t] [-e addr] [-b addr] [-rx file]
+ * Usage: sim2650 [-t] [-e addr] [-b addr] [-rx file] [-m addr len]
  *                [--allow-ram-image] [--pipbug] image.hex
  *   -t                 CPU trace to stderr
  *   -e addr            Entry point (hex); default $0440 with --pipbug, else $0000
- *   -b addr            Breakpoint (hex)
- *   -rx file           Redirect stdin from file
+ *   -b addr            Breakpoint (hex); halts before executing that address
+ *   -rx file           Redirect stdin from file (for non-interactive testing)
+ *   -m addr len        Dump len bytes of memory at addr (hex) to stderr at halt
  *   --allow-ram-image  Allow loading hex outside ROM range (auto-set by --pipbug)
  *   --pipbug           PIPBUG 1 mode:
  *                        · Memory map: ROM $0000-$03FF, RAM $0400-$1BFF
@@ -16,43 +17,26 @@
  *                        · Entry default $0440 (after Pipbug 1kB+64B)
  *                        · Intercept COUT=$02B4  CHIN=$0286  CRLF=$008A
  *
+ * Changes v1.7 -> v1.8:
+ *   -m addr len flag: dumps a memory range to stderr at halt or breakpoint.
+ *     Useful for inspecting program store ($15B8+) and variable area ($1500+)
+ *     without needing a full CPU trace.
+ *
  * Changes v1.6 -> v1.7  (2650 manual compliance corrections):
- *   BUG-SIM-07 FIXED: Corrected CC encoding to match manual:
- *              POS=01 ($40), ZERO=00 ($00), NEG=10 ($80).
- *   BUG-SIM-08 FIXED: TPSU/TPSL/TMI now set CC as specified:
- *              EQ if all tested bits are 1, otherwise LT.
- *   BUG-SIM-09 FIXED: ADD/SUB now update IDC from bit-3 carry/borrow.
- *   BUG-SIM-10 FIXED: CPSU/PPSU no longer modify PSU.S (sense) or
- *              reserved PSU bits; only F/II/SP are software-controlled.
+ *   BUG-SIM-07 FIXED: CC encoding corrected: POS=01 ($40), ZERO=00, NEG=10.
+ *   BUG-SIM-08 FIXED: TPSU/TPSL/TMI set CC=EQ if all tested bits are 1, else LT.
+ *   BUG-SIM-09 FIXED: ADD/SUB update IDC from bit-3 carry/borrow.
+ *   BUG-SIM-10 FIXED: CPSU/PPSU no longer modify PSU.S or reserved bits.
  *
  * Changes v1.5 -> v1.6  (Pipbug 1 integration):
- *   BUG-SIM-04 FIXED: Memory map corrected for Pipbug: ROM $0000-$03FF (1kB),
- *              RAM $0400-$1BFF; --pipbug sets entry default to $0440.
- *   BUG-SIM-05 FIXED: STR immediate (mode=1) now consumes the immediate byte
- *              (previously returned without fetching, leaving PC wrong).
- *   BUG-SIM-06 FIXED: --pipbug implicitly enables --allow-ram-image so the
- *              user program hex (loaded at $0440+) is accepted without error.
- *   NOTE: Emu2650.cs ADD/SUB CC uses sign-based SetCCFor — this is WRONG per
- *         the 2650 datasheet. sim2650 carry-based set_cc_add/set_cc_sub are
- *         correct and intentionally differ from Emu2650.cs on those opcodes.
- *
- * Changes v1.4 -> v1.5:
- *   BUG-SIM-01 FIXED: ZBSR fetches signed 7-bit operand as page-relative target
- *   BUG-SIM-02 FIXED: -e <addr> flag sets entry point
- *   BUG-SIM-03 FIXED: --pipbug installs COUT/CHIN/CRLF intercepts
- *   Register banking FIXED: PPSL/CPSL RS bit swaps R1-R3 / R1'-R3'
- *   Indexed LODA dest FIXED: mode-A indexed always delivers to R0
- *   alu_sub carry FIXED: C=1 means no borrow (correct per 2650 manual)
+ *   BUG-SIM-04..06 FIXED: memory map, STR immediate, --pipbug flag handling.
  *
  * CC semantics (correct per 2650 datasheet):
- *   ADD: no_carry->GT(01); carry+zero->EQ(10); carry+nonzero->LT(00)
- *   SUB: no_borrow+nonzero->GT(01); no_borrow+zero->EQ(10); borrow->LT(00)
- *   COM: signed compare unless PSL.COM=1 (unsigned)
+ *   ADD: no_carry->GT  carry+zero->EQ  carry+nonzero->LT
+ *   SUB: no_borrow+nonzero->GT  no_borrow+zero->EQ  borrow->LT
  *
  * PSL: CC1[7] CC0[6] IDC[5] RS[4] WC[3] OVF[2] COM[1] C[0]
  * PSU: S[7] F[6] II[5] - - SP[2:0]
- *
- * PIPBUG 1 memory map (Motorola MK3880 / Signetics reference board):
  *   $0000-$03FF  PIPBUG ROM  (1 kB, read-only)
  *   $0400-$043F  PIPBUG RAM  (64 B, stack/scratch)
  *   $0440-$1BFF  User RAM    (program+data, writable)
@@ -66,7 +50,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER   "1.7"
+#define SIM_VER   "1.8"
 #define MEM_SIZE  0x8000
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
@@ -131,6 +115,8 @@ static int ri(int n) {
 static int  trace      = 0;
 static int  running    = 1;
 static int  breakpt    = -1;
+static int  dump_start = -1;
+static int  dump_len   = 32;
 static long icount     = 0;
 static long maxinstr   = 5000000L;
 static int  strict_rom = 1;
@@ -543,6 +529,7 @@ int main(int argc, char *argv[]) {
         else if(!strcmp(argv[i],"-e")&&i+1<argc)  { entry_point=(unsigned short)strtol(argv[++i],NULL,16); entry_explicit=1; }
         else if(!strcmp(argv[i],"-b")&&i+1<argc)    breakpt=(int)strtol(argv[++i],NULL,16);
         else if(!strcmp(argv[i],"-rx")&&i+1<argc)   rxfile=argv[++i];
+        else if(!strcmp(argv[i],"-m")&&i+2<argc){ dump_start=(int)strtol(argv[++i],NULL,16); dump_len=(int)strtol(argv[++i],NULL,10); }
         else if(!strcmp(argv[i],"--allow-ram-image")) strict_rom=0;
         else if(!strcmp(argv[i],"--pipbug"))         use_pipbug=1;
         else hexfile=argv[i];
@@ -578,6 +565,10 @@ int main(int argc, char *argv[]) {
     fprintf(stderr,"\nHalted after %ld instructions\n",icount);
     fprintf(stderr,"R0=$%02X R1=$%02X R2=$%02X R3=$%02X\n",R(0),R(1),R(2),R(3));
     fprintf(stderr,"IAR=$%04X PSU=$%02X PSL=$%02X CC=%d\n",cpu.IAR,cpu.PSU,cpu.PSL,(cpu.PSL&PSL_CC)>>6);
+    if(dump_start>=0){
+        fprintf(stderr,"\nMEM $%04X+%d:\n",dump_start,dump_len);
+        for(int i=0;i<dump_len;i++){if(i%16==0)fprintf(stderr,"  $%04X: ",dump_start+i);fprintf(stderr,"%02X ",mem[dump_start+i]);if(i%16==15||i==dump_len-1)fprintf(stderr,"\n");}
+    }
     if(run_fault) return 2;
     if(icount>=maxinstr) return 3;
     return 0;

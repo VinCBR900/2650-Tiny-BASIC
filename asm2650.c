@@ -1,26 +1,27 @@
 /* ============================================================================
- * asm2650.c  Assembler core version 1.5
- * Signetics 2650 cross-assembler — from project repo
+ * asm2650.c  —  Signetics 2650 cross-assembler
+ * Version: 1.6
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
- * Signetics Syntax
+ *
+ * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
+ *        asm2650 source.asm -s             (dump symbol table to stderr)
  *
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
- *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1480 = $14
- *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1480 = $80
+ *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
+ *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.5 -> v1.6:
+ *   -s flag: dump full symbol table (labels and addresses) to stderr after
+ *     assembly. Useful for finding breakpoint addresses for sim2650 -b.
  *
  * Changes v1.4 -> v1.5:
  *   RES directive added as alias for DS (reserve N zero bytes, define label).
  *     Usage: LABEL: RES N  — identical to DS N, suits ROM/RAM split layout.
- *   EORZ already handled by general EOR group (EORZ Rn = opcode $20+n).
- *     EORZ R0 = $20 (R0 XOR R0 = 0, clears R0, 1 byte vs 2 for LODI R0 $00).
- *     No special-case needed; confirmed correct against 2650 datasheet.
+ *   EORZ Rn confirmed correct against 2650 datasheet (opcode $20+n).
  *
  * Changes v1.3 -> v1.4:
  *   BUG-ASM-01 FIXED: Same-line label+instruction now assembled correctly.
- *     Previously "LABEL: OPCODE operands" would define the label but silently
- *     drop the instruction (early return after colon). Now the instruction on
- *     the same line as a label is assembled normally. Label-only lines (colon
- *     followed by nothing or whitespace) still work as before.
+ *     "LABEL: OPCODE operands" previously dropped the instruction silently.
  * ============================================================================ */
 #include <stdio.h>
 #include <stdlib.h>
@@ -401,8 +402,10 @@ static void write_hex(FILE *f){
     fprintf(f,":00000001FF\n");
 }
 
+int dump_syms=0;
 int main(int argc,char *argv[]){
     if(argc<2){ fprintf(stderr,"Usage: asm2650 source.asm [output.hex]\n"); return 1; }
+    for(int i=1;i<argc;i++) if(!strcmp(argv[i],"-s")) dump_syms=1;
     memset(rom,0xFF,sizeof(rom));
     for(pass=1;pass<=2;pass++){
         FILE *f=fopen(argv[1],"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",argv[1]);return 1;}
@@ -411,10 +414,11 @@ int main(int argc,char *argv[]){
         fclose(f);
     }
     fprintf(stderr,"Pass complete: %d error(s), %d label(s)\n",errors,nlabels);
+    if(dump_syms){ for(int i=0;i<nlabels;i++) fprintf(stderr,"  %-20s $%04X\n",labels[i].name,labels[i].value); }
     if(errors) return 1;
     if(rom_hi>=rom_lo) fprintf(stderr,"Code: $%04X-$%04X (%d bytes)\n",rom_lo,rom_hi,rom_hi-rom_lo+1);
     FILE *out=stdout;
-    if(argc>=3){ out=fopen(argv[2],"w"); if(!out){fprintf(stderr,"Cannot create '%s'\n",argv[2]);return 1;} }
+    if(argc>=3&&!dump_syms){ out=fopen(argv[2],"w"); if(!out){fprintf(stderr,"Cannot create '%s'\n",argv[2]);return 1;} }
     write_hex(out);
     if(out!=stdout) fclose(out);
     return 0;
