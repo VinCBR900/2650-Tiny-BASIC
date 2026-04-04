@@ -3,13 +3,14 @@
 ## 1. Definitions & Addressing Modes
 
 ### **Registers & Values**
-* **rn**: General Purpose Register (r0, r1, r2, r3). Note: **r0** is the implicit source/destination for indexed operations and all **Z-group** instructions.
+* **rn**: General Purpose Register (r0, r1, r2, r3). Note: **r0** is the implicit source/destination for indexed operations and all **Z-group e.g ADDZ, LODZ** instructions.
 * **abs**: 15-bit Absolute Address ($0000 - $7FFF).
 * **rel**: 7-bit signed displacement (-64 to +63). The origin is the address of the byte *immediately following* the instruction.
 * **imm**: 8-bit Immediate value.
 * **x**: Index Register (r1, r2, r3).
 * **+ / -**: Auto-increment or auto-decrement of the index register.
-
+* **Zxxx**: Zero Page Branch instructions only access first 63 bytes of memory
+  
 ### **The Indirect Flag (*)**
 * The asterisk denotes **Indirect Addressing**. This sets Bit 7 of the address/displacement byte. The CPU fetches a 15-bit pointer from the calculated effective address and uses that as the final target.
 
@@ -98,26 +99,37 @@ COMZ,rn             ;r0 : rn -> Sets CC;                       ;2,1
 **Conditional Branching**
 ```asm
 BCTA,cond abs       ;if(cond) PC = abs;                        ;3,3
+BCTA,cond *abs       ;if(cond) PC = *abs;                        ;3,3
 BCTR,cond rel       ;if(cond) PC = rel;                        ;3,2
 BCFA,cond abs       ;if(!cond) PC = abs;                       ;3,3
+BCFA,cond *abs       ;if(!cond) PC = *abs;                       ;3,3
 BCFR,cond rel       ;if(!cond) PC = rel;                       ;3,2
 ```
 **Subroutine Calls**
 ```asm
 BSTA,cond abs       ;if(cond) {Push(PC+3); PC = abs;};         ;3,3
+BSTA,cond *abs       ;if(cond) {Push(PC+3); PC = *abs;};         ;3,3
 BSTR,cond rel       ;if(cond) {Push(PC+2); PC = rel;};         ;3,2
 ```
-**Zero-Page / Special Branches**
+**Special & Zero Page Branches**
 ```asm
-ZBRR rel            ;PC = Page0_Addr(rel);                     ;3,2
-ZBSR rel            ;Push(PC+2); PC = Page0_Addr(rel);         ;3,2
-*Note: ZBSR ($0001) effectively performs JSR ($0001).
+BSXA    abs,r3       ;gosub abs + r3;                         ;3,3
+BSXA    *abs,r3      ;gosub *(abs) + r3;                      ;5,3
+BXA     abs,r3       ;goto abs + r3;                          ;3,3
+BXA     *abs,r3      ;goto *(abs) + r3;                       ;5,3
+ZBRR    zero         ;goto zero;                              ;3,2
+ZBRR    *zero        ;goto *(zero);                           ;5,2
+ZBSR    zero         ;gosub zero;                             ;3,2
+ZBSR    *zero        ;gosub *(zero);                          ;5,2
+*Note: ZBSR *$0001 effectively performs JSR ($0001).
 ```
 **Increment/Decrement Branches**
 ```asm
 BIRA,rn abs         ;rn++; if(rn != 0) PC = abs;               ;3,3
+BIRA,rn *abs         ;rn++; if(rn != 0) PC = *abs;               ;3,3
 BIRR,rn rel         ;rn++; if(rn != 0) PC = rel;               ;3,2
 BDRA,rn abs         ;rn--; if(rn != 0) PC = abs;               ;3,3
+BDRA,rn *abs         ;rn--; if(rn != 0) PC = *abs;               ;3,3
 BDRR,rn rel         ;rn--; if(rn != 0) PC = rel;               ;3,2
 ```
 **Return Instructions**
