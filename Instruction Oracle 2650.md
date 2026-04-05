@@ -57,6 +57,18 @@ ADDZ,rn             ;r0 += rn;                                 ;2,1
 SUBA,rn abs         ;rn -= *(abs);                             ;4,3
 SUBI,rn imm         ;rn -= imm;                                ;2,2
 SUBR,rn rel         ;rn -= *(rel);                             ;3,2
+SUBA,rn abs          ;rn -= *(abs);                           ;4,3
+SUBA,r0 abs,x       ;r0 -= *(abs + x);                      ;4,3
+SUBA,r0 abs,x+      ;r0 -= *(abs + ++x);                    ;4,3
+                         ;or, x++; r0 -= *(abs + x);
+SUBA,r0 abs,x-      ;r0 -= *(abs + --x);                    ;4,3
+                         ;or, x--; r0 -= *(abs + x);
+SUBA,rn *abs         ;rn -= *(*(abs));                        ;6,3
+SUBA,r0 *abs,x      ;r0 -= *(*(abs) + x);                   ;6,3
+SUBA,r0 *abs,x+     ;r0 -= *(*(abs) + ++x);                 ;6,3
+                         ;or, x++; r0 -= *(*(abs) + x);
+SUBA,r0 *abs,x-     ;r0 -= *(*(abs) + --x);                 ;6,3
+                         ;or, x--; r0 -= *(*(abs) + x);
 SUBZ,rn             ;r0 -= rn;                                 ;2,1
 ```
 ### **AND / IOR / EOR (Bitwise)**
@@ -84,18 +96,54 @@ LODA,rn abs         ;rn = *(abs);                              ;4,3
 LODI,rn imm         ;rn = imm;                                 ;2,2
 LODR,rn rel         ;rn = *(rel);                              ;3,2
 LODZ,rn             ;r0 = rn;                                  ;2,1
+LODA,rn abs          ;rn = *(abs);                            ;4,3
+LODA,r0 abs,x       ;r0 = *(abs + x);                       ;4,3
+LODA,r0 abs,x+      ;r0 = *(abs + ++rn);                     ;4,3
+                         ;or, x++; r0 = *(abs + x);
+LODA,r0 abs,x-      ;r0 = *(abs + --rn);                     ;4,3
+                         ;or, x--; r0 = *(abs + x);
+LODA,rn *abs        ;x = *(*(abs));                         ;6,3
+LODA,r0 *abs,x      ;r0 = *(*(abs) + x);                    ;6,3
+LODA,r0 *abs,x+     ;r0 = *(*(abs) + ++x);                  ;6,3
+                        ;or, x++; r0 = *(*(abs) + x);
+LODA,r0 *abs,x-     ;r0 = *(*(abs) + --x);                  ;6,3
+                         ;or, x--; r0 = *(*(abs) + x);
 ```
 **STR (Store)**
 ```asm
 STRA,rn abs         ;*(abs) = rn;                              ;4,3
 STRR,rn rel         ;*(rel) = rn;                              ;3,2
-STRZ,rn             ;rn = r0;                                  ;2,1
+STRA,rn abs          ;*(abs) = rn;                            ;4,3
+STRA,r0 abs,x       ;*(abs + x) = r0;                       ;4,3
+STRA,r0 abs,x+      ;*(abs + ++x) = r0;                     ;4,3
+                         ;or, x++; *(abs + x) = r0;
+STRA,r0 abs,x-      ;*(abs + --x) = r0;                     ;4,3
+                         ;or, x--; *(abs + x) = r0;
+STRA,rn *abs         ;*(*(abs)) = rn;                         ;6,3
+STRA,r0 *abs,x      ;*(*(abs) + x) = r0;                    ;6,3
+STRA,r0 *abs,x+     ;*(*(abs) + ++x) = r0;                  ;6,3
+                         ;or, x++; *(*(abs) + x) = r0;
+STRA,r0 *abs,x-     ;*(*(abs) + --x) = r0;                  ;6,3
+                         ;or, x--; *(*(abs) + x) = r0;
+STRZ,x             ;rn = r0;                                  ;2,1
 ```
 **COM (Compare)**
 ```asm
 COMA,rn abs         ;rn : *(abs) -> Sets CC;                   ;4,3
 COMI,rn imm         ;rn : imm -> Sets CC;                      ;2,2
 COMR,rn rel         ;rn : *(rel) -> Sets CC;                   ;3,2
+COMA,rn abs          ;compare rn against *(abs);              ;4,3
+COMA,r0 abs,x       ;compare r0 against *(abs + x);         ;4,3
+COMA,r0 abs,x+      ;compare r0 against *(abs + ++x);       ;4,3
+                         ;or, x++; compare r0 against *(abs + x);
+COMA,r0 abs,x-      ;compare r0 against *(abs + --x);       ;4,3
+                         ;or, x--; compare r0 against *(abs + x);
+COMA,rn *abs         ;compare rn against *(*(abs));           ;6,3
+COMA,r0 *abs,x      ;compare r0 against *(*(abs) + x);      ;6,3
+COMA,r0 *abs,x+     ;compare r0 against *(*(abs) + ++x);    ;6,3
+                         ;or, x++; compare r0 against *(*(abs) + x);
+COMA,r0 *abs,x-     ;compare r0 against *(*(abs) + --x);    ;6,3
+                         ;or, x--; compare r0 against *(*(abs) + x);
 COMZ,rn             ;r0 : rn -> Sets CC;                       ;2,1
 ```
 ### **4. Branching & Subroutine Calls**
