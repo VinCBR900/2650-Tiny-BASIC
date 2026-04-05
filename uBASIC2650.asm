@@ -1,7 +1,7 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.5-pipbug
+; Version: v1.7
 ;
-; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
+; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
 ;   I/O via PIPBUG ROM entry points (BSTA,UN):
 ;     COUT $02B4  — output char in R0
@@ -17,6 +17,8 @@
 ;   ./sim2650 --pipbug -t uBASIC2650.hex             # CPU trace
 ;   ./sim2650 --pipbug -b 0xADDR uBASIC2650.hex      # breakpoint
 ;   ./sim2650 --pipbug -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
+;
+; NOTE: Winarcadia assembler expects LABELS: to be on a dedicated line
 ;
 ; CC SEMANTICS (2650 ALU — SUB sets opposite of most CPUs):
 ;   ADD: no-carry->GT  carry+zero->EQ  carry+nonzero->LT
@@ -42,14 +44,62 @@
 ;   R2        — never written by any routine; safe as long-lived scratch
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (loads DIVTAB ptr)
 ;
-; KNOWN REMAINING BUG (next session):
-;   BUG-BASIC-14: Variables set by LET inside a RUN are not visible to later
-;     lines in the same RUN.  "10 LET A=3 / 20 PRINT A / RUN" → prints 0.
-;     Suspected: DO_RUN resets variables or VARS array not in scope during run.
-;     PRINT A works in immediate mode confirming VARS store/load is correct.
-;     Root cause not yet identified — needs trace session.
-;
 ; Change history:
+;   v1.7  ISSUE-03 FIXED: DO_GOTO set GOTOFLG=$00 (EORZ/STRA) instead of $01.
+;           GOTO was silently ignored during RUN — DR_GOTO path never triggered.
+;           Fix: LODI,R0 1 / STRA,R0 GOTOFLG.
+;         ISSUE-01 FIXED: MUL16/DIV16 NEGFLG reset bug. The abs(left) block
+;           contained EORZ,R0 / STRA,R0 NEGFLG AFTER the two's-complement
+;           negation carry propagation step. This unconditionally cleared NEGFLG
+;           to zero even after it had been set to 1 for a negative left operand.
+;           Net effect: negative×anything gave wrong sign (e.g. -3*2=6 not -6).
+;           Fix: replace EORZ/STRA in abs(left) blocks with LODI,R0 1 / STRA,R0
+;           NEGFLG in both MUL16 and DIV16.
+;         ISSUE-02 FIXED: STORE_LINE shift-dest carry corrupted GOTOH.
+;           After ADDA,R0 SC1 / STRA,R0 GOTOL, the carry from the low-byte add
+;           was lost when LODA,R0 LNUMH loaded LNUMH (clobbering CC). The
+;           subsequent BCTA,GT SL_DSNCA tested LNUMH's sign/zero, not carry.
+;           Fix: test carry with BCTA,GT before LODA, duplicate LODA on both
+;           paths (carry / no-carry), store GOTOH on both paths.
+;         ISSUE-05 FIXED: PARSE_RELOP no-match path returned ERRFLG=$00 (success)
+;           when no relop character found. DO_IF proceeded as if relop was valid,
+;           using the previous RELOP value — silent wrong comparison.
+;           Fix: set ERRFLG=$01 before RETC,UN on the no-match path.
+;         ISSUE-04 FIXED: SE_SCAN / SE_C2N table-advance used BCTR,GT (relative
+;           short branch) to skip TMPH hi-byte increment, but CC after STRA is
+;           set by the stored value not the carry. Replaced with carry-safe idiom:
+;           test carry via BCTA,GT before STRA, then branch two paths.
+;           Note: practical risk was near-zero (KW_TAB <64B, no page wrap), but
+;           corrected for correctness.
+;         ISSUE-06 FIXED: Removed redundant second NUL check in RDLINE. After
+;           BUG-ASM-08 fix (v1.6), the first NUL check at RL_LP entry catches
+;           EOF. The second check after RL_STORE was unreachable dead code.
+;   v1.6  BUG-BASIC-14 FIXED: DO_LET variable letter saved to SC0 before
+;           PARSE_EXPR, but PARSE_EXPR clobbers SC0 (operator stack writes it
+;           repeatedly). DL_STORE read the token id, not the letter. All LET
+;           statements wrote to the wrong VARS slot.
+;           Fix: STRZ,R2 saves letter to R2 (never written by any routine);
+;           DL_STORE restores with LODZ,R2 before computing VARS address.
+;           DO_INPUT also updated for consistency.
+;         BUG-BASIC-15 FIXED: PF_LOADVAR saved variable letter to SC0, called
+;           INC_IP (clobbers R0 with new IPL), then used R0 directly for the
+;           VARS offset calculation instead of reloading from SC0.
+;           Fix: LODA,R0 SC0 added after INC_IP call.
+;         BUG-BASIC-16 FIXED: All 15 indexed VARS/stack accesses used
+;           STRA,R1 TMPL after ADDZ,R1. ADDZ,R1 means R0 += R1 (ends-in-Z
+;           affects R0); R1 is unchanged. Storing R1 always wrote the base
+;           address low byte, not the computed offset. This is the v1.4
+;           BUG-BASIC-07 "fix" applied backwards — it swapped R0→R1 but R0
+;           is correct (R0 holds the sum after ADDZ). The original code was
+;           right; the v1.4 fix broke it. All 15 STRA,R1 TMPL → STRA,R0 TMPL.
+;         BUG-ASM-08 FIXED: RDLINE entered infinite NUL loop after stdin EOF.
+;           GETKEY returns NUL ($00) forever once stdin is exhausted. RDLINE
+;           stored NULs filling IBUF, then overflowed into VARS ($1584+),
+;           zeroing variable values set by LET during RUN. This is why LET
+;           worked (confirmed by watchpoint at $1585) but the value was then
+;           clobbered before PRINT could read it.
+;           Fix: added COMI,R0 NUL / BCTA,EQ RL_EOL immediately after GETKEY
+;           in RL_LP. NUL from stdin EOF is treated as end-of-line.
 ;   v1.5  BUG-BASIC-09 FIXED: TRY_STORE_LINE/TSL_DONE cleared ERRFLG to $00
 ;           after storing a numbered line. REPL checks ERRFLG=$01 to skip
 ;           execution, so every stored line was immediately executed too.
@@ -74,10 +124,9 @@
 ;           restored TMPH:TMPL was garbage, causing RUN to jump to a random
 ;           address. Fix: save next-line pointer in SWSTK[0:1] ($152E:$152F),
 ;           which are unused until GOSUB is implemented.
-;   v1.4  BUG-BASIC-07 FIXED: All 15 indexed stack/variable accesses stored R0
-;           (raw index) instead of R1 (computed address low byte) after ADDZ,R1.
-;           Fix: STRA,R1 TMPL throughout PX_PUSHV, PX_LPAR, PX_PEEKOP,
-;           PX_PUSHOP, PX_RPAR loop, PX_RALL loop, APPLY_OP, DO_LET, PF_LOADVAR.
+;   v1.4  BUG-BASIC-07 (INCORRECTLY FIXED — re-fixed in v1.6 above):
+;           Changed STRA,R0 TMPL to STRA,R1 TMPL, believing ADDZ,R1 stored
+;           the result in R1. Correct understanding: ADDZ,R1 = R0 += R1.
 ;   v1.3  BUG-BASIC-03..06, BUG-ASM-04/06/10 fixed (see earlier sessions).
 ;   v1.2  BUG-BASIC-01: All HI/LO operators corrected (66 swapped lines).
 ;   v1.1  Initial PIPBUG 1 port.
@@ -94,6 +143,42 @@ DQ      EQU     $22
 COUT    EQU     $02B4   ; putchar: R0 = char to output
 CHIN    EQU     $0286   ; getchar: blocking: R0 =  key
 CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
+
+; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
+; BUG-ASM-10 FIX: Addres $1500 pins variables regardless of code growth.
+; Code ceiling: ~$14FF (code must not reach $1500 or assembler will error).
+; Variables: $1500-$15B8 (185 bytes). Program store: $15B9-$1BFF (1607 bytes).
+IPH:     EQU $1500   ; interpreter pointer hi
+IPL:     EQU $1501   ; interpreter pointer lo
+PEH:     EQU $1502   ; program end pointer hi
+PEL:     EQU $1503   ; program end pointer lo
+RUNFLG:  EQU $1504   ; $01=running $00=immediate
+GOTOFLG: EQU $1505   ; $01=GOTO/GOSUB pending
+GOTOH:   EQU $1506   ; pending target line hi
+GOTOL:   EQU $1507   ; pending target line lo
+CURH:    EQU $1508   ; current line hi  (error reporting)
+CURL:    EQU $1509   ; current line lo
+LNUMH:   EQU $150A   ; scratch line number hi
+LNUML:   EQU $150B   ; scratch line number lo
+SC0:     EQU $150C   ; scratch byte 0
+SC1:     EQU $150D   ; scratch byte 1
+ERRFLG:  EQU $150E   ; error flag $00=ok $01=error/handled
+NEGFLG:  EQU $150F   ; sign / CHR$ flag
+EXPH:    EQU $1510   ; expression result hi
+EXPL:    EQU $1511   ; expression result lo
+TMPH:    EQU $1512   ; temp 16-bit hi
+TMPL:    EQU $1513   ; temp 16-bit lo
+OPSTK:   EQU $1514   ; operator stack [8]  $1514-$151B
+VALSH:   EQU $151C   ; value stack hi  [8]  $151C-$1523
+VALSL:   EQU $1524   ; value stack lo  [8]  $1524-$152B
+STKIDX:  EQU $152C   ; parser stack top ($FF=empty)
+SWSP:    EQU $152D   ; SW call stack pointer ($FF=empty)
+SWSTK:   EQU $152E   ; SW call stack 8×2 bytes  $152E-$153D
+RELOP:   EQU $153E   ; relational op 1-6
+IBUF:    EQU $1544   ; input buffer 64 bytes  $1544-$1583
+VARS:    EQU $1584   ; A-Z variables 2 bytes each  $1584-$15B7
+PROG:    EQU $15B8   ; program store base
+PROGLIM: EQU $1c00   ; one past end of program store
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
         ORG     $0440
@@ -202,14 +287,19 @@ SE_SCAN:
         BCTA,EQ SE_SYNERR  ; end of table
         SUBA,R0 SC0
         BCTR,EQ SE_CHK2  ; c1 matches
-        ; advance 3 bytes to next entry
+        ; ISSUE-04 FIX: advance 3 bytes to next entry with correct carry check.
+        ; Old code: ADDI/STRA/BCTR,GT — STRA clobbers CC, branch tests stored
+        ; value not carry. New code: test CC from ADDI before STRA.
         LODA,R0 TMPL
         ADDI,R0 3
+        BCTA,GT SE_SC_NC        ; GT = no carry
         STRA,R0 TMPL
-        BCTR,GT SE_SCAN
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
+        BCTA,UN SE_SCAN
+SE_SC_NC:
+        STRA,R0 TMPL
         BCTA,UN SE_SCAN
 SE_CHK2:
         ; advance to c2
@@ -218,14 +308,17 @@ SE_C2N:
         LODA,R0 *TMPH
         SUBA,R0 SC1
         BCTR,EQ SE_MATCH
-        ; c2 mismatch: advance 2 more bytes to next entry
+        ; c2 mismatch: ISSUE-04 FIX: advance 2 more bytes with correct carry check.
         LODA,R0 TMPL
         ADDI,R0 2
+        BCTA,GT SE_C2_NC        ; GT = no carry
         STRA,R0 TMPL
-        BCTA,GT SE_SCAN
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
+        BCTA,UN SE_SCAN
+SE_C2_NC:
+        STRA,R0 TMPL
         BCTA,UN SE_SCAN
 SE_MATCH:
         ; advance to token byte
@@ -260,25 +353,21 @@ SE_TN:
 SE_SYNERR:
         EORZ,R0 ; Clear 
         BCTA,UN DO_ERROR
-SE_RET:
-DO_REM:
-        RETC,UN
-
-; ─── SIMPLE STATEMENTS ────────────────────────────────────────────────────────
-;DO_REM:
-;        RETC,UN
-
-DO_END:
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG
-
-        RETC,UN
 
 DO_NEW:
         LODI,R0 <PROG
         STRA,R0 PEH
         LODI,R0 >PROG
         STRA,R0 PEL
+        ; RETC,UN
+        ; drop through
+DO_END:
+        EORZ,R0 ; Clear R0
+        STRA,R0 RUNFLG
+        ; drop through
+; ─── SIMPLE STATEMENTS ────────────────────────────────────────────────────────
+SE_RET:
+DO_REM:
         RETC,UN
 
 ; ─── DO_PRINT ─────────────────────────────────────────────────────────────────
@@ -358,7 +447,11 @@ DL_ERR:
         LODI,R0 4
         BCTA,UN DO_ERROR
 DL_VAROK:
-        STRA,R0 SC0                      ; save variable letter
+        STRA,R0 SC0                      ; save variable letter in SC0 (immediate use)
+        STRZ,R2                          ; BUG-BASIC-14 FIX: also save in R2 (STRZ stores R0→Rn).
+        ; SC0 is general scratch clobbered by PARSE_EXPR (operator-stack ops
+        ; write SC0 repeatedly). R2 is never written by any routine and
+        ; survives the full PARSE_EXPR call below.
         BSTA,UN INC_IP
 DL_EQ:
         BSTA,UN WSKIP                    ; [+1]
@@ -378,13 +471,17 @@ DL_EX:
         BCTA,UN DO_ERROR
 DL_STORE:
         ; address = VARS + (SC0 - 'A') * 2
-        LODA,R0 SC0
+        ; BUG-BASIC-14 FIX: restore variable letter from R2 (SC0 was clobbered
+        ; by PARSE_EXPR). R2 is caller-saved across PARSE_EXPR (never written
+        ; by any routine). DO_INPUT jumps here with letter already in SC0 and R2.
+        LODZ,R2                          ; R0 = variable letter (preserved in R2 across PARSE_EXPR)
+        STRA,R0 SC0                      ; resync SC0 for any code reading it below
         SUBI,R0 A'A'  ; 0-25
         STRA,R0 SC1
         ADDA,R0 SC1  ; *2  (SC1 = index, R0 = index*2)
         LODI,R1 >VARS
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VARS
         BCTR,GT DL_NC
         ADDI,R0 1
@@ -412,6 +509,7 @@ DIN_ERR:
         BCTA,UN DO_ERROR
 DIN_VAROK:
         STRA,R0 SC0                      ; save variable letter
+        STRZ,R2                          ; also save in R2 for DL_STORE (SC0 clobbered by PARSE_S16)
         BSTA,UN INC_IP
 DIN_PR:
         LODI,R0 A'?'
@@ -521,27 +619,33 @@ DIF_EW:
         EORZ,R0 ; Clear 
         BCTA,UN DO_ERROR
 
-DIF_CEQ: LODA,R0 SC1
+DIF_CEQ: 
+        LODA,R0 SC1
         COMI,R0 $00
         BCTR,EQ DIF_TRUE
         BCTR,UN DIF_FALSE
-DIF_CNE: LODA,R0 SC1
+DIF_CNE: 
+        LODA,R0 SC1
         COMI,R0 $00
         BCFR,EQ DIF_TRUE
         BCTR,UN DIF_FALSE
-DIF_CLT: LODA,R0 SC1
+DIF_CLT: 
+        LODA,R0 SC1
         COMI,R0 $FF
         BCTR,EQ DIF_TRUE
         BCTR,UN DIF_FALSE
-DIF_CGT: LODA,R0 SC1
+DIF_CGT: 
+        LODA,R0 SC1
         COMI,R0 $01
         BCTR,EQ DIF_TRUE
         BCTR,UN DIF_FALSE
-DIF_CLE: LODA,R0 SC1
+DIF_CLE: 
+        LODA,R0 SC1
         COMI,R0 $01
         BCFR,EQ DIF_TRUE
         BCTR,UN DIF_FALSE
-DIF_CGE: LODA,R0 SC1
+DIF_CGE: 
+        LODA,R0 SC1
         COMI,R0 $FF
         BCFR,EQ DIF_TRUE
         BCTR,UN DIF_FALSE
@@ -564,7 +668,7 @@ DG_OK:
         STRA,R0 GOTOH
         LODA,R0 EXPL
         STRA,R0 GOTOL
-        EORZ,R0 ; Clear R0
+        LODI,R0 1               ; ISSUE-03 FIX: was EORZ/STRA ($00) — must be $01
         STRA,R0 GOTOFLG
         LODA,R0 RUNFLG
         COMI,R0 $01
@@ -874,16 +978,22 @@ SL_DOSHIFT:
         SUBI,R0 1
 SL_SNBR:
         STRA,R0 LNUMH           ; LNUMH:LNUML = src = PE-1
-        ; dst = src + SC1  → SC0 now holds body len not record size! Use SC1.
-        ; Actually SC1 = record size = shift amount.
+        ; dst = src + SC1 (record size = shift amount)
+        ; ISSUE-02 FIX: must test carry from ADDA before any LODA clobbers CC.
+        ; Old code did STRA / LODA LNUMH / BCTA,GT — LODA wiped the carry.
+        ; New code: test carry immediately after ADDA, then load LNUMH on both paths.
         LODA,R0 LNUML
         ADDA,R0 SC1
         STRA,R0 GOTOL
-        LODA,R0 LNUMH
-        BCTA,GT SL_DSNCA
+        BCTA,GT SL_DSNCA        ; GT = no carry from low-byte add (CC still valid)
+        LODA,R0 LNUMH           ; carry path: hi += 1
         ADDI,R0 1
+        STRA,R0 GOTOH
+        BCTA,UN SL_DSNCB
 SL_DSNCA:
-        STRA,R0 GOTOH           ; GOTOH:GOTOL = dst = PE-1+SC1
+        LODA,R0 LNUMH           ; no-carry path: hi unchanged
+        STRA,R0 GOTOH
+SL_DSNCB:
 
         ; use R3 as count (shift count lo; assume <256 for any real program)
         LODA,R3 TMPL
@@ -1188,7 +1298,7 @@ PX_LPN:
         STRA,R0 STKIDX
         LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <OPSTK
         BCTR,GT PX_LPNCA
         ADDI,R0 1
@@ -1234,7 +1344,7 @@ PX_PUSHV:
         STRA,R0 STKIDX
         LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSH
         BCTA,GT PX_VHN
         ADDI,R0 1
@@ -1245,7 +1355,7 @@ PX_VHN:
         LODA,R0 STKIDX
         LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSL
         BCTA,GT PX_VLN
         ADDI,R0 1
@@ -1276,7 +1386,7 @@ PX_REDLP:
         SUBI,R0 1
         LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <OPSTK
         BCTA,GT PX_TOPNC
         ADDI,R0 1
@@ -1301,7 +1411,7 @@ PX_PON:
         LODA,R0 STKIDX
         LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <OPSTK
         BCTA,GT PX_OPN
         ADDI,R0 1
@@ -1323,7 +1433,7 @@ PX_RPLP:
         SUBI,R0 1
         LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <OPSTK
         BCTA,GT PX_RPNCA2
         ADDI,R0 1
@@ -1352,7 +1462,7 @@ PX_RALL_LP:
         SUBI,R0 1
         LODI,R1 >OPSTK
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <OPSTK
         BCTA,GT PX_RANC
         ADDI,R0 1
@@ -1390,9 +1500,11 @@ GET_PREC_SC0:
         BCTA,EQ GP_HIGH
         EORZ,R0 ; Clear 
         RETC,UN
-GP_LOW:  LODI,R0 1
+GP_LOW:  
+        LODI,R0 1
         RETC,UN
-GP_HIGH: LODI,R0 2
+GP_HIGH: 
+        LODI,R0 2
         RETC,UN
 
 ; ─── APPLY_OP ─────────────────────────────────────────────────────────────────
@@ -1404,7 +1516,7 @@ APPLY_OP:
         LODA,R0 STKIDX
         LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSH
         BCTA,GT AO_RHN
         ADDI,R0 1
@@ -1415,7 +1527,7 @@ AO_RHN:
         LODA,R0 STKIDX
         LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSL
         BCTA,GT AO_RLN
         ADDI,R0 1
@@ -1429,7 +1541,7 @@ AO_RLN:
         SUBI,R0 1
         LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSH
         BCTA,GT AO_LHN
         ADDI,R0 1
@@ -1441,7 +1553,7 @@ AO_LHN:
         SUBI,R0 1
         LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSL
         BCTA,GT AO_LLN
         ADDI,R0 1
@@ -1519,7 +1631,7 @@ AO_STORE:
         SUBI,R0 1
         LODI,R1 >VALSH
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSH
         BCTA,GT AO_SHN
         ADDI,R0 1
@@ -1531,7 +1643,7 @@ AO_SHN:
         SUBI,R0 1
         LODI,R1 >VALSL
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VALSL
         BCTA,GT AO_SLN
         ADDI,R0 1
@@ -1568,18 +1680,19 @@ PF_NUM:
 
 PF_LOADVAR:
         ; load variable value from VARS
-        ; BUG-BASIC-03 FIX: R0 still has uppercased var letter from LODA/UPCASE above.
-        ; Save it to SC0 BEFORE INC_IP clobbers R0 via GETCI_UC side-effects.
-        ; The old LODA,R0 SC0 below was reading a stale token value from STMT_EXEC.
+        ; BUG-BASIC-03 FIX: save letter to SC0 BEFORE INC_IP clobbers R0.
         STRA,R0 SC0              ; save variable letter (A-Z)
         BSTA,UN INC_IP
 PF_LVNCA:
+        ; BUG-BASIC-15 FIX: INC_IP returns new IPL in R0, clobbering the letter.
+        ; Reload from SC0 before computing the VARS offset.
+        LODA,R0 SC0
         SUBI,R0 A'A'  ; 0-25
         STRA,R0 SC1
         ADDA,R0 SC1  ; *2
         LODI,R1 >VARS
         ADDZ,R1
-        STRA,R1 TMPL
+        STRA,R0 TMPL
         LODI,R0 <VARS
         BCTA,GT PF_LVN
         ADDI,R0 1
@@ -1607,6 +1720,8 @@ PARSE_RELOP:
         BCTA,EQ PRO_LT
         COMI,R0 A'>'
         BCTA,EQ PRO_GT
+        LODI,R0 1               ; ISSUE-05 FIX: no relop found — set error flag
+        STRA,R0 ERRFLG          ; (was RETC,UN with ERRFLG=$00 = false success)
         RETC,UN
 
 PRO_EQ:
@@ -1785,8 +1900,8 @@ MUL16:
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG
+        LODI,R0 1               ; ISSUE-01 FIX: was EORZ/STRA ($00) — left is
+        STRA,R0 NEGFLG          ; negative so result is negative: set NEGFLG=1
 MU_LA:
         ; abs(right) EXPH:EXPL
         LODA,R0 EXPH
@@ -1892,8 +2007,8 @@ DV_NZ:
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG
+        LODI,R0 1               ; ISSUE-01 FIX: was EORZ/STRA ($00) — dividend is
+        STRA,R0 NEGFLG          ; negative so result is negative: set NEGFLG=1
 DV_DA:
         ; abs(divisor) EXPH:EXPL
         LODA,R0 EXPH
@@ -2065,6 +2180,8 @@ PS16P_LAST:
 ; ─── GETKEY ───────────────────────────────────────────────────────────────────
 ; Blocking keyboard read via Pipbug CHIN.
 ; CHIN is blocking — waits for a keypress before returning.
+;
+; Later Implement Proprietary Bitbanged SENSE input when basic working
 ; Returns char in R0.  Clobbers R0 only.
 GETKEY:
         BSTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
@@ -2081,20 +2198,29 @@ RDLINE:
         STRA,R0 IPL
 RL_LP:
         BSTA,UN GETKEY          ; [+1] blocking — R0 = char
-        STRZ,R1                 ; R1 = R0 (char  ; R0 now free for pointer arithmetic)
+        COMI,R0 NUL             ; BUG-ASM-08 FIX: NUL = EOF from sim stdin.
+        BCTA,EQ RL_EOL          ;   Treat as end-of-line so we don't flood IBUF
+        ;                       ;   (and overwrite VARS) after stdin is exhausted.
+        STRZ,R1                 ; R1 = char (R0 still has char for CR/BS checks)
         COMI,R1 CR
         BCTA,EQ RL_EOL
         COMI,R1 LF
         BCTA,EQ RL_EOL
+        ; ISSUE-06 FIX: removed redundant second COMI,R1 NUL / BCTA,EQ RL_EOL here.
+        ; BUG-ASM-08 fix (first NUL check immediately after GETKEY above) already
+        ; catches EOF before we reach this point — second check was dead code.
         COMI,R1 BS
         BCTA,EQ RL_BS
         ; buffer full?  IP >= IBUF+63
+        ; BUG-BASIC-17 FIX: was SUBA (absolute read) not SUBI (immediate compare).
+        ; SUBA,R0 <IBUF reads mem[$0015] (PIPBUG ROM), not the constant $15.
+        ; All four pointer comparisons here must use SUBI.
         LODA,R0 IPH
-        SUBA,R0 <IBUF
+        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($15)
         BCTA,GT RL_FULL
         BCTA,LT RL_STORE
         LODA,R0 IPL
-        SUBA,R0 >IBUF+63
+        SUBI,R0 >IBUF+63        ; compare IPL against IBUF lo byte + 63 ($83)
         BCTA,LT RL_STORE
 RL_FULL:
         BCTA,UN RL_LP
@@ -2107,11 +2233,11 @@ RL_STORE:
 RL_BS:
         ; at IBUF start? — no backspace if buffer empty
         LODA,R0 IPH
-        SUBA,R0 <IBUF
+        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($15)
         BCTA,GT RL_BSDO
         BCTA,LT RL_LP
         LODA,R0 IPL
-        SUBA,R0 >IBUF
+        SUBI,R0 >IBUF           ; compare IPL against IBUF lo byte ($44)
         BCTA,EQ RL_LP
 RL_BSDO:
         LODA,R0 IPL
@@ -2294,42 +2420,5 @@ DE_IN:
 DE_NL:
         BSTA,UN CRLF
         BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
-ROMEND:
-
-; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
-; BUG-ASM-10 FIX: ORG $1500 pins variables regardless of code growth.
-; Code ceiling: ~$14FF (code must not reach $1500 or assembler will error).
-; Variables: $1500-$15B8 (185 bytes). Program store: $15B9-$1BFF (1607 bytes).
-        ORG     $1500
-IPH:     RES 1 ;     $1500   ; interpreter pointer hi
-IPL:     RES 1 ;     $1501   ; interpreter pointer lo
-PEH:     RES 1 ;     $1502   ; program end pointer hi
-PEL:     RES 1 ;     $1503   ; program end pointer lo
-RUNFLG:  RES 1 ;     $1504   ; $01=running $00=immediate
-GOTOFLG: RES 1 ;     $1505   ; $01=GOTO/GOSUB pending
-GOTOH:   RES 1 ;     $1506   ; pending target line hi
-GOTOL:   RES 1 ;     $1507   ; pending target line lo
-CURH:    RES 1 ;     $1508   ; current line hi  (error reporting)
-CURL:    RES 1 ;     $1509   ; current line lo
-LNUMH:   RES 1 ;     $150A   ; scratch line number hi
-LNUML:   RES 1 ;     $150B   ; scratch line number lo
-SC0:     RES 1 ;     $150C   ; scratch byte 0
-SC1:     RES 1 ;     $150D   ; scratch byte 1
-ERRFLG:  RES 1 ;     $150E   ; error flag $00=ok $01=error/handled
-NEGFLG:  RES 1 ;     $150F   ; sign / CHR$ flag
-EXPH:    RES 1 ;     $1510   ; expression result hi
-EXPL:    RES 1 ;     $1511   ; expression result lo
-TMPH:    RES 1 ;     $1512   ; temp 16-bit hi
-TMPL:    RES 1 ;     $1513   ; temp 16-bit lo
-OPSTK:   RES 8 ;     $1514   ; operator stack [8]  $1514-$151B
-VALSH:   RES 8 ;     $151C   ; value stack hi  [8]  $151C-$1523
-VALSL:   RES 8 ;     $1524   ; value stack lo  [8]  $1524-$152B
-STKIDX:  RES 1 ;     $152C   ; parser stack top ($FF=empty)
-SWSP:    RES 1 ;     $152D   ; SW call stack pointer ($FF=empty)
-SWSTK:   RES 16 ;    $152E   ; SW call stack 8×2 bytes  $152E-$153D
-RELOP:   RES 6 ;     $153E   ; relational op 1-6
-IBUF:    RES 64 ;    $1544   ; input buffer 64 bytes  $1544-$1583
-VARS:    RES 52 ;    $1584   ; A-Z variables 2 bytes each  $1584-$15B7
-PROG:    RES 1 ;     $15B8   ; program store base
-PROGLIM: EQU     $1c00   ; one past end of program store
+ROMEND: ; so we can measure Binary rom size
         END

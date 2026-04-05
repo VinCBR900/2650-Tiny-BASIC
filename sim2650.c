@@ -1,6 +1,6 @@
 /* ============================================================================
  * sim2650.c  —  Signetics 2650 simulator for uBASIC2650 / PIPBUG 1 project
- * Version: 1.8
+ * Version: 1.9
  * Build: gcc -Wall -O2 -o sim2650 sim2650.c
  *
  * Usage: sim2650 [-t] [-e addr] [-b addr] [-rx file] [-m addr len]
@@ -16,6 +16,13 @@
  *                        · ROM-protect only $0000-$03FF
  *                        · Entry default $0440 (after Pipbug 1kB+64B)
  *                        · Intercept COUT=$02B4  CHIN=$0286  CRLF=$008A
+ *
+ * Changes v1.8 -> v1.9:
+ *   BUG-SIM-11 FIXED: EOF not respected on stdin (-rx file mode).
+ *     io_in() now sets eof_hit flag on EOF; pb_chin() and direct I/O opcodes
+ *     check it; main loop halts cleanly with exit code 0 when EOF is reached.
+ *     Previously, EOF caused getchar() to return -1 which was cast to 0x00,
+ *     feeding infinite NULLs to the simulated program.
  *
  * Changes v1.7 -> v1.8:
  *   -m addr len flag: dumps a memory range to stderr at halt or breakpoint.
@@ -50,7 +57,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER   "1.8"
+#define SIM_VER   "1.9"
 #define MEM_SIZE  0x8000
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
@@ -114,6 +121,7 @@ static int ri(int n) {
 
 static int  trace      = 0;
 static int  running    = 1;
+static int  eof_hit    = 0;   /* set when stdin reaches EOF; halts main loop */
 static int  breakpt    = -1;
 static int  dump_start = -1;
 static int  dump_len   = 32;
@@ -156,7 +164,16 @@ static unsigned char fetch(void) {
 }
 
 /* --- I/O ------------------------------------------------------------------- */
-static unsigned char io_in(void)       { int c = getchar(); return c==EOF ? 0 : (unsigned char)c; }
+/* io_in — read one byte from stdin.
+ * Returns the character on success.
+ * On EOF sets eof_hit=1 (main loop will halt) and returns 0x00 as a safe
+ * dummy so the caller always gets a well-defined unsigned char value.
+ */
+static unsigned char io_in(void) {
+    int c = getchar();
+    if (c == EOF) { eof_hit = 1; return 0x00; }
+    return (unsigned char)c;
+}
 static void          io_out(unsigned char v) { putchar(v); fflush(stdout); }
 
 /* --- PIPBUG stubs ---------------------------------------------------------- */
@@ -166,7 +183,7 @@ static void pb_ret(void) {
     cpu.PSU = (cpu.PSU & ~PSU_SP) | (cpu.SP & 7);
 }
 static void pb_cout(void) { io_out(R(0)); pb_ret(); }
-static void pb_chin(void) { R(0) = io_in(); pb_ret(); }   /* blocking: waits for keypress */
+static void pb_chin(void) { R(0) = io_in(); if (!eof_hit) pb_ret(); else running = 0; }   /* blocking: waits for keypress; halts on EOF */
 static void pb_crlf(void) { io_out('\r'); io_out('\n'); pb_ret(); }
 
 /* --- CC -------------------------------------------------------------------- */
@@ -371,7 +388,7 @@ static void execute(void) {
 
     /* I/O */
     if((op>=0x30&&op<=0x33)||(op>=0x70&&op<=0x73)||(op>=0x54&&op<=0x57))
-        { R(rn)=io_in(); set_cc(R(rn)); return; }
+        { R(rn)=io_in(); if(eof_hit){running=0;return;} set_cc(R(rn)); return; }
     if((op>=0xB0&&op<=0xB3)||(op>=0xF0&&op<=0xF3)||(op>=0xD4&&op<=0xD7))
         { io_out(R(rn)); set_cc(R(rn)); return; }
 
@@ -561,6 +578,7 @@ int main(int argc, char *argv[]) {
         if(breakpt>=0&&(int)cpu.IAR==breakpt){fprintf(stderr,"\n*** BREAKPOINT $%04X ***\n",cpu.IAR);break;}
         execute(); icount++;
     }
+    if(eof_hit)         fprintf(stderr,"\n*** EOF on stdin — halted ***\n");
     if(icount>=maxinstr) fprintf(stderr,"\n*** Instruction limit (%ld) ***\n",maxinstr);
     fprintf(stderr,"\nHalted after %ld instructions\n",icount);
     fprintf(stderr,"R0=$%02X R1=$%02X R2=$%02X R3=$%02X\n",R(0),R(1),R(2),R(3));
