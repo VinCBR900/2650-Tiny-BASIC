@@ -28,7 +28,7 @@ Used in `BCT`, `BCF`, `BSR`, and `RET` instructions:
 * **LT / N**: Negative (Mask %10)
 * **UN**: Unconditional (Mask %11)
 
-### ** Hardware Stack **
+### **Hardware Stack**
 Unfortunately a dedicated HW subroutine stack is implemented which is only 8 deep before wrapping.  PIPBUG uses 3 slots so care needed.
 
 ### **Timing & Size Notation**
