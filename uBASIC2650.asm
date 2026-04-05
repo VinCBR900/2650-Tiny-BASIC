@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.7
+; Version: v1.8
 ;
 ; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
@@ -8,7 +8,7 @@
 ;     CHIN $0286  — blocking input, char returned in R0
 ;     CRLF $008A  — emit CR+LF (R0 not significant on entry or exit)
 ;
-; Assembler: asm2650.c v1.5   Simulator: sim2650.c v1.7
+; Assembler: asm2650.c v1.6   Simulator: sim2650.c v1.9
 ; Build:
 ;   gcc -Wall -O2 -o asm2650 asm2650.c
 ;   gcc -Wall -O2 -o sim2650 sim2650.c
@@ -33,8 +33,12 @@
 ; DO_ERROR convention: LODI,R0 <code>; BCTA,UN DO_ERROR
 ;   Saves RUNFLG, clears run state, then BCTA,UN REPL (flushes hardware RAS).
 ;
-; RAS DEPTH BUDGET (8-level hardware stack):
-;   REPL(1)->STMT_EXEC(2)->DO_xxx(3)->PARSE_EXPR(4)->PARSE_FACTOR(5)->UPCASE(6)
+; RAS DEPTH BUDGET (8-level hardware stack, shared by BSTA and BSTR):
+;   PIPBUG COUT: uses BSTR DLAY inside = caller+2. CRLF: BSTR COUT→BSTR DLAY = caller+3.
+;   PIPBUG CHIN: uses BSTR DLAY/DLY inside = caller+2.
+;   Our deepest path: STMT_EXEC(1)→PARSE_EXPR(2)→APPLY_OP(3)→MUL16(4)→INC_EXP(5)
+;                  or STMT_EXEC(1)→PRINT_S16(2)→COUT(3)→[BSTR DLAY inside COUT](4)
+;   Verified max depth = 5. Limit = 8. Margin = 3. DO_IF adds 2 more → max 7. Safe.
 ;
 ; SCRATCH REGISTER ALLOCATION:
 ;   SC0:SC1   — general scratch; clobbered by STMT_EXEC (do NOT use for inter-
@@ -45,6 +49,14 @@
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (loads DIVTAB ptr)
 ;
 ; Change history:
+;   v1.8  ISSUE-01 RE-FIX: MUL16/DIV16 NEGFLG placement was still wrong.
+;           The LODI,R0 1 / STRA,R0 NEGFLG in v1.7 was placed after the
+;           hi-byte carry increment, which is only reached on carry. For
+;           values like -3 ($FFFD): XOR→$0002, +1→$0003 — no carry, so
+;           BCTA,GT branched past NEGFLG=1 to MU_LA/DV_DA. Sign was lost,
+;           result printed positive. Fix: introduce MU_LNC/DV_DNC labels,
+;           branch there on carry (skipping hi-byte inc), then BOTH paths
+;           fall into LODI,R0 1 / STRA,R0 NEGFLG before MU_LA/DV_DA.
 ;   v1.7  ISSUE-03 FIXED: DO_GOTO set GOTOFLG=$00 (EORZ/STRA) instead of $01.
 ;           GOTO was silently ignored during RUN — DR_GOTO path never triggered.
 ;           Fix: LODI,R0 1 / STRA,R0 GOTOFLG.
@@ -148,37 +160,37 @@ CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 ; BUG-ASM-10 FIX: Addres $1500 pins variables regardless of code growth.
 ; Code ceiling: ~$14FF (code must not reach $1500 or assembler will error).
 ; Variables: $1500-$15B8 (185 bytes). Program store: $15B9-$1BFF (1607 bytes).
-IPH:     EQU $1500   ; interpreter pointer hi
-IPL:     EQU $1501   ; interpreter pointer lo
-PEH:     EQU $1502   ; program end pointer hi
-PEL:     EQU $1503   ; program end pointer lo
-RUNFLG:  EQU $1504   ; $01=running $00=immediate
-GOTOFLG: EQU $1505   ; $01=GOTO/GOSUB pending
-GOTOH:   EQU $1506   ; pending target line hi
-GOTOL:   EQU $1507   ; pending target line lo
-CURH:    EQU $1508   ; current line hi  (error reporting)
-CURL:    EQU $1509   ; current line lo
-LNUMH:   EQU $150A   ; scratch line number hi
-LNUML:   EQU $150B   ; scratch line number lo
-SC0:     EQU $150C   ; scratch byte 0
-SC1:     EQU $150D   ; scratch byte 1
-ERRFLG:  EQU $150E   ; error flag $00=ok $01=error/handled
-NEGFLG:  EQU $150F   ; sign / CHR$ flag
-EXPH:    EQU $1510   ; expression result hi
-EXPL:    EQU $1511   ; expression result lo
-TMPH:    EQU $1512   ; temp 16-bit hi
-TMPL:    EQU $1513   ; temp 16-bit lo
-OPSTK:   EQU $1514   ; operator stack [8]  $1514-$151B
-VALSH:   EQU $151C   ; value stack hi  [8]  $151C-$1523
-VALSL:   EQU $1524   ; value stack lo  [8]  $1524-$152B
-STKIDX:  EQU $152C   ; parser stack top ($FF=empty)
-SWSP:    EQU $152D   ; SW call stack pointer ($FF=empty)
-SWSTK:   EQU $152E   ; SW call stack 8×2 bytes  $152E-$153D
-RELOP:   EQU $153E   ; relational op 1-6
-IBUF:    EQU $1544   ; input buffer 64 bytes  $1544-$1583
-VARS:    EQU $1584   ; A-Z variables 2 bytes each  $1584-$15B7
-PROG:    EQU $15B8   ; program store base
-PROGLIM: EQU $1c00   ; one past end of program store
+IPH     EQU $1500   ; interpreter pointer hi
+IPL     EQU $1501   ; interpreter pointer lo
+PEH     EQU $1502   ; program end pointer hi
+PEL     EQU $1503   ; program end pointer lo
+RUNFLG  EQU $1504   ; $01=running $00=immediate
+GOTOFLG EQU $1505   ; $01=GOTO/GOSUB pending
+GOTOH   EQU $1506   ; pending target line hi
+GOTOL   EQU $1507   ; pending target line lo
+CURH    EQU $1508   ; current line hi  (error reporting)
+CURL    EQU $1509   ; current line lo
+LNUMH   EQU $150A   ; scratch line number hi
+LNUML   EQU $150B   ; scratch line number lo
+SC0     EQU $150C   ; scratch byte 0
+SC1     EQU $150D   ; scratch byte 1
+ERRFLG  EQU $150E   ; error flag $00=ok $01=error/handled
+NEGFLG  EQU $150F   ; sign / CHR$ flag
+EXPH    EQU $1510   ; expression result hi
+EXPL    EQU $1511   ; expression result lo
+TMPH    EQU $1512   ; temp 16-bit hi
+TMPL    EQU $1513   ; temp 16-bit lo
+OPSTK   EQU $1514   ; operator stack [8]  $1514-$151B
+VALSH   EQU $151C   ; value stack hi  [8]  $151C-$1523
+VALSL   EQU $1524   ; value stack lo  [8]  $1524-$152B
+STKIDX  EQU $152C   ; parser stack top ($FF=empty)
+SWSP    EQU $152D   ; SW call stack pointer ($FF=empty)
+SWSTK   EQU $152E   ; SW call stack 8×2 bytes  $152E-$153D
+RELOP   EQU $153E   ; relational op 1-6
+IBUF    EQU $1544   ; input buffer 64 bytes  $1544-$1583
+VARS    EQU $1584   ; A-Z variables 2 bytes each  $1584-$15B7
+PROG    EQU $15B8   ; program store base
+PROGLIM EQU $1c00   ; one past end of program store
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
         ORG     $0440
@@ -1896,12 +1908,13 @@ MUL16:
         LODA,R0 TMPL
         ADDI,R0 1
         STRA,R0 TMPL
-        BCTA,GT MU_LA
+        BCTA,GT MU_LNC
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
-        LODI,R0 1               ; ISSUE-01 FIX: was EORZ/STRA ($00) — left is
-        STRA,R0 NEGFLG          ; negative so result is negative: set NEGFLG=1
+MU_LNC:
+        LODI,R0 1               ; ISSUE-01 FIX (corrected): set NEGFLG=1 on BOTH
+        STRA,R0 NEGFLG          ; carry and no-carry paths — left was negative
 MU_LA:
         ; abs(right) EXPH:EXPL
         LODA,R0 EXPH
@@ -1973,6 +1986,8 @@ MU_DONE:
         STRA,R0 EXPL
         BSTA,UN INC_EXP
 MU_RET:
+        EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
+        STRA,R0 NEGFLG                   ; exit — dual-use with CHR$ flag in DO_PRINT
         RETC,UN
 
 ; ─── DIV16 ────────────────────────────────────────────────────────────────────
@@ -2003,12 +2018,13 @@ DV_NZ:
         LODA,R0 TMPL
         ADDI,R0 1
         STRA,R0 TMPL
-        BCTA,GT DV_DA
+        BCTA,GT DV_DNC
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
-        LODI,R0 1               ; ISSUE-01 FIX: was EORZ/STRA ($00) — dividend is
-        STRA,R0 NEGFLG          ; negative so result is negative: set NEGFLG=1
+DV_DNC:
+        LODI,R0 1               ; ISSUE-01 FIX (corrected): set NEGFLG=1 on BOTH
+        STRA,R0 NEGFLG          ; carry and no-carry paths — dividend was negative
 DV_DA:
         ; abs(divisor) EXPH:EXPL
         LODA,R0 EXPH
@@ -2074,6 +2090,8 @@ DV_DONE:
         STRA,R0 EXPL
         BSTA,UN INC_EXP
 DV_RET:
+        EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
+        STRA,R0 NEGFLG                   ; exit — dual-use with CHR$ flag in DO_PRINT
         RETC,UN
 DV_ZERO:
         LODI,R0 2
