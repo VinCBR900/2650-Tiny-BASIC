@@ -21,7 +21,6 @@
 * **imm**: 8-bit Immediate value.
 * **x**: Index Register (r1, r2, r3).
 * **+ / -**: Auto-increment or auto-decrement of the index register (occurs BEFORE the memory access).
-* **Zxxx**: Zero Page Branch instructions is signed MOD 8192, so accesses first 63 bytes of ROM memory ($0000-003F) and top 63 bytes ($7FC0-7FFF).
 
 ### **The Addressing Toolkit**
 ----------------------
@@ -158,12 +157,12 @@ IORA,rn abs         ;rn |= *(abs);                             ;4,3
 IORI,rn imm         ;rn |= imm;                                ;2,2
 IORR,rn rel         ;rn |= *(rel);                             ;3,2
 IORZ,rn             ;r0 |= rn;                                 ;2,1
-; Use IORZ,R0 to clear R0 to zero (R0 ^= R0 also works via EORZ,R0)
 
 EORA,rn abs         ;rn ^= *(abs);                             ;4,3
 EORI,rn imm         ;rn ^= imm;                                ;2,2
 EORR,rn rel         ;rn ^= *(rel);                             ;3,2
 EORZ,rn             ;r0 ^= rn;                                 ;2,1
+; Use EORZ,R0 to clear R0 to zero (R0 ^= R0 )
 ```
 
 ---
@@ -177,13 +176,12 @@ LODI,rn imm         ;rn = imm;                                 ;2,2
 LODR,rn rel         ;rn = *(rel);                              ;3,2
 LODZ,rn             ;r0 = rn;    (destination is ALWAYS r0)   ;2,1
 ; NOTE: LODZ,R0 result is undefined per 2650 manual (R0=R0 self-load). Assembler warns.
-; Use IORZ,R0 (R0 ^= R0) to guarantee R0=0, or EORZ,R0 to toggle.
 
-; Indexed absolute (R0 is always the destination, rn in opcode = index register):
+; Indexed absolute (R0 is always the destination, x in opcode = R1-R3 ):
 LODA,r0 abs,x       ;r0 = *(abs + x);    x unchanged           ;4,3
 LODA,r0 abs,x+      ;x++; r0 = *(abs + x);  pre-increment      ;4,3
 LODA,r0 abs,x-      ;x--; r0 = *(abs + x);  pre-decrement      ;4,3
-LODA,rn *abs        ;rn = *(*(abs));     indirect               ;6,3
+LODA,rn *abs        ;rn = *(*(abs));     indirect              ;6,3
 LODA,r0 *abs,x      ;r0 = *(*(abs) + x);                       ;6,3
 ```
 **KEY**: In indexed absolute mode the register field in the opcode byte encodes the **index register**, NOT the destination. Destination is always R0. `LODA,R0 BASE,R2` emits opcode `$0E` (R2 in field), not `$0C` (R0). Confirmed by asm2650.py and WinArcadia.
@@ -217,34 +215,43 @@ COM uses signed comparison by default (PSL COM=0). Set COM=1 via `PPSL $02` for 
 ### **Conditional Branching**
 ```asm
 BCTA,cond abs       ;if(cond) PC = abs;                        ;3,3
+BCTA,cond *abs      ;if(cond) PC = *abs;                       ;3,3
 BCTR,cond rel       ;if(cond) PC += rel;                       ;3,2
 BCFA,cond abs       ;if(!cond) PC = abs;                       ;3,3
+BCFA,cond *abs      ;if(!cond) PC = *abs;                      ;3,3
 BCFR,cond rel       ;if(!cond) PC += rel;                      ;3,2
 ```
 
 ### **Subroutine Calls / Returns**
 ```asm
 BSTA,cond abs       ;if(cond) { push(PC); PC = abs; }          ;3,3
+BSTA,cond *abs      ;if(cond) { push(PC); PC = *abs; }         ;3,3
 BSTR,cond rel       ;if(cond) { push(PC); PC += rel; }         ;3,2
 BSFA,cond abs       ;if(!cond){ push(PC); PC = abs; }          ;3,3
+BSFA,cond *abs      ;if(!cond){ push(PC); PC = *abs; }         ;3,3
 BSFR,cond rel       ;if(!cond){ push(PC); PC += rel; }         ;3,2
 RETC,cond           ;if(cond) PC = pop();                      ;3,1
 RETE,cond           ;if(cond) { PC = pop(); enable ints; }     ;3,1
 ```
 
-### **Zero-Page Branches** *(target must be within $0000-$007F)*
+### **Zero-Page Branches** *(target must be within $0000-$003F)*
 ```asm
-ZBRR    offset      ;PC = page_base + sign_extend_7bit(offset)          ;2,2
-ZBSR    offset      ;push(PC); PC = page_base + sign_extend_7bit(offset) ;3,2
+ZBRR    offset      ;PC = page_base +/- sign_extend_7bit (offset))          ;2,2
+ZBRR    *offset     ;PC = *(page_base +/- sign_extend_7bit (offset))          ;2,2
+ZBSR    offset      ;push(PC); PC = page_base +/- sign_extend_7bit(offset) ;3,2
+ZBSR    *offset     ;push(PC); PC = *(page_base +/- sign_extend_7bit(offset)) ;3,2
 ```
-* Offset is a signed 7-bit value: range -64 to +63.
-* Under PIPBUG, $0000-$007F is ROM — no user-placed stubs possible. ZBSR/ZBRR are Phase 2 standalone only.
-* ZBRR: WinArcadia assembler requires an operand (quirk). Use `RETC,UN` instead for PIPBUG-phase source.
+* Offset is a signed 7-bit value: range -64 to +63 with address MOD 8192. For
+example, ZBRR -8 will develop an effective address of 8184, and ZBRR +52
+will develop an effective address of 52.
+* Under PIPBUG, $0000-$03FF is ROM — no user-placed stubs possible. ZBSR/ZBRR are standalone use only (Phase 2).
 
 ### **Indexed Branch**
 ```asm
-BXA     abs,r3      ;PC = abs + r3;                            ;3,3
-BSXA    abs,r3      ;push(PC); PC = abs + r3;                  ;3,3
+BXA     abs,r3       ;goto abs + r3;                          ;3,3
+BXA     *abs,r3      ;goto *(abs) + r3;                       ;5,3
+BSXA    abs,r3       ;gosub abs + r3;                         ;3,3
+BSXA    *abs,r3      ;gosub *(abs) + r3;                      ;5,3
 ```
 
 ---
@@ -275,6 +282,7 @@ Compare: `SUBI,R1 1 / BCFA,EQ LOOP` = 5 bytes. BRNR saves 1 byte per loop-close.
 ```asm
 BIRR,rn rel         ;rn++; if (rn != 0) PC += rel;             ;3,2
 BIRA,rn abs         ;rn++; if (rn != 0) PC = abs;              ;3,3
+BIRA,rn *abs        ;rn++; if (rn != 0) PC = *abs;             ;5,3
 ```
 Register IS incremented before test. Loop exits when `rn` wraps from $FF to $00.
 ```asm
@@ -288,6 +296,7 @@ LOOP:
 ```asm
 BDRR,rn rel         ;rn--; if (rn >= 0) PC += rel;             ;3,2
 BDRA,rn abs         ;rn--; if (rn >= 0) PC = abs;              ;3,3
+BDRA,rn *abs        ;rn--; if (rn >= 0) PC = *abs;             ;5,3
 ```
 Register IS decremented before SIGNED test. Loop exits when `rn` underflows to $FF (-1 signed).
 This is the most compact loop instruction — just 2 bytes, decrement is free:
@@ -311,6 +320,7 @@ PIPBUG uses `BDRR,R0 $` (self-branch) as a single-instruction counted delay.
 ```asm
 BSNR,rn rel         ;if (rn != 0) { push(PC); PC += rel; }     ;3,2
 BSNA,rn abs         ;if (rn != 0) { push(PC); PC = abs; }      ;3,3
+BSNA,rn *abs        ;if (rn != 0) { push(PC); PC = *abs; }     ;5,3
 ```
 Same non-modifying semantics as BRNR. Tests register, no side effect on rn.
 
@@ -353,7 +363,7 @@ PSU: S[7] F[6] II[5] -[4] -[3] SP[2:0]
 PPSL $10    ; RS=1: R1, R2, R3 now address bank-1 registers (R1', R2', R3')
 CPSL $10    ; RS=0: R1, R2, R3 address bank-0 registers again
 ```
-R0 is always bank-0 regardless of RS. PIPBUG COUT uses bank-1 internally and restores RS on exit.
+R0 is commmon across both banks regardless of RS. PIPBUG COUT uses bank-1 internally and restores RS on exit.
 
 ### **I/O Operations**
 ```asm
