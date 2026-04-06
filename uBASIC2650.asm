@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.9 - BUG-SCA-01..10 fixed (BRNR→BDRR epidemic + MUL16/DIV16 sign)
+; Version: v1.10 - BUG-SCA-11: BDRR exit-on-zero semantics; fix CLRV and PU16_M10 counts
 ;
 ; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
@@ -49,6 +49,17 @@
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (loads DIVTAB ptr)
 ;
 ; Change history:
+;   v1.10 BUG-SCA-11 FIXED: BDRR/BDRA semantics are rn--; if(rn!=0) branch —
+;           exit when rn hits zero (not signed underflow to $FF as previously
+;           assumed). All v1.9 BDRR conversions that load a count from memory
+;           (bodylen, shift count) are correct because N iterations occur for
+;           load value N. Two sites had hardcoded wrong loads:
+;           (a) CLRV: load was $33 → only 51 iterations, missing last VARS byte
+;               at $15B7. Fix: load $34 for 52 iterations.
+;           (b) PU16_M10: load was 9 → only 9 multiplications (off by 1 in
+;               every multi-digit number). Fix: load 10 for 10 iterations.
+;           Also corrected all BDRR loop comments to say "if R3!=0 branch"
+;           instead of "while R3>=0 signed".
 ;   v1.9  BUG-SCA-01 FIXED: CLRV loop used BRNR,R3 (pure test, no decrement) →
 ;           infinite loop on startup. R3 never reached zero. Fix: BDRR,R3 with
 ;           initial load adjusted for BDRR semantics (exits after N+1 iters when
@@ -250,15 +261,15 @@ RESET:
         STRA,R0 IPH
         LODI,R0 >VARS
         STRA,R0 IPL
-; BUG-SCA-01 FIX: was LODI,R3 $34 / BRNR,R3 — BRNR never decrements R3
-; so loop ran forever. BDRR decrements then branches while R3>=0 (signed),
-; exiting when R3 wraps $00→$FF. Load $33 = 52 iterations (51..0→exit).
-        LODI,R3 $33             ; 52 iterations: counts 51→50→...→0→exit
+; BUG-SCA-01 FIX: was LODI,R3 $34 / BRNR,R3 — BRNR never decrements R3.
+; BUG-SCA-11 FIX: BDRR semantics are rn--; if(rn!=0) branch — exits when rn
+; hits zero. Load N for exactly N iterations: $34→$33→...→$01→$00→exit = 52.
+        LODI,R3 $34             ; 52 iterations: R3 counts $34→$33→...→$01→$00→exit
 CLRV:
         EORZ,R0 ; Clear R0
         STRA,R0 *IPH
         BSTA,UN INC_IP
-        BDRR,R3 CLRV            ; R3--; branch while R3>=0 signed
+        BDRR,R3 CLRV            ; R3--; if R3!=0 branch
         LODI,R0 <BANNER
         STRA,R0 IPH
         LODI,R0 >BANNER
@@ -788,7 +799,7 @@ DLS_BLPX:
         LODA,R0 *TMPH
         BSTA,UN COUT
         BSTA,UN INC_TMP
-        BDRR,R3 DLS_BLPX       ; R3--; branch while R3>=0 signed
+        BDRR,R3 DLS_BLPX       ; R3--; if R3!=0 branch
 DLS_NL:
         BSTA,UN CRLF
         BCTA,UN DLS_LP
@@ -848,7 +859,7 @@ DR_CPY:
         BSTA,UN INC_TMP
         BSTA,UN INC_IP
         ; BUG-SCA-03 FIX: was BRNR,R3 — R3 never decremented → infinite copy loop.
-        BDRR,R3 DR_CPY          ; R3--; branch while R3>=0 signed
+        BDRR,R3 DR_CPY          ; R3--; if R3!=0 branch
 DR_CD:
         LODI,R1 NUL
         STRA,R1 *IPH  ; NUL-terminate
@@ -1087,7 +1098,7 @@ SL_SRNB:
         SUBI,R0 1
         STRA,R0 GOTOH
 SL_DRNB:
-        BDRR,R3 SL_SHLOOP       ; R3--; branch while R3>=0 signed
+        BDRR,R3 SL_SHLOOP       ; R3--; if R3!=0 branch
 
 SL_NOSHIFT:
         ; write record at EXPH:EXPL (insertion point)
@@ -1122,7 +1133,7 @@ SL_WBODY:
         STRA,R1 *EXPH  ; copy body byte
         BSTA,UN INC_TMP
         BSTA,UN INC_EXP
-        BDRR,R3 SL_WBODY        ; R3--; branch while R3>=0 signed
+        BDRR,R3 SL_WBODY        ; R3--; if R3!=0 branch
 SL_WDONE:
         ; update PE += SC1 (record size)
         LODA,R0 PEL
@@ -1168,7 +1179,7 @@ DL2_SKIP:
         COMI,R3 $00
         BCTA,EQ DL2_COPY
         BSTA,UN INC_TMP
-        BDRR,R3 DL2_SKIP        ; R3--; branch while R3>=0 signed
+        BDRR,R3 DL2_SKIP        ; R3--; if R3!=0 branch
         BCTA,UN DL2_COPY        ; R3 wrapped: all bytes skipped
 DL2_COPY:
         ; copy TMPH:TMPL..PE-1 to EXPH:EXPL
@@ -1260,7 +1271,7 @@ FL_AN2:
         BCTA,EQ FL_LP
 FL_AS:
         BSTA,UN INC_TMP
-        BDRR,R3 FL_AS            ; R3--; branch while R3>=0 signed; fall-thru→done
+        BDRR,R3 FL_AS            ; R3--; if R3!=0 branch; fall-thru→done
         BCTA,UN FL_LP            ; all body bytes skipped: check next record
 FL_RET:
         LODI,R0 1               ; BUG-BASIC-10 FIX: $01 = "not found"
@@ -1320,7 +1331,7 @@ FI_AN2:
         BCTA,EQ FI_LP
 FI_AS:
         BSTA,UN INC_TMP
-        BDRR,R3 FI_AS            ; R3--; branch while R3>=0 signed
+        BDRR,R3 FI_AS            ; R3--; if R3!=0 branch
         BCTA,UN FI_LP            ; all body bytes skipped: check next record
 FI_RET:
         RETC,UN
@@ -1915,9 +1926,8 @@ PU16_DIG:
 PU16_DNC:
         ; BUG-SCA-10 FIX: EXP = EXP*10.  Was LODI,R3 10 / BRNR,R3 — BRNR never
         ; decrements R3, so loop ran forever for any input with 2+ digits.
-        ; BDRR exits after N+1 iterations for initial load N. Load 9 → 10 iters.
-        ; Each iteration adds TMPH:TMPL (old EXP) to EXP, starting from 0,
-        ; giving EXP = old_EXP * 10 after 10 additions.
+        ; BUG-SCA-11 FIX: BDRR semantics are rn--; if(rn!=0) branch. Load N for
+        ; exactly N iterations. Need 10 additions so load 10: 10→9→...→1→0→exit.
         LODA,R0 EXPH
         STRA,R0 TMPH
         LODA,R0 EXPL
@@ -1925,7 +1935,7 @@ PU16_DNC:
         EORZ,R0 ; Clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
-        LODI,R3 9               ; 10 iterations: BDRR counts 9→8→...→0→exit
+        LODI,R3 10              ; 10 iterations: R3 counts 10→9→...→1→0→exit
 PU16_M10:
         LODA,R0 EXPL
         ADDA,R0 TMPL
@@ -1938,7 +1948,7 @@ PU16_MNC:
         LODA,R0 EXPH
         ADDA,R0 TMPH
         STRA,R0 EXPH
-        BDRR,R3 PU16_M10       ; R3--; branch while R3>=0 signed
+        BDRR,R3 PU16_M10       ; R3--; if R3!=0 branch
         ; EXP += digit
         LODA,R0 EXPL
         ADDA,R0 SC0
