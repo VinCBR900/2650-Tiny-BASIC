@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.8
+; Version: v1.9 - BUG-SCA-01..10 fixed (BRNR→BDRR epidemic + MUL16/DIV16 sign)
 ;
 ; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
@@ -49,6 +49,45 @@
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (loads DIVTAB ptr)
 ;
 ; Change history:
+;   v1.9  BUG-SCA-01 FIXED: CLRV loop used BRNR,R3 (pure test, no decrement) →
+;           infinite loop on startup. R3 never reached zero. Fix: BDRR,R3 with
+;           initial load adjusted for BDRR semantics (exits after N+1 iters when
+;           loaded with N; load $33 for 52 clears, guard zero case not needed as
+;           VARS is always 52 bytes). Label CLRV_NC removed (no longer needed).
+;         BUG-SCA-02 FIXED: DO_LIST DLS_BLPX body-print loop used BRNR,R3 →
+;           infinite loop printing first byte of every stored line body.
+;           Fix: BDRR,R3. R3 loaded from memory; guard COMI,R3 $00 / BCTA,EQ
+;           DLS_NL before loop entry retained (BDRR with R3=0 would execute once).
+;           Label DLS_BNC removed.
+;         BUG-SCA-03 FIXED: DO_RUN DR_CPY copy-to-IBUF loop used BRNR,R3 →
+;           infinite loop copying line body. Fix: BDRR,R3.
+;           Labels DR_TNC, DR_INC removed.
+;         BUG-SCA-04 FIXED: STORE_LINE SL_SHLOOP shift loop used BRNR,R3 →
+;           infinite loop during any line insertion that requires shifting.
+;           Fix: BDRR,R3. Existing zero-count guard (COMI,R3 / BCTA,EQ SL_NOSHIFT)
+;           at loop entry retained (BDRR with R3=0 executes once).
+;         BUG-SCA-05 FIXED: STORE_LINE SL_WBODY write-body loop used BRNR,R3 →
+;           infinite loop writing body bytes. Fix: BDRR,R3.
+;           Labels SL_WBNC, SL_WENC removed.
+;         BUG-SCA-06 FIXED: FIND_LINE FL_AS advance loop used BRNR,R3 →
+;           infinite loop advancing past body bytes; search never found any line
+;           beyond the first record. Fix: BDRR,R3. Label FL_ASN removed.
+;         BUG-SCA-07 FIXED: FIND_INS FI_AS advance loop — same as BUG-SCA-06.
+;           Fix: BDRR,R3. Label FI_ASN removed.
+;         BUG-SCA-08 FIXED: DELETE_LINE DL2_SKIP advance loop used BRNR,R3 →
+;           infinite loop; deletion never found copy start. Fix: BDRR,R3.
+;           Label DL2_SN removed.
+;         BUG-SCA-09 FIXED: MUL16 right-operand abs() NEGFLG toggle was inside
+;           the carry path only (BCTA,GT jumped over both the hi-byte increment
+;           AND the EORI/STRA toggle). For most negative right values (e.g. -3:
+;           abs complement+1 = no carry), NEGFLG was never toggled, giving wrong
+;           sign: 3*(-3)=+9 instead of -9. Fix: introduce MU_RA_NC label so the
+;           no-carry path skips only the hi-byte increment but falls through to
+;           the NEGFLG toggle. Same fix applied to DIV16 DV_VA block (BUG-SCA-09b).
+;         BUG-SCA-10 FIXED: PARSE_U16 multiply-by-10 loop used BRNR,R3 with
+;           LODI,R3 10 — R3 never decremented, so any number with 2+ digits
+;           entered an infinite loop during parsing. Fix: BDRR,R3 with load
+;           adjusted to 9 (BDRR gives 10 iterations: 9→8→...→0→exit).
 ;   v1.8  ISSUE-01 RE-FIX: MUL16/DIV16 NEGFLG placement was still wrong.
 ;           The LODI,R0 1 / STRA,R0 NEGFLG in v1.7 was placed after the
 ;           hi-byte carry increment, which is only reached on carry. For
@@ -211,13 +250,15 @@ RESET:
         STRA,R0 IPH
         LODI,R0 >VARS
         STRA,R0 IPL
-        LODI,R3 $34
+; BUG-SCA-01 FIX: was LODI,R3 $34 / BRNR,R3 — BRNR never decrements R3
+; so loop ran forever. BDRR decrements then branches while R3>=0 (signed),
+; exiting when R3 wraps $00→$FF. Load $33 = 52 iterations (51..0→exit).
+        LODI,R3 $33             ; 52 iterations: counts 51→50→...→0→exit
 CLRV:
         EORZ,R0 ; Clear R0
         STRA,R0 *IPH
         BSTA,UN INC_IP
-CLRV_NC:
-        BRNR,R3 CLRV
+        BDRR,R3 CLRV            ; R3--; branch while R3>=0 signed
         LODI,R0 <BANNER
         STRA,R0 IPH
         LODI,R0 >BANNER
@@ -281,7 +322,8 @@ STMT_EXEC:
         BSTA,UN WSKIP                   ; [+1]
         LODA,R0 *IPH
         COMI,R0 NUL
-        BCTA,EQ SE_RET  ; blank line
+        ; BCTA,EQ SE_RET  ; blank line
+        RETC,EQ ; Blank line
 
         BSTA,UN GETCI_UC
         STRA,R0 SC0  ; [+1] char1 uppercase, IP advanced
@@ -304,7 +346,7 @@ SE_SCAN:
         ; value not carry. New code: test CC from ADDI before STRA.
         LODA,R0 TMPL
         ADDI,R0 3
-        BCTA,GT SE_SC_NC        ; GT = no carry
+        BCTR,GT SE_SC_NC        ; GT = no carry
         STRA,R0 TMPL
         LODA,R0 TMPH
         ADDI,R0 1
@@ -323,7 +365,7 @@ SE_C2N:
         ; c2 mismatch: ISSUE-04 FIX: advance 2 more bytes with correct carry check.
         LODA,R0 TMPL
         ADDI,R0 2
-        BCTA,GT SE_C2_NC        ; GT = no carry
+        BCTR,GT SE_C2_NC        ; GT = no carry
         STRA,R0 TMPL
         LODA,R0 TMPH
         ADDI,R0 1
@@ -388,7 +430,7 @@ DO_REM:
 DO_PRINT:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
-        COMI,R0 NUL
+        COMI,R0 NUL ; No opening " so just CRLF
         BCTA,EQ DP_NL
 
 DP_ITEM:
@@ -645,23 +687,26 @@ DIF_CLT:
         LODA,R0 SC1
         COMI,R0 $FF
         BCTR,EQ DIF_TRUE
-        BCTR,UN DIF_FALSE
+        ;BCTR,UN DIF_FALSE
+        RETC,UN
 DIF_CGT: 
         LODA,R0 SC1
         COMI,R0 $01
         BCTR,EQ DIF_TRUE
-        BCTR,UN DIF_FALSE
+        ;BCTR,UN DIF_FALSE
+        RETC,UN
 DIF_CLE: 
         LODA,R0 SC1
         COMI,R0 $01
         BCFR,EQ DIF_TRUE
-        BCTR,UN DIF_FALSE
+        ; BCTR,UN DIF_FALSE
+        RETC,UN
 DIF_CGE: 
         LODA,R0 SC1
         COMI,R0 $FF
         BCFR,EQ DIF_TRUE
-        BCTR,UN DIF_FALSE
-
+        ; BCTR,UN DIF_FALSE
+        RETC,UN
 DIF_TRUE:
         BSTA,UN STMT_EXEC                ; [+1]  execute THEN body
 DIF_FALSE:
@@ -684,7 +729,8 @@ DG_OK:
         STRA,R0 GOTOFLG
         LODA,R0 RUNFLG
         COMI,R0 $01
-        BCTR,EQ DG_RET
+        ;BCTR,EQ DG_RET
+        RETC,EQ
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG  ; start run if in immediate mode
 DG_RET:
@@ -699,12 +745,14 @@ DO_LIST:
 DLS_LP:
         LODA,R0 TMPH
         SUBA,R0 PEH
-        BCTA,GT DLS_RET
+        ; BCTA,GT DLS_RET
+        RETC,GT
         BCTA,LT DLS_BODY
         LODA,R0 TMPL
         SUBA,R0 PEL
         BCTR,LT DLS_BODY
-        BCTA,UN DLS_RET
+        ; BCTA,UN DLS_RET
+        RETC,UN
 DLS_BODY:
         ; line number hi:lo
         LODA,R0 *TMPH
@@ -732,19 +780,20 @@ DLS_N2:
         LODA,R3 *TMPH
         BSTA,UN INC_TMP
 DLS_N3:
+        ; BUG-SCA-02 FIX: was BRNR,R3 (pure test, R3 never decremented → inf loop).
+        ; Guard zero-body case first (BDRR with R3=0 would execute once wrongly).
         COMI,R3 $00
         BCTA,EQ DLS_NL
 DLS_BLPX:
         LODA,R0 *TMPH
         BSTA,UN COUT
         BSTA,UN INC_TMP
-DLS_BNC:
-        BRNR,R3 DLS_BLPX
+        BDRR,R3 DLS_BLPX       ; R3--; branch while R3>=0 signed
 DLS_NL:
         BSTA,UN CRLF
         BCTA,UN DLS_LP
 DLS_RET:
-        RETC,UN
+        ; RETC,UN
 
 ; ─── DO_RUN ───────────────────────────────────────────────────────────────────
 ; Executes stored lines sequentially, honouring GOTOFLG for GOTO/GOSUB/RETURN.
@@ -761,7 +810,8 @@ DO_RUN:
 DR_LP:
         LODA,R0 RUNFLG
         COMI,R0 $00
-        BCTA,EQ DR_RET
+        ; BCTA,EQ DR_RET
+        RETC,EQ
         ; end of program?
         LODA,R0 TMPH
         SUBA,R0 PEH
@@ -796,10 +846,9 @@ DR_CPY:
         LODA,R1 *TMPH
         STRA,R1 *IPH
         BSTA,UN INC_TMP
-DR_TNC:
         BSTA,UN INC_IP
-DR_INC:
-        BRNR,R3 DR_CPY
+        ; BUG-SCA-03 FIX: was BRNR,R3 — R3 never decremented → infinite copy loop.
+        BDRR,R3 DR_CPY          ; R3--; branch while R3>=0 signed
 DR_CD:
         LODI,R1 NUL
         STRA,R1 *IPH  ; NUL-terminate
@@ -859,17 +908,19 @@ TRY_STORE_LINE:
         STRA,R0 ERRFLG
         LODA,R0 *IPH
         COMI,R0 A'0'
-        BCTR,LT TSL_RET
+        ; BCTR,LT TSL_RET
+        RETC,LT
         COMI,R0 A'9'+1
         BCTR,LT TSL_NUM
 TSL_RET:
-        RETC,UN
+        ;RETC,UN
 TSL_NUM:
         BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ TSL_GOT
-        BCTR,UN TSL_RET
+        ;BCTR,UN TSL_RET
+        RETC,UN
 TSL_GOT:
         ; validate 1..32767
         LODA,R0 EXPH
@@ -884,7 +935,8 @@ TSL_RNG:
         BCTR,GT TSL_NZ
         LODA,R0 EXPL
         COMI,R0 $00
-        BCTA,EQ TSL_RET2  ; line 0 invalid
+        ; BCTA,EQ TSL_RET2  ; line 0 invalid
+        RETC,EQ
 TSL_NZ:
         LODA,R0 EXPH
         STRA,R0 LNUMH
@@ -903,7 +955,7 @@ TSL_DONE:
         STRA,R0 ERRFLG
         RETC,UN
 TSL_RET2:
-        RETC,UN
+       ; RETC,UN
 
 ; ─── STORE_LINE ───────────────────────────────────────────────────────────────
 ; Insert line LNUMH:LNUML with body at IP into program store (sorted).
@@ -1008,6 +1060,8 @@ SL_DSNCA:
 SL_DSNCB:
 
         ; use R3 as count (shift count lo; assume <256 for any real program)
+        ; BUG-SCA-04 FIX: was BRNR,R3 at loop end — R3 never decremented → infinite shift.
+        ; Guard zero case first (BDRR with R3=0 would execute once wrongly).
         LODA,R3 TMPL
 SL_SHLOOP:
         COMI,R3 $00
@@ -1033,7 +1087,7 @@ SL_SRNB:
         SUBI,R0 1
         STRA,R0 GOTOH
 SL_DRNB:
-        BRNR,R3 SL_SHLOOP
+        BDRR,R3 SL_SHLOOP       ; R3--; branch while R3>=0 signed
 
 SL_NOSHIFT:
         ; write record at EXPH:EXPL (insertion point)
@@ -1058,6 +1112,8 @@ SL_WN2:
         BSTA,UN INC_EXP
 SL_WN3:
         ; write body bytes (R3 = body len from SC0)
+        ; BUG-SCA-05 FIX: was BRNR,R3 — R3 never decremented → infinite write.
+        ; Guard zero-body case first.
         LODA,R3 SC0
         COMI,R3 $00
         BCTA,EQ SL_WDONE
@@ -1065,10 +1121,8 @@ SL_WBODY:
         LODA,R1 *TMPH
         STRA,R1 *EXPH  ; copy body byte
         BSTA,UN INC_TMP
-SL_WBNC:
         BSTA,UN INC_EXP
-SL_WENC:
-        BRNR,R3 SL_WBODY
+        BDRR,R3 SL_WBODY        ; R3--; branch while R3>=0 signed
 SL_WDONE:
         ; update PE += SC1 (record size)
         LODA,R0 PEL
@@ -1108,12 +1162,14 @@ DL2_BLN:
         ; advance TMPH:TMPL past record to get src for copy
         LODA,R3 SC0
         SUBI,R3 2  ; R3 = bodylen + 1  (skip len byte + body)
+        ; BUG-SCA-08 FIX: was BRNR,R3 — R3 never decremented → infinite advance,
+        ; copy source never found, deletion corrupted program store.
 DL2_SKIP:
         COMI,R3 $00
         BCTA,EQ DL2_COPY
         BSTA,UN INC_TMP
-DL2_SN:
-        BRNR,R3 DL2_SKIP
+        BDRR,R3 DL2_SKIP        ; R3--; branch while R3>=0 signed
+        BCTA,UN DL2_COPY        ; R3 wrapped: all bytes skipped
 DL2_COPY:
         ; copy TMPH:TMPL..PE-1 to EXPH:EXPL
 DL2_LP:
@@ -1198,13 +1254,14 @@ FL_AN:
         LODA,R3 *TMPH                    ; bodylen
         BSTA,UN INC_TMP
 FL_AN2:
+        ; BUG-SCA-06 FIX: was BRNR,R3 — R3 never decremented → never advanced
+        ; past body, so search only ever examined first record.
         COMI,R3 $00
         BCTA,EQ FL_LP
 FL_AS:
         BSTA,UN INC_TMP
-FL_ASN:
-        BRNR,R3 FL_AS
-        BCTA,UN FL_LP
+        BDRR,R3 FL_AS            ; R3--; branch while R3>=0 signed; fall-thru→done
+        BCTA,UN FL_LP            ; all body bytes skipped: check next record
 FL_RET:
         LODI,R0 1               ; BUG-BASIC-10 FIX: $01 = "not found"
         STRA,R0 ERRFLG
@@ -1257,13 +1314,14 @@ FI_AN:
         LODA,R3 *TMPH
         BSTA,UN INC_TMP
 FI_AN2:
+        ; BUG-SCA-07 FIX: was BRNR,R3 — same as BUG-SCA-06, insertion point
+        ; search always landed at first record position for multi-record stores.
         COMI,R3 $00
         BCTA,EQ FI_LP
 FI_AS:
         BSTA,UN INC_TMP
-FI_ASN:
-        BRNR,R3 FI_AS
-        BCTA,UN FI_LP
+        BDRR,R3 FI_AS            ; R3--; branch while R3>=0 signed
+        BCTA,UN FI_LP            ; all body bytes skipped: check next record
 FI_RET:
         RETC,UN
 
@@ -1844,16 +1902,22 @@ PU16_LP:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
         COMI,R0 A'0'
-        BCTA,LT PU16_DONE
+        ;BCTA,LT PU16_DONE
+        RETC,LT
         COMI,R0 A'9'+1
         BCTA,LT PU16_DIG
-        BCTA,UN PU16_DONE
+        ;BCTA,UN PU16_DONE
+        RETC,UN
 PU16_DIG:
         SUBI,R0 A'0'
         STRA,R0 SC0  ; digit value 0-9
         BSTA,UN INC_IP
 PU16_DNC:
-        ; EXP = EXP*10 using R3 loop (BRNR counts down to 0)
+        ; BUG-SCA-10 FIX: EXP = EXP*10.  Was LODI,R3 10 / BRNR,R3 — BRNR never
+        ; decrements R3, so loop ran forever for any input with 2+ digits.
+        ; BDRR exits after N+1 iterations for initial load N. Load 9 → 10 iters.
+        ; Each iteration adds TMPH:TMPL (old EXP) to EXP, starting from 0,
+        ; giving EXP = old_EXP * 10 after 10 additions.
         LODA,R0 EXPH
         STRA,R0 TMPH
         LODA,R0 EXPL
@@ -1861,7 +1925,7 @@ PU16_DNC:
         EORZ,R0 ; Clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
-        LODI,R3 10
+        LODI,R3 9               ; 10 iterations: BDRR counts 9→8→...→0→exit
 PU16_M10:
         LODA,R0 EXPL
         ADDA,R0 TMPL
@@ -1874,7 +1938,7 @@ PU16_MNC:
         LODA,R0 EXPH
         ADDA,R0 TMPH
         STRA,R0 EXPH
-        BRNR,R3 PU16_M10
+        BDRR,R3 PU16_M10       ; R3--; branch while R3>=0 signed
         ; EXP += digit
         LODA,R0 EXPL
         ADDA,R0 SC0
@@ -1888,7 +1952,7 @@ PU16_DIG_NC:
         STRA,R0 ERRFLG  ; success: at least one digit
         BCTA,UN PU16_LP
 PU16_DONE:
-        RETC,UN
+        ; RETC,UN
 
 ; ─── MUL16 ────────────────────────────────────────────────────────────────────
 ; Signed TMPH:TMPL × EXPH:EXPL → EXPH:EXPL  (16-bit two's complement wrap)
@@ -1929,11 +1993,17 @@ MU_LA:
         LODA,R0 EXPL
         ADDI,R0 1
         STRA,R0 EXPL
-        BCTA,GT MU_RA
+        ; BUG-SCA-09 FIX: was BCTA,GT MU_RA — this jumped over BOTH the hi-byte
+        ; increment AND the NEGFLG toggle, so for most negative right values (those
+        ; whose +1 does not carry to hi byte, e.g. -3→$FFFD, abs=$0003) NEGFLG was
+        ; never toggled → wrong sign (3*-3=+9 not -9). Fix: introduce MU_RA_NC so
+        ; no-carry path skips only the hi-byte increment, then BOTH paths toggle.
+        BCTA,GT MU_RA_NC        ; GT = no carry from lo-byte +1: skip hi increment
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
-        LODA,R0 NEGFLG
+MU_RA_NC:
+        LODA,R0 NEGFLG          ; toggle sign on BOTH carry and no-carry paths
         EORI,R0 $01
         STRA,R0 NEGFLG
 MU_RA:
@@ -2039,11 +2109,15 @@ DV_DA:
         LODA,R0 EXPL
         ADDI,R0 1
         STRA,R0 EXPL
-        BCTA,GT DV_VA
+        ; BUG-SCA-09b FIX: same as MUL16 right-operand fix. BCTA,GT DV_VA jumped
+        ; over BOTH hi-byte increment AND NEGFLG toggle for no-carry cases.
+        ; Fix: introduce DV_VA_NC so no-carry skips only the hi-byte increment.
+        BCTA,GT DV_VA_NC        ; GT = no carry: skip hi increment
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
-        LODA,R0 NEGFLG
+DV_VA_NC:
+        LODA,R0 NEGFLG          ; toggle sign on BOTH paths
         EORI,R0 $01
         STRA,R0 NEGFLG
 DV_VA:
@@ -2202,8 +2276,8 @@ PS16P_LAST:
 ; Later Implement Proprietary Bitbanged SENSE input when basic working
 ; Returns char in R0.  Clobbers R0 only.
 GETKEY:
-        BSTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
-        RETC,UN
+;        BSTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
+;        RETC,UN
 
 ; ─── RDLINE ───────────────────────────────────────────────────────────────────
 ; Read a line from input into IBUF, echo with backspace support. NUL-terminates.
@@ -2215,7 +2289,7 @@ RDLINE:
         LODI,R0 >IBUF
         STRA,R0 IPL
 RL_LP:
-        BSTA,UN GETKEY          ; [+1] blocking — R0 = char
+        BSTA,UN CHIN          ; [+1] blocking — R0 = char
         COMI,R0 NUL             ; BUG-ASM-08 FIX: NUL = EOF from sim stdin.
         BCTA,EQ RL_EOL          ;   Treat as end-of-line so we don't flood IBUF
         ;                       ;   (and overwrite VARS) after stdin is exhausted.
@@ -2286,19 +2360,20 @@ PRTSTR_IP:
 PRTSTR:
         LODA,R1 *IPH
         COMI,R1 NUL
-        BCTA,EQ PRTSTR_RET
+        ;BCTA,EQ PRTSTR_RET
+        RETC,EQ
         LODZ,R1
         BSTA,UN COUT
         BSTA,UN INC_IP
-        BCTA,UN PRTSTR
+        BCTR,UN PRTSTR
 PRTSTR_RET:
-        RETC,UN
+       ; RETC,UN
 
 ; ─── WSKIP ────────────────────────────────────────────────────────────────────
 WSKIP:
         LODA,R0 *IPH
         COMI,R0 SP
-        BCTA,EQ WS_ADV
+        BCTR,EQ WS_ADV
         RETC,UN
 WS_ADV:
         BSTA,UN INC_IP
@@ -2311,7 +2386,7 @@ WS_ADV:
 ; Clobbers: R1 (caller must not rely on R1 across GETCI_UC call)
 GETCI_UC:
         LODA,R0 *IPH
-        BSTA,UN UPCASE                   ; [+1] R0 = uppercased char
+        BSTR,UN UPCASE                   ; [+1] R0 = uppercased char
         STRZ,R1                          ; R1 = char (save before INC_IP clobbers R0)
         BSTA,UN INC_IP                   ; [+1] advance IP (clobbers R0)
         LODZ,R1                          ; R0 = char (restore)
@@ -2321,10 +2396,12 @@ GETCI_UC_RET:
 ; ─── UPCASE ───────────────────────────────────────────────────────────────────
 UPCASE:
         COMI,R0 A'a'
-        BCTA,LT UC_RET
+        ; BCTA,LT UC_RET
+        RETC,LT
         COMI,R0 A'z'+1
-        BCTA,LT UC_DO
-        BCTA,UN UC_RET
+        BCTR,LT UC_DO
+        ;BCTR,UN UC_RET
+        RETC,UN
 UC_DO:  SUBI,R0 32
 UC_RET: RETC,UN
 
@@ -2332,17 +2409,17 @@ UC_RET: RETC,UN
 ; Skip [A-Za-z$] at IP.
 EATWORD:
         LODA,R0 *IPH
-        BSTA,UN UPCASE  ; [+1]
+        BSTR,UN UPCASE  ; [+1]
         COMI,R0 A'A'
-        BCTA,LT EW_DS
+        BCTR,LT EW_DS
         COMI,R0 A'Z'+1
-        BCTA,LT EW_ADV
+        BCTR,LT EW_ADV
 EW_DS:  COMI,R0 A'$'
-        BCTA,EQ EW_ADV
+        BCTR,EQ EW_ADV
         RETC,UN
 EW_ADV:
         BSTA,UN INC_IP
-        BCTA,UN EATWORD
+        BCTR,UN EATWORD
 
 ; ─── SHARED 16-BIT POINTER INCREMENT/DECREMENT SUBROUTINES ───────────────────
 ; INC_IP  : IPH:IPL  += 1   (clobbers R0)
@@ -2359,7 +2436,8 @@ INC_IP:
         LODA,R0 IPL
         ADDI,R0 1
         STRA,R0 IPL
-        BCTA,GT INC_IP_RET      ; no carry — hi byte unchanged
+        ;BCTA,GT INC_IP_RET      ; no carry — hi byte unchanged
+        RETC,GT
         LODA,R0 IPH
         ADDI,R0 1
         STRA,R0 IPH
@@ -2370,7 +2448,8 @@ INC_TMP:
         LODA,R0 TMPL
         ADDI,R0 1
         STRA,R0 TMPL
-        BCTA,GT INC_TMP_RET     ; no carry
+        ;BCTA,GT INC_TMP_RET     ; no carry
+        RETC,GT
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
@@ -2381,7 +2460,8 @@ INC_EXP:
         LODA,R0 EXPL
         ADDI,R0 1
         STRA,R0 EXPL
-        BCTA,GT INC_EXP_RET     ; no carry
+        ;BCTA,GT INC_EXP_RET     ; no carry
+        RETC,GT
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
@@ -2392,7 +2472,7 @@ DEC_TMP:
         LODA,R0 TMPL
         SUBI,R0 1
         STRA,R0 TMPL
-        BCFA,LT DEC_TMP_RET     ; no borrow (C=1) — hi byte unchanged
+        BCFR,LT DEC_TMP_RET     ; no borrow (C=1) — hi byte unchanged
         LODA,R0 TMPH
         SUBI,R0 1
         STRA,R0 TMPH
@@ -2419,8 +2499,8 @@ DO_ERROR:
         BSTA,UN COUT
         LODA,R0 SC1
         COMI,R0 $01
-        BCTA,EQ DE_IN
-        BCTA,UN DE_NL
+        BCTR,EQ DE_IN
+        BCTR,UN DE_NL
 DE_IN:
         LODI,R0 SP
         BSTA,UN COUT
