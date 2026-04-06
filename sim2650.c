@@ -17,6 +17,12 @@
  *                        · Entry default $0440 (after Pipbug 1kB+64B)
  *                        · Intercept COUT=$02B4  CHIN=$0286  CRLF=$008A
  *
+ * Changes v1.9 -> v1.10:
+ *   BUG-SIM-12 FIXED: BRNR/BRNA incorrectly decremented Rn before test.
+ *     Per 2650 manual: BRNR tests Rn != 0 with NO side effect on Rn.
+ *     Must pair with explicit SUBI/SUBZ for a counted loop.
+ *     (BIRR still increments, BDRR still decrements — those are correct.)
+ *
  * Changes v1.8 -> v1.9:
  *   BUG-SIM-11 FIXED: EOF not respected on stdin (-rx file mode).
  *     io_in() now sets eof_hit flag on EOF; pb_chin() and direct I/O opcodes
@@ -57,7 +63,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER   "1.9"
+#define SIM_VER   "1.10"
 #define MEM_SIZE  0x8000
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
@@ -422,9 +428,13 @@ static void execute(void) {
         return;
     }
 
-    /* BRNR/BRNA — decrement, branch if != 0 */
-    if(op>=0x58&&op<=0x5B){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0){cpu.IAR=t;} return; }
-    if(op>=0x5C&&op<=0x5F){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0)cpu.IAR=t; return; }
+    /* BRNR/BRNA — test Rn, branch if Rn != 0. NO modification to Rn.
+     * Per 2650 manual pseudocode: if(rn != 0) goto abs;
+     * The register is tested but NOT decremented. BRNR is a pure conditional
+     * branch on register value. Must be paired with a separate SUBI/SUBZ to
+     * use as a counted loop. Contrast with BDRR (decrement IS built in). */
+    if(op>=0x58&&op<=0x5B){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); if(R(rn)!=0)cpu.IAR=t; return; }
+    if(op>=0x5C&&op<=0x5F){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); if(R(rn)!=0)cpu.IAR=t; return; }
 
     /* BIRR/BIRA — increment, branch if != 0 */
     if(op>=0xD8&&op<=0xDB){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); R(rn)++; if(R(rn)!=0){cpu.IAR=t;} return; }
