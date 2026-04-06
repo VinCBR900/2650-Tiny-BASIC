@@ -924,7 +924,7 @@ TRY_STORE_LINE:
         COMI,R0 A'9'+1
         BCTR,LT TSL_NUM
 TSL_RET:
-        ;RETC,UN
+        RETC,UN
 TSL_NUM:
         BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 ERRFLG
