@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.10 - BUG-SCA-11: BDRR exit-on-zero semantics; fix CLRV and PU16_M10 counts
+; Version: v1.11 - BUG-SCA-12: *SWSTK indirect→direct in DO_RUN save/restore
 ;
 ; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
@@ -49,6 +49,16 @@
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (loads DIVTAB ptr)
 ;
 ; Change history:
+;   v1.11 BUG-SCA-12 FIXED: DO_RUN next-line-pointer save used STRA,R0 *SWSTK
+;           (indirect addressing — writes R0 to the address stored AT SWSTK,
+;           not into SWSTK itself). After CLRV, SWSTK[0:1]=$00:$00, so the
+;           first RUN iteration wrote the next-line pointer hi byte into PIPBUG
+;           ROM at $0000, corrupting nothing visible but reading back $00 on
+;           restore → TMPH=0 → DR_LP end-of-program check passed immediately,
+;           RUN exited after one line without executing GOTO. The lo restore
+;           (LODA,R0 *SWSTK) read from $0000 too, getting $C0 (NOP opcode from
+;           PIPBUG ROM) as TMPL, causing wild pointer on the GOTO path.
+;           Fix: STRA,R0 SWSTK / LODA,R0 SWSTK (direct, matching SWSTK+1 usage).
 ;   v1.10 BUG-SCA-11 FIXED: BDRR/BDRA semantics are rn--; if(rn!=0) branch —
 ;           exit when rn hits zero (not signed underflow to $FF as previously
 ;           assumed). All v1.9 BDRR conversions that load a count from memory
@@ -869,12 +879,16 @@ DR_CD:
         ; stack, indexed from the top; [0:1] at $152E:$152F are unused while
         ; SWSP=$FF (empty) and GOSUB is not yet implemented.
         LODA,R0 TMPH
-        STRA,R0 SC0    ; SC0:SC1 still set (DO_GOSUB reads them for return addr)
-        STRA,R0 *SWSTK ; NLP_H: also save in SWSTK[0] for safe restore
+        STRA,R0 SC0      ; SC0:SC1 still set (DO_GOSUB reads them for return addr)
+        ; BUG-SCA-12 FIX: was STRA,R0 *SWSTK (indirect — writes to address stored
+        ; AT SWSTK, not to SWSTK itself). After CLRV, SWSTK[0:1]=$00:$00 so the
+        ; first RUN wrote the next-line pointer into PIPBUG ROM at $0000. Use direct
+        ; STRA,R0 SWSTK to store into $152E, matching SWSTK+1 usage on the next line.
+        STRA,R0 SWSTK    ; NLP_H: save hi byte of next-line ptr into SWSTK[0] ($152E)
         LODA,R0 TMPL
         STRA,R0 SC1
         LODA,R0 TMPL
-        STRA,R0 SWSTK+1 ; NLP_L: save in SWSTK[1]
+        STRA,R0 SWSTK+1  ; NLP_L: save lo byte of next-line ptr into SWSTK[1] ($152F)
         ; execute line
         LODI,R0 <IBUF
         STRA,R0 IPH
@@ -886,7 +900,8 @@ DR_CD:
         COMI,R0 $01
         BCTR,EQ DR_GOTO
         ; advance: restore next-line pointer from SWSTK[0:1] (SC0:SC1 clobbered)
-        LODA,R0 *SWSTK
+        ; BUG-SCA-12 FIX: was LODA,R0 *SWSTK (indirect). Use direct LODA,R0 SWSTK.
+        LODA,R0 SWSTK
         STRA,R0 TMPH
         LODA,R0 SWSTK+1
         STRA,R0 TMPL
@@ -964,9 +979,8 @@ TSL_DEL:
 TSL_DONE:
         LODI,R0 1               ; BUG-BASIC-09 FIX: $01 = "line stored, skip exec"
         STRA,R0 ERRFLG
-        RETC,UN
 TSL_RET2:
-       ; RETC,UN
+        RETC,UN
 
 ; ─── STORE_LINE ───────────────────────────────────────────────────────────────
 ; Insert line LNUMH:LNUML with body at IP into program store (sorted).
