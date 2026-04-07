@@ -1,14 +1,26 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.6
+ * Version: 1.7
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
  *        asm2650 source.asm -s             (dump symbol table to stderr)
  *
+ * Supported assembler directives:
+ *   ORG, EQU, DS, RES, DB, DW, END
+ *
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.6 -> v1.7:
+ *   Added warning controls:
+ *     --no-warn-inline-label
+ *     --no-warn-local-branch
+ *   Added output/CLI controls:
+ *     --binary, -o <file>, -r $HHHH-$HHHH, -h/--help
+ *   Help now prints version and options; binary mode supports full 32K image
+ *   output or optional ranged output.
  *
  * Changes v1.5 -> v1.6:
  *   -s flag: dump full symbol table (labels and addresses) to stderr after
@@ -32,6 +44,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
+#define ASM2650_VERSION "1.7"
 
 typedef struct { char name[32]; int value; } Label;
 static Label labels[MAX_LABELS];
@@ -44,6 +57,8 @@ static int  pc     = 0;
 static int  pass   = 0;
 static int  errors = 0;
 static int  lineno = 0;
+static int  warn_inline_label = 1;
+static int  warn_local_abs_branch = 1;
 
 static void upcase(char *s){
     /* Upcase the assembler line but preserve content inside single-quoted literals.
@@ -176,6 +191,12 @@ static void emit_abs(int addr, int ind, int cc_or_pp){
     emit(pc,b1); pc++; emit(pc,b2); pc++;
 }
 
+static int rel_offset_if_possible(int target, int base_pc, int *off_out){
+    int off=target-(base_pc+1);
+    if(off_out) *off_out=off;
+    return (off>=-64 && off<=63);
+}
+
 static void assemble_line(char *line){
     char buf[MAX_LINE]; strncpy(buf,line,MAX_LINE-1); buf[MAX_LINE-1]=0;
     upcase(buf);
@@ -191,6 +212,9 @@ static void assemble_line(char *line){
         }
         p=skip_ws(p);
         if(pass==1) label_define(lbl,pc);
+        if(*lbl && *p && pass==2 && warn_inline_label){
+            fprintf(stderr,"WARN line %d: label and instruction on same line\n",lineno);
+        }
     }
     /* v1.4 FIX: allow "LABEL: OPCODE operands" on one line.
      * After defining the label, continue to assemble any instruction that follows.
@@ -272,7 +296,16 @@ static void assemble_line(char *line){
             else { field=reg_val(field_str); if(field<0){fprintf(stderr,"ERROR line %d: %s needs Rn\n",lineno,mn);errors++;return;} }
             int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
             if(is_rel){ emit(pc,(unsigned char)(br[i].base_r|field));pc++; if(ok) emit_rel(v,ind); else{emit(pc,0);pc++;} }
-            else { emit(pc,(unsigned char)(br[i].base_a|field));pc++; if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;} }
+            else {
+                if(pass==2 && warn_local_abs_branch && ok){
+                    int off=0;
+                    if(rel_offset_if_possible(v,pc,&off)){
+                        fprintf(stderr,"WARN line %d: %s can use relative form (offset %d)\n",lineno,mn,off);
+                    }
+                }
+                emit(pc,(unsigned char)(br[i].base_a|field));pc++;
+                if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;}
+            }
             return;
         }
     }
@@ -282,6 +315,12 @@ static void assemble_line(char *line){
             char *cc_s, *addr_s; PARSE_FIELD(ops, nops, cc_s, addr_s);
             int cc=cc_val(cc_s); if(cc<0){fprintf(stderr,"ERROR line %d: %s needs EQ/GT/LT/UN\n",lineno,mn);errors++;return;}
             int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
+            if(pass==2 && warn_local_abs_branch && ok){
+                int off=0;
+                if(rel_offset_if_possible(v,pc,&off)){
+                    fprintf(stderr,"WARN line %d: %s can use relative form (offset %d)\n",lineno,mn,off);
+                }
+            }
             emit(pc,(unsigned char)(bra[i].base|cc));pc++;
             if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;}
             return;
@@ -291,17 +330,22 @@ static void assemble_line(char *line){
         int base=(strcmp(mn,"BRNA")==0)?0x5C:(strcmp(mn,"BIRA")==0)?0xDC:(strcmp(mn,"BDRA")==0)?0xFC:0x7C;
         int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: %s needs Rn\n",lineno,mn);errors++;return;}
         char *addr_s=ops[1]; int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
+        if(pass==2 && warn_local_abs_branch && ok){
+            int off=0;
+            if(rel_offset_if_possible(v,pc,&off)){
+                fprintf(stderr,"WARN line %d: %s can use relative form (offset %d)\n",lineno,mn,off);
+            }
+        }
         emit(pc,(unsigned char)(base|r));pc++; if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;} return;
     }
     /*
      * BXA/BSXA are non-orthogonal: index register is fixed to R3 in hardware.
      * Accept optional explicit R3 and warn when omitted.
      * Reject R0-R2 and reject autoincrement/decrement suffixes.
-     * Also accept BSX as alias for BSXA.
     */
-    if(strcmp(mn,"BXA")==0||strcmp(mn,"BSXA")==0||strcmp(mn,"BSX")==0){
+    if(strcmp(mn,"BXA")==0||strcmp(mn,"BSXA")==0){
         int ind=0, ok=0, v=0;
-        int is_bsx = (strcmp(mn,"BSXA")==0||strcmp(mn,"BSX")==0);
+        int is_bsx = (strcmp(mn,"BSXA")==0);
         char *addr_s = ops[0];
         char *reg_s = NULL;
 
@@ -402,13 +446,79 @@ static void write_hex(FILE *f){
     fprintf(f,":00000001FF\n");
 }
 
+static void write_binary(FILE *f, int lo, int hi){
+    if(lo<0) lo=0;
+    if(hi>=MAX_ROM) hi=MAX_ROM-1;
+    if(hi<lo) return;
+    fwrite(&rom[lo],1,(size_t)(hi-lo+1),f);
+}
+
+static void print_usage(FILE *f){
+    fprintf(f,"asm2650 v%s - Signetics 2650 cross-assembler\n", ASM2650_VERSION);
+    fprintf(f,"Usage: asm2650 [options] source.asm [output.hex]\n");
+    fprintf(f,"Options:\n");
+    fprintf(f,"  -s                             Dump symbol table to stderr\n");
+    fprintf(f,"  --binary                       Write flat 32768-byte binary image\n");
+    fprintf(f,"  -o <file>                      Write binary image to <file>\n");
+    fprintf(f,"  -r $HHHH-$HHHH                 Limit binary output address range (inclusive)\n");
+    fprintf(f,"  --no-warn-inline-label         Disable warning for LABEL: INSTR on same line\n");
+    fprintf(f,"  --no-warn-local-branch         Disable warning when absolute branch could be relative\n");
+    fprintf(f,"  -h, --help                     Show this help and exit\n");
+}
+
+static int parse_range(const char *s, int *lo, int *hi){
+    unsigned int a,b;
+    if(sscanf(s,"$%x-$%x",&a,&b)!=2) return 0;
+    if(a>=MAX_ROM || b>=MAX_ROM || a>b) return 0;
+    *lo=(int)a; *hi=(int)b;
+    return 1;
+}
+
 int dump_syms=0;
 int main(int argc,char *argv[]){
-    if(argc<2){ fprintf(stderr,"Usage: asm2650 source.asm [output.hex]\n"); return 1; }
-    for(int i=1;i<argc;i++) if(!strcmp(argv[i],"-s")) dump_syms=1;
+    const char *src_file=NULL;
+    const char *hex_file=NULL;
+    const char *bin_file=NULL;
+    int binary_mode=0;
+    int range_set=0, range_lo=0, range_hi=MAX_ROM-1;
+
+    for(int i=1;i<argc;i++){
+        if(!strcmp(argv[i],"-s")) dump_syms=1;
+        else if(!strcmp(argv[i],"--binary")) binary_mode=1;
+        else if(!strcmp(argv[i],"-o")){
+            if(i+1>=argc){ fprintf(stderr,"ERROR: -o requires a file path\n"); return 1; }
+            bin_file=argv[++i];
+            binary_mode=1;
+        } else if(!strcmp(argv[i],"-r")){
+            if(i+1>=argc){ fprintf(stderr,"ERROR: -r requires a range like $0000-$00FF\n"); return 1; }
+            if(!parse_range(argv[++i],&range_lo,&range_hi)){
+                fprintf(stderr,"ERROR: invalid range '%s' (expected $HHHH-$HHHH within $0000-$7FFF)\n",argv[i]);
+                return 1;
+            }
+            range_set=1;
+        } else if(!strcmp(argv[i],"--no-warn-inline-label")) warn_inline_label=0;
+        else if(!strcmp(argv[i],"--no-warn-local-branch")) warn_local_abs_branch=0;
+        else if(!strcmp(argv[i],"-h") || !strcmp(argv[i],"--help")){
+            print_usage(stdout);
+            return 0;
+        } else if(argv[i][0]=='-'){
+            fprintf(stderr,"ERROR: unknown option '%s'\n",argv[i]);
+            print_usage(stderr);
+            return 1;
+        } else if(!src_file) src_file=argv[i];
+        else if(!hex_file) hex_file=argv[i];
+        else { fprintf(stderr,"ERROR: unexpected argument '%s'\n",argv[i]); return 1; }
+    }
+
+    if(!src_file){ print_usage(stderr); return 1; }
+    if(range_set && !binary_mode){
+        fprintf(stderr,"ERROR: -r requires --binary or -o\n");
+        return 1;
+    }
+
     memset(rom,0xFF,sizeof(rom));
     for(pass=1;pass<=2;pass++){
-        FILE *f=fopen(argv[1],"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",argv[1]);return 1;}
+        FILE *f=fopen(src_file,"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",src_file);return 1;}
         pc=0; lineno=0; char line[MAX_LINE];
         while(fgets(line,MAX_LINE,f)){ lineno++; int l=strlen(line); while(l>0&&(line[l-1]=='\r'||line[l-1]=='\n')) line[--l]=0; assemble_line(line); }
         fclose(f);
@@ -418,8 +528,16 @@ int main(int argc,char *argv[]){
     if(errors) return 1;
     if(rom_hi>=rom_lo) fprintf(stderr,"Code: $%04X-$%04X (%d bytes)\n",rom_lo,rom_hi,rom_hi-rom_lo+1);
     FILE *out=stdout;
-    if(argc>=3&&!dump_syms){ out=fopen(argv[2],"w"); if(!out){fprintf(stderr,"Cannot create '%s'\n",argv[2]);return 1;} }
-    write_hex(out);
+    if(binary_mode){
+        if(bin_file){
+            out=fopen(bin_file,"wb");
+            if(!out){fprintf(stderr,"Cannot create '%s'\n",bin_file);return 1;}
+        }
+        write_binary(out, range_set?range_lo:0, range_set?range_hi:(MAX_ROM-1));
+    } else {
+        if(hex_file&&!dump_syms){ out=fopen(hex_file,"w"); if(!out){fprintf(stderr,"Cannot create '%s'\n",hex_file);return 1;} }
+        write_hex(out);
+    }
     if(out!=stdout) fclose(out);
     return 0;
 }
