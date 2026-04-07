@@ -1,6 +1,6 @@
 /* ============================================================================
  * sim2650.c  —  Signetics 2650 simulator for uBASIC2650 / PIPBUG 1 project
- * Version: 1.9
+ * Version: 1.11
  * Build: gcc -Wall -O2 -o sim2650 sim2650.c
  *
  * Usage: sim2650 [-t] [-e addr] [-b addr] [-rx file] [-m addr len]
