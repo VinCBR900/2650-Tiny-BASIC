@@ -1,10 +1,10 @@
 /* ============================================================================
  * sim2650.c  —  Signetics 2650 simulator for uBASIC2650 / PIPBUG 1 project
- * Version: 1.11
+ * Version: 1.12
  * Build: gcc -Wall -O2 -o sim2650 sim2650.c
  *
  * Usage: sim2650 [-t] [-e addr] [-b addr] [-rx file] [-m addr len]
- *                [--allow-ram-image] [--pipbug] image.hex
+ *                [--allow-ram-image] [--pipbug] [--halt-continue] image.hex
  *   -t                 CPU trace to stderr
  *   -e addr            Entry point (hex); default $0440 with --pipbug, else $0000
  *   -b addr            Breakpoint (hex); halts before executing that address
@@ -16,6 +16,16 @@
  *                        · ROM-protect only $0000-$03FF
  *                        · Entry default $0440 (after Pipbug 1kB+64B)
  *                        · Intercept COUT=$02B4  CHIN=$0286  CRLF=$008A
+ *   --halt-continue    HALT ($40) does not stop simulation; execute as
+ *                      non-terminating instruction (winarcadia-like behavior)
+ *
+ * Changes v1.11 -> v1.12:
+ *   Parity updates vs winarcadia 2650.c:
+ *   - Added --halt-continue flag; default HALT behavior remains "stop now".
+ *   - DAR now updates CC like the reference core.
+ *   - STRZ now updates CC from written register value.
+ *   - Undefined opcodes $90/$91 are consumed as 1-byte no-fault ops.
+ *   - RRR/RRL OVF logic in WC mode aligned with reference edge behavior.
  *
  * Changes v1.10 -> v1.11:
  *   BUG-SIM-13 FIXED: Relative effective addresses were allowed to cross 8K
@@ -73,7 +83,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER   "1.11"
+#define SIM_VER   "1.12"
 #define MEM_SIZE  0x8000
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
@@ -146,6 +156,7 @@ static long maxinstr   = 5000000L;
 static int  strict_rom = 1;
 static int  run_fault  = 0;
 static int  use_pipbug = 0;
+static int  halt_stops = 1;   /* default: HALT stops simulation immediately */
 static unsigned short entry_point = 0x0000;
 
 /* --- Memory ---------------------------------------------------------------- */
@@ -314,7 +325,7 @@ static void execute(void) {
     if (trace) fprintf(stderr,"[%04X] %02X  R0=%02X R1=%02X R2=%02X R3=%02X PSL=%02X SP=%d\n",
         op_pc, op, R(0),R(1),R(2),R(3), cpu.PSL, cpu.SP);
 
-    if (op == 0x40) { running = 0; return; }          /* HALT */
+    if (op == 0x40) { if (halt_stops) running = 0; return; }   /* HALT */
     if (op == 0xC0) { return; }                        /* NOP */
     if (op == 0x12) { R(0)=cpu.PSU; set_cc(R(0)); return; }  /* SPSU */
     if (op == 0x13) { R(0)=cpu.PSL; set_cc(R(0)); return; }  /* SPSL */
@@ -342,12 +353,21 @@ static void execute(void) {
     if (op==0xB4){ unsigned char m=fetch(); cpu.PSL=(cpu.PSL&~PSL_CC)|(((cpu.PSU&m)==m)?CC_ZERO:CC_NEG); return; }
     if (op==0xB5){ unsigned char m=fetch(); cpu.PSL=(cpu.PSL&~PSL_CC)|(((cpu.PSL&m)==m)?CC_ZERO:CC_NEG); return; }
 
+    /* Undefined opcodes */
+    if (op == 0x90 || op == 0x91) { return; }                /* consume as 1-byte no-fault op */
+
     /* DAR */
     if (op>=0x94&&op<=0x97){
         unsigned char r=R(rn);
-        if(!(cpu.PSL & PSL_C))   r = (unsigned char)(r + 0xA0);
-        if(!(cpu.PSL & PSL_IDC)) r = (unsigned char)(r + 0x0A);
-        R(rn)=r; return; /* DAR does not update CC in reference core */
+        if(!(cpu.PSL & PSL_C)) {
+            r = (unsigned char)(r + 0xA0);
+            set_cc(r);
+        }
+        if(!(cpu.PSL & PSL_IDC)) {
+            r = (unsigned char)((r & 0xF0) | ((r + 0x0A) & 0x0F));
+            set_cc(r);
+        }
+        R(rn)=r; return;
     }
 
     /* TMI */
@@ -363,7 +383,7 @@ static void execute(void) {
         if(cpu.PSL&PSL_WC){
             r=(r>>1)|((cpu.PSL&PSL_C)?0x80:0);
             if(b0)cpu.PSL|=PSL_C;else cpu.PSL&=~PSL_C;
-            if(((old^r)&0x80)!=0) cpu.PSL|=PSL_OVF; else cpu.PSL&=~PSL_OVF;
+            if(((old^r)&0x80)!=0 && old<=0x7F) cpu.PSL|=PSL_OVF; else cpu.PSL&=~PSL_OVF;
             if(r&0x20) cpu.PSL|=PSL_IDC; else cpu.PSL&=~PSL_IDC;
         }
         else r=(r>>1)|(b0<<7);
@@ -376,7 +396,7 @@ static void execute(void) {
         if(cpu.PSL&PSL_WC){
             r=(r<<1)|((cpu.PSL&PSL_C)?1:0);
             if(b7)cpu.PSL|=PSL_C;else cpu.PSL&=~PSL_C;
-            if(((old^r)&0x80)!=0) cpu.PSL|=PSL_OVF; else cpu.PSL&=~PSL_OVF;
+            if(((old^r)&0x80)!=0 && (old<=0x7F || old>=0xC0)) cpu.PSL|=PSL_OVF; else cpu.PSL&=~PSL_OVF;
             if(r&0x20) cpu.PSL|=PSL_IDC; else cpu.PSL&=~PSL_IDC;
         }
         else r=(r<<1)|b7;
@@ -480,7 +500,7 @@ static void execute(void) {
         /* STR group — no immediate mode */
         if (grp==6) {
             switch(mode) {
-                case 0: cpu.R[ri(rn)]=cpu.R[ri(0)]; return;       /* STRZ */
+                case 0: cpu.R[ri(rn)]=cpu.R[ri(0)]; set_cc(R(rn)); return;       /* STRZ */
                 case 1: fetch(); return;                            /* invalid — consume byte so PC stays correct */
                 case 2: { int off=fetch_rel(&ind); eff=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF));
                           if(ind){eff=resolve(eff,1);} mwr(eff,R(rn)); return; }
@@ -560,7 +580,7 @@ int main(int argc, char *argv[]) {
     fprintf(stderr,"sim2650 v%s\n",SIM_VER);
     if(argc<2){
         fprintf(stderr,"Usage: sim2650 [-t] [-e addr] [-b addr] [-rx file]\n"
-                       "               [--allow-ram-image] [--pipbug] image.hex\n");
+                       "               [--allow-ram-image] [--pipbug] [--halt-continue] image.hex\n");
         return 1;
     }
     const char *hexfile=NULL, *rxfile=NULL;
@@ -573,6 +593,7 @@ int main(int argc, char *argv[]) {
         else if(!strcmp(argv[i],"-m")&&i+2<argc){ dump_start=(int)strtol(argv[++i],NULL,16); dump_len=(int)strtol(argv[++i],NULL,10); }
         else if(!strcmp(argv[i],"--allow-ram-image")) strict_rom=0;
         else if(!strcmp(argv[i],"--pipbug"))         use_pipbug=1;
+        else if(!strcmp(argv[i],"--halt-continue"))  halt_stops=0;
         else hexfile=argv[i];
     }
 
