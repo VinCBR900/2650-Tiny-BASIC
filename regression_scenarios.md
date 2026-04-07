@@ -66,3 +66,20 @@ These scenarios are intended for simulator/manual regression runs.
 4. **Overflow policy confirmation**
    - `PRINT 32767+1` wraps to -32768 (16-bit two's-complement wrap)
    - `PRINT -32768-1` wraps to 32767
+
+## Quick automated smoke run (non-interactive)
+
+Use this to sanity-check assemble+boot+basic input in one shot:
+
+```bash
+gcc -Wall -O2 -o asm2650 asm2650.c
+gcc -Wall -O2 -o sim2650 sim2650.c
+./asm2650 uBASIC2650.asm /tmp/ubasic.hex
+printf 'PRINT 1\n' > /tmp/rx.txt
+./sim2650 --pipbug -rx /tmp/rx.txt /tmp/ubasic.hex
+```
+
+Expected key output signals:
+- Banner shows `sim2650 v1.11`
+- Prompt appears and evaluates `PRINT 1` to `1`
+- Simulator exits cleanly on EOF from `-rx` input
