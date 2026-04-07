@@ -1,5 +1,14 @@
 # Signetics 2650 Instruction Set Oracle
-#### Version: 1.1, Updated: 2026-04-06
+#### Version: 1.3, Updated: 2026-04-07
+
+### Changes v1.1 -> v1.3:
+*   MANUAL-ALIGN-01: Expanded opcode-variation coverage to match Signetics `(*)a` and `(,X)` notation.
+    * Added missing `*rel` forms (e.g., `SUBR`, `BRNR/BIRR/BDRR/BSNR`).
+    * Added missing absolute indirect-indexed forms for A-group ops.
+*   MANUAL-ALIGN-02: Corrected `BDRR/BDRA` pseudocode condition.
+    * Correct pseudocode: `if (--rn != 0) branch`.
+*   MANUAL-ALIGN-03: Corrected indirect `ZBRR/ZBSR` timing to `;5,2`.
+*   MANUAL-ALIGN-04: Clarified `ZBRR/ZBSR` signed 7-bit target range wording and examples.
 
 ### Changes v1.0 -> v1.1:
 *   BUG-ORACLE-01 FIXED: BRNR/BRNA pseudocode was wrong.
@@ -127,6 +136,9 @@ ADDA,r0 abs,x       ;r0 += *(abs + x);                         ;4,3
 ADDA,r0 abs,x+      ;r0 += *(abs + ++x);                       ;4,3
 ADDA,r0 abs,x-      ;r0 += *(abs + --x);                       ;4,3
 ADDA,rn *abs        ;rn += *(*(abs));                          ;6,3
+ADDA,r0 *abs,x      ;r0 += *(*(abs) + x);                      ;6,3
+ADDA,r0 *abs,x+     ;x++; r0 += *(*(abs) + x);                 ;6,3
+ADDA,r0 *abs,x-     ;x--; r0 += *(*(abs) + x);                 ;6,3
 ADDI,rn imm         ;rn += imm;                                ;2,2
 ADDR,rn rel         ;rn += *(rel);                             ;3,2
 ADDR,rn *rel        ;rn += *(*(rel));                          ;5,2
@@ -140,27 +152,55 @@ SUBA,r0 abs,x       ;r0 -= *(abs + x);                         ;4,3
 SUBA,r0 abs,x+      ;r0 -= *(abs + ++x);                       ;4,3
 SUBA,r0 abs,x-      ;r0 -= *(abs + --x);                       ;4,3
 SUBA,rn *abs        ;rn -= *(*(abs));                          ;6,3
+SUBA,r0 *abs,x      ;r0 -= *(*(abs) + x);                      ;6,3
+SUBA,r0 *abs,x+     ;x++; r0 -= *(*(abs) + x);                 ;6,3
+SUBA,r0 *abs,x-     ;x--; r0 -= *(*(abs) + x);                 ;6,3
 SUBI,rn imm         ;rn -= imm;                                ;2,2
 SUBR,rn rel         ;rn -= *(rel);                             ;3,2
+SUBR,rn *rel        ;rn -= *(*(rel));                          ;5,2
 SUBZ,rn             ;r0 -= rn;                                 ;2,1
 ```
 
 ### **AND / IOR / EOR (Bitwise)**
 ```asm
 ANDA,rn abs         ;rn &= *(abs);                             ;4,3
+ANDA,r0 abs,x       ;r0 &= *(abs + x);                         ;4,3
+ANDA,r0 abs,x+      ;r0 &= *(abs + ++x);                       ;4,3
+ANDA,r0 abs,x-      ;r0 &= *(abs + --x);                       ;4,3
+ANDA,rn *abs        ;rn &= *(*(abs));                          ;6,3
+ANDA,r0 *abs,x      ;r0 &= *(*(abs) + x);                      ;6,3
+ANDA,r0 *abs,x+     ;x++; r0 &= *(*(abs) + x);                 ;6,3
+ANDA,r0 *abs,x-     ;x--; r0 &= *(*(abs) + x);                 ;6,3
 ANDI,rn imm         ;rn &= imm;                                ;2,2
 ANDR,rn rel         ;rn &= *(rel);                             ;3,2
+ANDR,rn *rel        ;rn &= *(*(rel));                          ;5,2
 ANDZ,rn             ;r0 &= rn;                                 ;2,1
 ; NOTE: ANDZ,R0 is NOT a valid instruction — encodes as HALT ($40). Assembler warns.
 
 IORA,rn abs         ;rn |= *(abs);                             ;4,3
+IORA,r0 abs,x       ;r0 |= *(abs + x);                         ;4,3
+IORA,r0 abs,x+      ;r0 |= *(abs + ++x);                       ;4,3
+IORA,r0 abs,x-      ;r0 |= *(abs + --x);                       ;4,3
+IORA,rn *abs        ;rn |= *(*(abs));                          ;6,3
+IORA,r0 *abs,x      ;r0 |= *(*(abs) + x);                      ;6,3
+IORA,r0 *abs,x+     ;x++; r0 |= *(*(abs) + x);                 ;6,3
+IORA,r0 *abs,x-     ;x--; r0 |= *(*(abs) + x);                 ;6,3
 IORI,rn imm         ;rn |= imm;                                ;2,2
 IORR,rn rel         ;rn |= *(rel);                             ;3,2
+IORR,rn *rel        ;rn |= *(*(rel));                          ;5,2
 IORZ,rn             ;r0 |= rn;                                 ;2,1
 
 EORA,rn abs         ;rn ^= *(abs);                             ;4,3
+EORA,r0 abs,x       ;r0 ^= *(abs + x);                         ;4,3
+EORA,r0 abs,x+      ;r0 ^= *(abs + ++x);                       ;4,3
+EORA,r0 abs,x-      ;r0 ^= *(abs + --x);                       ;4,3
+EORA,rn *abs        ;rn ^= *(*(abs));                          ;6,3
+EORA,r0 *abs,x      ;r0 ^= *(*(abs) + x);                      ;6,3
+EORA,r0 *abs,x+     ;x++; r0 ^= *(*(abs) + x);                 ;6,3
+EORA,r0 *abs,x-     ;x--; r0 ^= *(*(abs) + x);                 ;6,3
 EORI,rn imm         ;rn ^= imm;                                ;2,2
 EORR,rn rel         ;rn ^= *(rel);                             ;3,2
+EORR,rn *rel        ;rn ^= *(*(rel));                          ;5,2
 EORZ,rn             ;r0 ^= rn;                                 ;2,1
 ; Use EORZ,R0 to clear R0 to zero (R0 ^= R0 )
 ```
@@ -183,6 +223,8 @@ LODA,r0 abs,x+      ;x++; r0 = *(abs + x);  pre-increment      ;4,3
 LODA,r0 abs,x-      ;x--; r0 = *(abs + x);  pre-decrement      ;4,3
 LODA,rn *abs        ;rn = *(*(abs));     indirect              ;6,3
 LODA,r0 *abs,x      ;r0 = *(*(abs) + x);                       ;6,3
+LODA,r0 *abs,x+     ;x++; r0 = *(*(abs) + x);                  ;6,3
+LODA,r0 *abs,x-     ;x--; r0 = *(*(abs) + x);                  ;6,3
 ```
 **KEY**: In indexed absolute mode the register field in the opcode byte encodes the **index register**, NOT the destination. Destination is always R0. `LODA,R0 BASE,R2` emits opcode `$0E` (R2 in field), not `$0C` (R0). Confirmed by asm2650.py and WinArcadia.
 
@@ -194,6 +236,9 @@ STRA,r0 abs,x       ;*(abs + x) = r0;                          ;4,3
 STRA,r0 abs,x+      ;x++; *(abs + x) = r0;                    ;4,3
 STRA,r0 abs,x-      ;x--; *(abs + x) = r0;                    ;4,3
 STRA,rn *abs        ;*(*(abs)) = rn;                           ;6,3
+STRA,r0 *abs,x      ;*(*(abs) + x) = r0;                       ;6,3
+STRA,r0 *abs,x+     ;x++; *(*(abs) + x) = r0;                  ;6,3
+STRA,r0 *abs,x-     ;x--; *(*(abs) + x) = r0;                  ;6,3
 STRZ,rn             ;rn = r0;   (source is ALWAYS r0)          ;2,1
 ; NOTE: STRZ,R0 is NOT valid — encodes as NOP ($C0). Assembler warns.
 ```
@@ -203,8 +248,13 @@ STRZ,rn             ;rn = r0;   (source is ALWAYS r0)          ;2,1
 COMA,rn abs         ;rn : *(abs) -> sets CC;                   ;4,3
 COMI,rn imm         ;rn : imm   -> sets CC;                    ;2,2
 COMR,rn rel         ;rn : *(rel) -> sets CC;                   ;3,2
+COMR,rn *rel        ;rn : *(*(rel)) -> sets CC;                ;5,2
 COMZ,rn             ;r0 : rn    -> sets CC;                    ;2,1
 COMA,r0 abs,x       ;r0 : *(abs+x) -> sets CC;                 ;4,3
+COMA,rn *abs        ;rn : *(*(abs)) -> sets CC;                ;6,3
+COMA,r0 *abs,x      ;r0 : *(*(abs)+x) -> sets CC;              ;6,3
+COMA,r0 *abs,x+     ;x++; r0 : *(*(abs)+x) -> sets CC;         ;6,3
+COMA,r0 *abs,x-     ;x--; r0 : *(*(abs)+x) -> sets CC;         ;6,3
 ```
 COM uses signed comparison by default (PSL COM=0). Set COM=1 via `PPSL $02` for unsigned.
 
@@ -234,16 +284,16 @@ RETC,cond           ;if(cond) PC = pop();                      ;3,1
 RETE,cond           ;if(cond) { PC = pop(); enable ints; }     ;3,1
 ```
 
-### **Zero-Page Branches** *(target must be within $0000-$003F)*
+### **Zero-Page Branches** *(signed 7-bit zero-relative target: $0000-$007F, wrapping to $1F80-$1FFF)*
 ```asm
 ZBRR    offset      ;PC = page_base +/- sign_extend_7bit (offset))          ;2,2
-ZBRR    *offset     ;PC = *(page_base +/- sign_extend_7bit (offset))          ;2,2
+ZBRR    *offset     ;PC = *(page_base +/- sign_extend_7bit (offset))          ;5,2
 ZBSR    offset      ;push(PC); PC = page_base +/- sign_extend_7bit(offset) ;3,2
-ZBSR    *offset     ;push(PC); PC = *(page_base +/- sign_extend_7bit(offset)) ;3,2
+ZBSR    *offset     ;push(PC); PC = *(page_base +/- sign_extend_7bit(offset)) ;5,2
 ```
-* Offset is a signed 7-bit value: range -64 to +63 with address MOD 8192. For
-example, ZBRR -8 will develop an effective address of 8184, and ZBRR +52
-will develop an effective address of 52.
+* Offset is a signed 7-bit value: range -64 to +63, resolved from zero within the
+current 8K space (`relative_2650[offset] & NONPAGE`). For example, ZBRR -8
+develops effective address 8184 ($1FF8), and ZBRR +52 develops address 52 ($0034).
 * Under PIPBUG, $0000-$03FF is ROM — no user-placed stubs possible. ZBSR/ZBRR are standalone use only (Phase 2).
 
 ### **Indexed Branch**
@@ -263,6 +313,7 @@ These instructions branch based on a register value. They are **not** based on t
 ### **BRNR / BRNA — Branch if Register Non-Zero**
 ```asm
 BRNR,rn rel         ;if (rn != 0) PC += rel;                   ;3,2
+BRNR,rn *rel        ;if (rn != 0) PC = *(rel);                 ;5,2
 BRNA,rn abs         ;if (rn != 0) PC = abs;                    ;3,3
 BRNA,rn *abs        ;if (rn != 0) PC = *(abs);                 ;5,3
 ```
@@ -281,6 +332,7 @@ Compare: `SUBI,R1 1 / BCFA,EQ LOOP` = 5 bytes. BRNR saves 1 byte per loop-close.
 ### **BIRR / BIRA — Branch and Increment Register**
 ```asm
 BIRR,rn rel         ;rn++; if (rn != 0) PC += rel;             ;3,2
+BIRR,rn *rel        ;rn++; if (rn != 0) PC = *(rel);           ;5,2
 BIRA,rn abs         ;rn++; if (rn != 0) PC = abs;              ;3,3
 BIRA,rn *abs        ;rn++; if (rn != 0) PC = *abs;             ;5,3
 ```
@@ -294,18 +346,19 @@ LOOP:
 
 ### **BDRR / BDRA — Branch and Decrement Register** *(used by PIPBUG delays)*
 ```asm
-BDRR,rn rel         ;rn--; if (rn >= 0) PC += rel;             ;3,2
-BDRA,rn abs         ;rn--; if (rn >= 0) PC = abs;              ;3,3
-BDRA,rn *abs        ;rn--; if (rn >= 0) PC = *abs;             ;5,3
+BDRR,rn rel         ;rn--; if (rn != 0) PC += rel;             ;3,2
+BDRR,rn *rel        ;rn--; if (rn != 0) PC = *(rel);           ;5,2
+BDRA,rn abs         ;rn--; if (rn != 0) PC = abs;              ;3,3
+BDRA,rn *abs        ;rn--; if (rn != 0) PC = *abs;             ;5,3
 ```
-Register IS decremented before SIGNED test. Loop exits when `rn` underflows to $FF (-1 signed).
+Register IS decremented before test. Branch is taken while result is non-zero.
 This is the most compact loop instruction — just 2 bytes, decrement is free:
 ```asm
-        LODI,R1 4       ; will take 5 iterations: 4->3->2->1->0->FF(exits)
+        LODI,R1 5       ; will take 5 iterations: 5->4->3->2->1->0(exits)
 LOOP:
         ; body
-        BDRR,R1 LOOP    ; R1--, branch if R1 >= 0 signed (2 bytes per loop-close)
-; After loop: R1 = $FF (-1). If you need R1=0 after, add LODI,R1 0.
+        BDRR,R1 LOOP    ; R1--, branch if R1 != 0 (2 bytes per loop-close)
+; After loop: R1 = $00.
 ```
 PIPBUG uses `BDRR,R0 $` (self-branch) as a single-instruction counted delay.
 
@@ -314,11 +367,12 @@ PIPBUG uses `BDRR,R0 $` (self-branch) as a single-instruction counted delay.
 |---|---|---|---|
 | BRNR/BRNA | No  | rn != 0 | rn == 0 (you decrement) |
 | BIRR/BIRA | Yes (++) | rn != 0 after inc | rn wraps $FF→$00 |
-| BDRR/BDRA | Yes (--) | rn >= 0 signed | rn wraps $00→$FF |
+| BDRR/BDRA | Yes (--) | rn != 0 after dec | rn decrements to $00 |
 
 ### **BSNR / BSNA — Branch to Subroutine if Register Non-Zero**
 ```asm
 BSNR,rn rel         ;if (rn != 0) { push(PC); PC += rel; }     ;3,2
+BSNR,rn *rel        ;if (rn != 0) { push(PC); PC = *(rel); }   ;5,2
 BSNA,rn abs         ;if (rn != 0) { push(PC); PC = abs; }      ;3,3
 BSNA,rn *abs        ;if (rn != 0) { push(PC); PC = *abs; }     ;5,3
 ```
