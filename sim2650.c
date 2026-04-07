@@ -17,6 +17,16 @@
  *                        · Entry default $0440 (after Pipbug 1kB+64B)
  *                        · Intercept COUT=$02B4  CHIN=$0286  CRLF=$008A
  *
+ * Changes v1.10 -> v1.11:
+ *   BUG-SIM-13 FIXED: Relative effective addresses were allowed to cross 8K
+ *     page boundaries. 2650 relative mode wraps within current page.
+ *   BUG-SIM-14 FIXED: Non-branch absolute addressing (mode 3 ALU/STR) now
+ *     uses current page base (m_page + 13-bit offset), matching 2650 core.
+ *   BUG-SIM-15 FIXED: Indirect pointer fetch now wraps second byte at page
+ *     end (xxxx1FFF -> xxxx0000) instead of crossing to next page.
+ *   BUG-SIM-16 FIXED: DAR semantics aligned to reference core:
+ *     add $A0 when C=0 and add $0A when IDC=0; DAR no longer updates CC.
+ *
  * Changes v1.9 -> v1.10:
  *   BUG-SIM-12 FIXED: BRNR/BRNA incorrectly decremented Rn before test.
  *     Per 2650 manual: BRNR tests Rn != 0 with NO side effect on Rn.
@@ -63,7 +73,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#define SIM_VER   "1.10"
+#define SIM_VER   "1.11"
 #define MEM_SIZE  0x8000
 
 /* Default (non-Pipbug) memory map — a generic 2650 board */
@@ -244,7 +254,7 @@ static unsigned short fetch_abs_nb(int *ind, int *idx) {
     unsigned char b1 = fetch(), b2 = fetch();
     *ind = (b1 & 0x80) ? 1 : 0;
     *idx = (b1 >> 5) & 3;
-    return (unsigned short)(((b1 & 0x1F) << 8) | b2);
+    return (unsigned short)(((b1 & 0x1F) << 8) | b2); /* 13-bit in-page offset */
 }
 static unsigned short fetch_abs_br(int *ind) {
     unsigned char b1 = fetch(), b2 = fetch();
@@ -253,7 +263,10 @@ static unsigned short fetch_abs_br(int *ind) {
 }
 static unsigned short resolve(unsigned short base, int ind) {
     if (!ind) return base;
-    return (unsigned short)(((mrd(base) & 0x7F) << 8) | mrd((base+1) & 0x7FFF));
+    unsigned short hi_addr = base & 0x7FFF;
+    unsigned short lo_addr = (unsigned short)((hi_addr + 1) & 0x7FFF);
+    if ((hi_addr & 0x1FFF) == 0x1FFF) lo_addr = hi_addr & 0x6000; /* wrap in page */
+    return (unsigned short)(((mrd(hi_addr) & 0x7F) << 8) | mrd(lo_addr));
 }
 
 /* --- ALU ------------------------------------------------------------------- */
@@ -286,6 +299,7 @@ static unsigned char alu_sub(unsigned char a, unsigned char b, int wb) {
 /* --- Execute --------------------------------------------------------------- */
 static void execute(void) {
     unsigned short op_pc = cpu.IAR;
+    unsigned short page = op_pc & 0x6000;
 
     /* PIPBUG intercepts (before opcode fetch so we don't consume ROM bytes) */
     if (use_pipbug) {
@@ -331,9 +345,9 @@ static void execute(void) {
     /* DAR */
     if (op>=0x94&&op<=0x97){
         unsigned char r=R(rn);
-        if((r&0x0F)>9||(cpu.PSL&PSL_IDC)) r+=6;
-        if((r>>4)>9||(cpu.PSL&PSL_C)) r+=0x60;
-        R(rn)=r; set_cc(r); return;
+        if(!(cpu.PSL & PSL_C))   r = (unsigned char)(r + 0xA0);
+        if(!(cpu.PSL & PSL_IDC)) r = (unsigned char)(r + 0x0A);
+        R(rn)=r; return; /* DAR does not update CC in reference core */
     }
 
     /* TMI */
@@ -399,9 +413,9 @@ static void execute(void) {
         { io_out(R(rn)); set_cc(R(rn)); return; }
 
     /* Branches */
-#define BR_BODY_R(cond_expr) do{ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); if(cond_expr)cpu.IAR=t; }while(0)
+#define BR_BODY_R(cond_expr) do{ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF)); if(ind)t=resolve(t,1); if(cond_expr)cpu.IAR=t; }while(0)
 #define BR_BODY_A(cond_expr) do{ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); if(cond_expr)cpu.IAR=t; }while(0)
-#define BS_BODY_R(cond_expr) do{ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); if(cond_expr){push_ras(cpu.IAR);cpu.IAR=t;} }while(0)
+#define BS_BODY_R(cond_expr) do{ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF)); if(ind)t=resolve(t,1); if(cond_expr){push_ras(cpu.IAR);cpu.IAR=t;} }while(0)
 #define BS_BODY_A(cond_expr) do{ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); if(cond_expr){push_ras(cpu.IAR);cpu.IAR=t;} }while(0)
 
     if(op>=0x18&&op<=0x1B){ BR_BODY_R( test_cc(op&3)); return; } /* BCTR */
@@ -416,7 +430,7 @@ static void execute(void) {
     /* BSNR/BSNA — branch to subroutine if register != 0 */
     if(op>=0x78&&op<=0x7B){
         int ind,off=fetch_rel(&ind);
-        unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF;
+        unsigned short t=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF));
         if(ind) t=resolve(t,1);
         if(R(rn)!=0){ push_ras(cpu.IAR); cpu.IAR=t; }
         return;
@@ -433,15 +447,15 @@ static void execute(void) {
      * The register is tested but NOT decremented. BRNR is a pure conditional
      * branch on register value. Must be paired with a separate SUBI/SUBZ to
      * use as a counted loop. Contrast with BDRR (decrement IS built in). */
-    if(op>=0x58&&op<=0x5B){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); if(R(rn)!=0)cpu.IAR=t; return; }
+    if(op>=0x58&&op<=0x5B){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF)); if(ind)t=resolve(t,1); if(R(rn)!=0)cpu.IAR=t; return; }
     if(op>=0x5C&&op<=0x5F){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); if(R(rn)!=0)cpu.IAR=t; return; }
 
     /* BIRR/BIRA — increment, branch if != 0 */
-    if(op>=0xD8&&op<=0xDB){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); R(rn)++; if(R(rn)!=0){cpu.IAR=t;} return; }
+    if(op>=0xD8&&op<=0xDB){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF)); if(ind)t=resolve(t,1); R(rn)++; if(R(rn)!=0){cpu.IAR=t;} return; }
     if(op>=0xDC&&op<=0xDF){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); R(rn)++; if(R(rn)!=0)cpu.IAR=t; return; }
 
     /* BDRR/BDRA — decrement, branch if != 0 */
-    if(op>=0xF8&&op<=0xFB){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(cpu.IAR+off)&0x7FFF; if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0){cpu.IAR=t;} return; }
+    if(op>=0xF8&&op<=0xFB){ int ind,off=fetch_rel(&ind); unsigned short t=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF)); if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0){cpu.IAR=t;} return; }
     if(op>=0xFC){ int ind; unsigned short t=fetch_abs_br(&ind); if(ind)t=resolve(t,1); R(rn)--; if(R(rn)!=0)cpu.IAR=t; return; }
 
     /* BXA/BSXA */
@@ -468,9 +482,9 @@ static void execute(void) {
             switch(mode) {
                 case 0: cpu.R[ri(rn)]=cpu.R[ri(0)]; return;       /* STRZ */
                 case 1: fetch(); return;                            /* invalid — consume byte so PC stays correct */
-                case 2: { int off=fetch_rel(&ind); eff=(unsigned short)(cpu.IAR+off)&0x7FFF;
+                case 2: { int off=fetch_rel(&ind); eff=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF));
                           if(ind){eff=resolve(eff,1);} mwr(eff,R(rn)); return; }
-                case 3: { eff=fetch_abs_nb(&ind,&idx); if(ind)eff=resolve(eff,1);
+                case 3: { eff=(unsigned short)(page | fetch_abs_nb(&ind,&idx)); if(ind)eff=resolve(eff,1);
                           if(idx==1){R(rn)++;eff=(eff+R(rn))&0x7FFF;}
                           else if(idx==2){R(rn)--;eff=(eff+R(rn))&0x7FFF;}
                           else if(idx==3){eff=(eff+R(rn))&0x7FFF;}
@@ -482,9 +496,9 @@ static void execute(void) {
         switch(mode) {
             case 0: operand=R(rn); break;
             case 1: operand=fetch(); break;
-            case 2: { int off=fetch_rel(&ind); eff=(unsigned short)(cpu.IAR+off)&0x7FFF;
+            case 2: { int off=fetch_rel(&ind); eff=(unsigned short)(page | ((cpu.IAR+off)&0x1FFF));
                       if(ind){eff=resolve(eff,1);} operand=mrd(eff); break; }
-            case 3: { eff=fetch_abs_nb(&ind,&idx); if(ind)eff=resolve(eff,1);
+            case 3: { eff=(unsigned short)(page | fetch_abs_nb(&ind,&idx)); if(ind)eff=resolve(eff,1);
                       if(idx==1){R(rn)++;eff=(eff+R(rn))&0x7FFF;}
                       else if(idx==2){R(rn)--;eff=(eff+R(rn))&0x7FFF;}
                       else if(idx==3){eff=(eff+R(rn))&0x7FFF;}
