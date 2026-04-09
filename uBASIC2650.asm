@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.11 - BUG-SCA-12: *SWSTK→SWSTK in DO_RUN; BUG-SCA-13: inline labels split
+; Version: v1.12 - BUG-SCA-14: All carry-skip GT branches replaced with TPSL $01/BCTA,LT (18 sites)
 ;
 ; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
@@ -1077,7 +1077,8 @@ SL_SNBR:
         LODA,R0 LNUML
         ADDA,R0 SC1
         STRA,R0 GOTOL
-        BCTA,GT SL_DSNCA        ; GT = no carry from low-byte add (CC still valid)
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTA,LT SL_DSNCA         ; branch if C=0 (no carry)
         LODA,R0 LNUMH           ; carry path: hi += 1
         ADDI,R0 1
         STRA,R0 GOTOH
@@ -1156,7 +1157,8 @@ SL_WDONE:
         LODA,R0 PEL
         ADDA,R0 SC1
         STRA,R0 PEL
-        BCTR,GT SL_PENC
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTR,LT SL_PENC          ; branch if C=0 (no carry)
         LODA,R0 PEH
         ADDI,R0 1
         STRA,R0 PEH
@@ -1179,7 +1181,8 @@ DL2_FOUND:
         LODA,R0 TMPL
         ADDI,R0 2
         STRA,R0 TMPL
-        BCTR,GT DL2_BLN
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTR,LT DL2_BLN          ; branch if C=0 (no carry)
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
@@ -1258,7 +1261,8 @@ FL_CHK:
         ADDI,R0 1
         STRA,R0 EXPL
         LODA,R0 TMPH
-        BCTR,GT FL_LH
+        TPSL $01                 ; BUG-SCA-14 FIX: LODA clobbered CC; test C bit
+        BCTR,LT FL_LH            ; branch if C=0 (no carry from TMPL+1)
         ADDI,R0 1
 FL_LH:
         STRA,R0 EXPH                     ; EXPH:EXPL = lo byte address
@@ -1274,7 +1278,8 @@ FL_ADV:
         LODA,R0 TMPL
         ADDI,R0 2
         STRA,R0 TMPL
-        BCTR,GT FL_AN
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTR,LT FL_AN            ; branch if C=0 (no carry)
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
@@ -1322,7 +1327,8 @@ FI_CHK:
         ADDI,R0 1
         STRA,R0 EXPL
         LODA,R0 TMPH
-        BCTR,GT FI_LH
+        TPSL $01                 ; BUG-SCA-14 FIX: LODA clobbered CC; test C bit
+        BCTR,LT FI_LH            ; branch if C=0 (no carry from TMPL+1)
         ADDI,R0 1
 FI_LH:
         STRA,R0 EXPH
@@ -1334,7 +1340,8 @@ FI_ADV:
         LODA,R0 TMPL
         ADDI,R0 2
         STRA,R0 TMPL
-        BCTR,GT FI_AN
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTR,LT FI_AN            ; branch if C=0 (no carry)
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
@@ -1678,7 +1685,8 @@ AO_ADD:
         LODA,R0 SC1
         ADDA,R0 EXPL
         STRA,R0 EXPL
-        BCTA,GT AO_ADDNC
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTA,LT AO_ADDNC         ; branch if C=0 (no carry)
         LODA,R0 NEGFLG
         ADDI,R0 1
         BCTA,UN AO_ADDHI
@@ -1957,7 +1965,8 @@ PU16_M10:
         LODA,R0 EXPL
         ADDA,R0 TMPL
         STRA,R0 EXPL
-        BCTA,GT PU16_MNC
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTA,LT PU16_MNC         ; branch if C=0 (no carry)
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
@@ -1970,7 +1979,8 @@ PU16_MNC:
         LODA,R0 EXPL
         ADDA,R0 SC0
         STRA,R0 EXPL
-        BCTA,GT PU16_DIG_NC
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTA,LT PU16_DIG_NC      ; branch if C=0 (no carry)
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
@@ -1999,7 +2009,8 @@ MUL16:
         LODA,R0 TMPL
         ADDI,R0 1
         STRA,R0 TMPL
-        BCTA,GT MU_LNC
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
+        BCTA,LT MU_LNC           ; branch if C=0 (no carry)
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
@@ -2025,7 +2036,8 @@ MU_LA:
         ; whose +1 does not carry to hi byte, e.g. -3→$FFFD, abs=$0003) NEGFLG was
         ; never toggled → wrong sign (3*-3=+9 not -9). Fix: introduce MU_RA_NC so
         ; no-carry path skips only the hi-byte increment, then BOTH paths toggle.
-        BCTA,GT MU_RA_NC        ; GT = no carry from lo-byte +1: skip hi increment
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
+        BCTA,LT MU_RA_NC         ; branch if C=0 (no carry): skip hi increment
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
@@ -2053,7 +2065,8 @@ MU_ADD:
         LODA,R0 EXPL
         ADDA,R0 SC1
         STRA,R0 EXPL
-        BCTA,GT MU_MNC
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        BCTA,LT MU_MNC           ; branch if C=0 (no carry)
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
@@ -2115,7 +2128,8 @@ DV_NZ:
         LODA,R0 TMPL
         ADDI,R0 1
         STRA,R0 TMPL
-        BCTA,GT DV_DNC
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
+        BCTA,LT DV_DNC           ; branch if C=0 (no carry)
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
@@ -2139,7 +2153,8 @@ DV_DA:
         ; BUG-SCA-09b FIX: same as MUL16 right-operand fix. BCTA,GT DV_VA jumped
         ; over BOTH hi-byte increment AND NEGFLG toggle for no-carry cases.
         ; Fix: introduce DV_VA_NC so no-carry skips only the hi-byte increment.
-        BCTA,GT DV_VA_NC        ; GT = no carry: skip hi increment
+        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
+        BCTA,LT DV_VA_NC         ; branch if C=0 (no carry): skip hi increment
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
@@ -2458,7 +2473,7 @@ EW_ADV:
 ; DEC_TMP : TMPH:TMPL -= 1  (clobbers R0)
 ; Rule: NO BSTA inside these — must not consume extra RAS depth.
 ; Carry idiom: ADDI sets no-carry->GT, carry->EQ/LT.
-;   BCTA,GT skip  =  skip hi-byte increment if no carry from lo-byte add.
+;   BCTA,LT skip = branch on no-carry (C=0). BCFA,LT skip = branch on no-borrow (C=1).
 ; Borrow idiom: SUBI sets no-borrow->GT/EQ, borrow->LT.
 ;   BCFA,LT skip  =  skip hi-byte decrement if no borrow (C=1).
 
@@ -2467,7 +2482,8 @@ INC_IP:
         ADDI,R0 1
         STRA,R0 IPL
         ;BCTA,GT INC_IP_RET      ; no carry — hi byte unchanged
-        RETC,GT
+        TPSL $01                 ; BUG-SCA-14 FIX: test carry bit directly
+        RETC,LT                  ; return if C=0 (no carry) — result sign unreliable
         LODA,R0 IPH
         ADDI,R0 1
         STRA,R0 IPH
@@ -2479,7 +2495,8 @@ INC_TMP:
         ADDI,R0 1
         STRA,R0 TMPL
         ;BCTA,GT INC_TMP_RET     ; no carry
-        RETC,GT
+        TPSL $01                 ; BUG-SCA-14 FIX: test carry bit directly
+        RETC,LT                  ; return if C=0 (no carry)
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
@@ -2491,7 +2508,8 @@ INC_EXP:
         ADDI,R0 1
         STRA,R0 EXPL
         ;BCTA,GT INC_EXP_RET     ; no carry
-        RETC,GT
+        TPSL $01                 ; BUG-SCA-14 FIX: test carry bit directly
+        RETC,LT                  ; return if C=0 (no carry)
         LODA,R0 EXPH
         ADDI,R0 1
         STRA,R0 EXPH
