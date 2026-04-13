@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.12 - BUG-SCA-14: All carry-skip GT branches replaced with TPSL $01/BCTA,LT (18 sites)
+; Version: v1.14 - BUG-T6: DIF_LS saves left in LNUMH:LNUML; fix comparison sense (right>left→SC1=$FF for CLT)
 ;
 ; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
@@ -370,14 +370,12 @@ SE_SCAN:
         ; value not carry. New code: test CC from ADDI before STRA.
         LODA,R0 TMPL
         ADDI,R0 3
-        BCTR,GT SE_SC_NC        ; GT = no carry
         STRA,R0 TMPL
+        TPSL $01                 ; BUG-SCA-14b FIX: carry from ADDI,R0 3
+        BCTA,LT SE_SCAN          ; C=0 = no carry, hi byte unchanged
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
-        BCTA,UN SE_SCAN
-SE_SC_NC:
-        STRA,R0 TMPL
         BCTA,UN SE_SCAN
 SE_CHK2:
         ; advance to c2
@@ -389,14 +387,12 @@ SE_C2N:
         ; c2 mismatch: ISSUE-04 FIX: advance 2 more bytes with correct carry check.
         LODA,R0 TMPL
         ADDI,R0 2
-        BCTR,GT SE_C2_NC        ; GT = no carry
         STRA,R0 TMPL
+        TPSL $01                 ; BUG-SCA-14b FIX: carry from ADDI,R0 2
+        BCTA,LT SE_SCAN          ; C=0 = no carry, hi byte unchanged
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
-        BCTA,UN SE_SCAN
-SE_C2_NC:
-        STRA,R0 TMPL
         BCTA,UN SE_SCAN
 SE_MATCH:
         ; advance to token byte
@@ -620,9 +616,9 @@ DO_IF:
         BCTA,UN DO_ERROR
 DIF_LS:
         LODA,R0 EXPH
-        STRA,R0 TMPH  ; save left in TMPH:TMPL
-        LODA,R0 EXPL
-        STRA,R0 TMPL
+        STRA,R0 LNUMH  ; BUG-T6 FIX: save left in LNUMH:LNUML (TMPH:TMPL clobbered
+        LODA,R0 EXPL   ;   by PARSE_EXPR's PX_PUSHV writing <VALSH/$15 to TMPH)
+        STRA,R0 LNUML
         BSTA,UN PARSE_RELOP              ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
@@ -637,9 +633,9 @@ DIF_RP:
         EORZ,R0 ; Clear 
         BCTA,UN DO_ERROR
 DIF_EVAL:
-        ; signed 16-bit compare: TMPH:TMPL (left) vs EXPH:EXPL (right)
+        ; signed 16-bit compare: LNUMH:LNUML (left) vs EXPH:EXPL (right)
         ; bias hi bytes by XOR $80 → unsigned compare
-        LODA,R0 TMPH
+        LODA,R0 LNUMH
         EORI,R0 $80
         STRA,R0 SC0
         LODA,R0 EXPH
@@ -649,19 +645,19 @@ DIF_EVAL:
         BCTR,GT DIF_GT
         ; hi bytes equal: compare lo (unsigned)
         LODA,R0 EXPL
-        SUBA,R0 TMPL
+        SUBA,R0 LNUML
         BCTR,LT DIF_LT
         BCTR,GT DIF_GT
         EORZ,R0 ; Clear R0
         STRA,R0 SC1
         BCTR,UN DIF_TH  ; EQ
 DIF_LT:
-        LODI,R0 $FF
+        LODI,R0 $01          ; right-hi < left-hi: left > right → SC1=$01
         STRA,R0 SC1
-        BCTA,UN DIF_TH  ; LT
+        BCTA,UN DIF_TH  ; LT (result: left > right)
 DIF_GT:
-        EORZ,R0 ; Clear R0
-        STRA,R0 SC1  ; GT
+        LODI,R0 $FF          ; right-hi > left-hi: left < right → SC1=$FF
+        STRA,R0 SC1  ; GT (result: left < right)
 
 DIF_TH:
         ; consume THEN keyword: expect T then H then EATWORD
@@ -680,7 +676,7 @@ DIF_TH2:
 DIF_EW:
         BSTA,UN EATWORD                  ; [+1]
 
-        ; test condition using SC1 ($FF=LT $00=EQ $01=GT) vs RELOP
+        ; test condition using SC1 ($FF=left<right, $00=EQ, $01=left>right) vs RELOP
         LODA,R0 RELOP
         COMI,R0 1
         BCTR,EQ DIF_CEQ  ; =
