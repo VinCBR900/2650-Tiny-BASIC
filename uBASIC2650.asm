@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.14 - BUG-T6: DIF_LS saves left in LNUMH:LNUML; fix comparison sense (right>left→SC1=$FF for CLT)
+; Version: v1.15 - CHR$(), PRINT semicolons, modulo %, nested IF; RAS fix (PARSE_U16 WSKIP removed)
 ;
 ; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.  Variables pinned at $1500 (ORG).  Program store $15B8+.
@@ -221,39 +221,39 @@ CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 
 ; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
 ; BUG-ASM-10 FIX: Addres $1500 pins variables regardless of code growth.
-; Code ceiling: ~$14FF (code must not reach $1500 or assembler will error).
-; Variables: $1500-$15B8 (185 bytes). Program store: $15B9-$1BFF (1607 bytes).
-IPH     EQU $1500   ; interpreter pointer hi
-IPL     EQU $1501   ; interpreter pointer lo
-PEH     EQU $1502   ; program end pointer hi
-PEL     EQU $1503   ; program end pointer lo
-RUNFLG  EQU $1504   ; $01=running $00=immediate
-GOTOFLG EQU $1505   ; $01=GOTO/GOSUB pending
-GOTOH   EQU $1506   ; pending target line hi
-GOTOL   EQU $1507   ; pending target line lo
-CURH    EQU $1508   ; current line hi  (error reporting)
-CURL    EQU $1509   ; current line lo
-LNUMH   EQU $150A   ; scratch line number hi
-LNUML   EQU $150B   ; scratch line number lo
-SC0     EQU $150C   ; scratch byte 0
-SC1     EQU $150D   ; scratch byte 1
-ERRFLG  EQU $150E   ; error flag $00=ok $01=error/handled
-NEGFLG  EQU $150F   ; sign / CHR$ flag
-EXPH    EQU $1510   ; expression result hi
-EXPL    EQU $1511   ; expression result lo
-TMPH    EQU $1512   ; temp 16-bit hi
-TMPL    EQU $1513   ; temp 16-bit lo
-OPSTK   EQU $1514   ; operator stack [8]  $1514-$151B
-VALSH   EQU $151C   ; value stack hi  [8]  $151C-$1523
-VALSL   EQU $1524   ; value stack lo  [8]  $1524-$152B
-STKIDX  EQU $152C   ; parser stack top ($FF=empty)
-SWSP    EQU $152D   ; SW call stack pointer ($FF=empty)
-SWSTK   EQU $152E   ; SW call stack 8×2 bytes  $152E-$153D
-RELOP   EQU $153E   ; relational op 1-6
-IBUF    EQU $1544   ; input buffer 64 bytes  $1544-$1583
-VARS    EQU $1584   ; A-Z variables 2 bytes each  $1584-$15B7
-PROG    EQU $15B8   ; program store base
-PROGLIM EQU $1c00   ; one past end of program store
+; Code ceiling: ~$14FF (code must not reach $1600 or assembler will error).
+; Variables: $1600-$16B8 (185 bytes). Program store: $16B9
+IPH     EQU $1600   ; interpreter pointer hi
+IPL     EQU $1601   ; interpreter pointer lo
+PEH     EQU $1602   ; program end pointer hi
+PEL     EQU $1603   ; program end pointer lo
+RUNFLG  EQU $1604   ; $01=running $00=immediate
+GOTOFLG EQU $1605   ; $01=GOTO/GOSUB pending
+GOTOH   EQU $1606   ; pending target line hi
+GOTOL   EQU $1607   ; pending target line lo
+CURH    EQU $1608   ; current line hi  (error reporting)
+CURL    EQU $1609   ; current line lo
+LNUMH   EQU $160A   ; scratch line number hi
+LNUML   EQU $160B   ; scratch line number lo
+SC0     EQU $160C   ; scratch byte 0
+SC1     EQU $160D   ; scratch byte 1
+ERRFLG  EQU $160E   ; error flag $00=ok $01=error/handled
+NEGFLG  EQU $160F   ; sign / CHR$ flag
+EXPH    EQU $1610   ; expression result hi
+EXPL    EQU $1611   ; expression result lo
+TMPH    EQU $1612   ; temp 16-bit hi
+TMPL    EQU $1613   ; temp 16-bit lo
+OPSTK   EQU $1614   ; operator stack [8]  $1514-$151B
+VALSH   EQU $161C   ; value stack hi  [8]  $151C-$1523
+VALSL   EQU $1624   ; value stack lo  [8]  $1524-$152B
+STKIDX  EQU $162C   ; parser stack top ($FF=empty)
+SWSP    EQU $162D   ; SW call stack pointer ($FF=empty)
+SWSTK   EQU $162E   ; SW call stack 8×2 bytes  $152E-$153D
+RELOP   EQU $163E   ; relational op 1-6
+IBUF    EQU $1644   ; input buffer 64 bytes  $1544-$1583
+VARS    EQU $1684   ; A-Z variables 2 bytes each  $1584-$15B7
+PROG    EQU $16B8   ; program store base
+PROGLIM EQU $1d00   ; one past end of program store
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
         ORG     $0440
@@ -497,15 +497,25 @@ DP_SDONE:
 DP_SEP:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
+        COMI,R0 A';'
+        BCTR,EQ DP_SEMI  ; semicolon → no space, continue or end without CRLF
         COMI,R0 A','
         BCTR,EQ DP_COMMA
-        BCTR,UN DP_NL
-DP_COMMA:
-        BSTA,UN INC_IP
-        BCTA,UN DP_ITEM
+        ; fall through to DP_NL (NUL, or any non-separator = end of PRINT)
 DP_NL:
         BSTA,UN CRLF
         RETC,UN
+DP_SEMI:
+        BSTA,UN INC_IP                   ; consume ';'
+DP_SEMI2:
+        BSTA,UN WSKIP                    ; [+1]
+        LODA,R0 *IPH
+        COMI,R0 NUL
+        RETC,EQ                          ; trailing ";" → no CRLF, done
+        BCTA,UN DP_ITEM                  ; more items follow
+DP_COMMA:
+        BSTA,UN INC_IP
+        BCTA,UN DP_ITEM
 
 ; ─── DO_LET / shared store path ───────────────────────────────────────────────
 ; DO_INPUT jumps to DL_STORE with SC0 = variable letter already set.
@@ -734,6 +744,7 @@ DIF_FALSE:
 
 ; ─── DO_GOTO ──────────────────────────────────────────────────────────────────
 DO_GOTO:
+        BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
         BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
@@ -940,6 +951,7 @@ TRY_STORE_LINE:
 TSL_RET:
         RETC,UN
 TSL_NUM:
+        BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
         BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
@@ -1599,6 +1611,8 @@ GET_PREC_SC0:
         BCTA,EQ GP_HIGH
         COMI,R0 A'/'
         BCTA,EQ GP_HIGH
+        COMI,R0 A'%'
+        BCTA,EQ GP_HIGH
         EORZ,R0 ; Clear 
         RETC,UN
 GP_LOW:  
@@ -1674,6 +1688,8 @@ AO_LLN:
         BCTA,EQ AO_MUL
         COMI,R0 A'/'
         BCTA,EQ AO_DIV
+        COMI,R0 A'%'
+        BCTA,EQ AO_MOD
         RETC,UN
 
 AO_ADD:
@@ -1727,6 +1743,24 @@ AO_DIV:
         ; ERRFLG=$01 on /0 — DO_ERROR called inside DIV16
         BCTA,UN AO_STORE
 
+AO_MOD:
+        ; Modulo: left % right = left - (left/right)*right
+        ; DIV16 leaves remainder in TMPH:TMPL (dividend after subtraction loop)
+        ; We call DIV16 and use TMPH:TMPL as result.
+        ; left=NEGFLG:SC1, right=EXPH:EXPL
+        LODA,R0 NEGFLG
+        STRA,R0 TMPH
+        LODA,R0 SC1
+        STRA,R0 TMPL
+        BSTA,UN DIV16                    ; [+1] quotient→EXPH:EXPL, remainder→TMPH:TMPL
+        ; DIV16 on /0 jumps to DO_ERROR directly
+        ; Remainder in TMPH:TMPL — copy to EXPH:EXPL for AO_STORE
+        LODA,R0 TMPH
+        STRA,R0 EXPH
+        LODA,R0 TMPL
+        STRA,R0 EXPL
+        BCTA,UN AO_STORE
+
 AO_STORE:
         ; write EXPH:EXPL to VALSH/VALSL[STKIDX-1]; STKIDX--
         LODA,R0 STKIDX
@@ -1767,7 +1801,15 @@ PARSE_FACTOR:
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG  ; clear CHR$ flag
         LODA,R0 *IPH
-        BSTA,UN UPCASE  ; [+1]
+        ; RAS-FIX: inline UPCASE here instead of BSTA UPCASE (+1 slot).
+        ; Saves 1 RAS slot so CHR$(expr) path stays within 7 levels.
+        ; Equivalent to: if(r0>='a' && r0<='z') r0-=32
+        COMI,R0 A'a'
+        BCTR,LT PF_UC_DONE       ; < 'a' → already uppercase or not alpha
+        COMI,R0 A'z'+1
+        BCTR,GT PF_UC_DONE       ; > 'z' → not lowercase
+        SUBI,R0 32               ; convert to uppercase
+PF_UC_DONE:
 
         ; check for variable A-Z
         COMI,R0 A'A'
@@ -1781,7 +1823,11 @@ PF_NUM:
         RETC,UN
 
 PF_LOADVAR:
-        ; load variable value from VARS
+        ; load variable value from VARS — but first check for CHR$()
+        ; R0 already has the uppercased first char. If 'C', may be CHR$
+        COMI,R0 A'C'
+        BCTR,EQ PF_CHR_TRY
+PF_VAR:
         ; BUG-BASIC-03 FIX: save letter to SC0 BEFORE INC_IP clobbers R0.
         STRA,R0 SC0              ; save variable letter (A-Z)
         BSTA,UN INC_IP
@@ -1807,6 +1853,68 @@ PF_LVN2:
         LODA,R0 *TMPH
         STRA,R0 EXPL
         EORZ,R0 ; Clear R0
+        STRA,R0 ERRFLG
+        RETC,UN
+
+; ─── CHR$(n) detection ────────────────────────────────────────────────────────
+; Entry: R0=A'C', IP at 'C'. Check next chars are H, R, $, (
+; If yes: consume "CHR$(", parse expr, set NEGFLG=$01 (char output flag).
+; If no:  fall through to normal variable load of C.
+;
+; Input : R0=A'C', *IPH=A'C'
+; Output: EXPH:EXPL=char value, NEGFLG=$01, ERRFLG=$00
+; Clobbers: R0, TMPH:TMPL, SC0, SC1
+PF_CHR_TRY:
+        BSTA,UN INC_IP           ; consume 'C'
+PF_CHRT1:
+        ; NB: stored program text is always uppercase (RDLINE uppercases on store)
+        ; so we can compare directly without calling UPCASE here.
+        LODA,R0 *IPH
+        COMI,R0 A'H'
+        BCTA,EQ PF_CHRT2
+        ; Not CHR$ — treat C as variable
+        LODI,R0 A'C'
+        BCTA,UN PF_VAR
+PF_CHRT2:
+        BSTA,UN INC_IP           ; consume 'H'
+PF_CHRT3:
+        LODA,R0 *IPH
+        COMI,R0 A'R'
+        BCTA,EQ PF_CHRT4
+        LODI,R0 A'C'
+        BCTA,UN PF_VAR
+PF_CHRT4:
+        BSTA,UN INC_IP           ; consume 'R'
+PF_CHRT5:
+        LODA,R0 *IPH
+        COMI,R0 A'$'
+        BCTA,EQ PF_CHRT6
+        LODI,R0 A'C'
+        BCTA,UN PF_VAR
+PF_CHRT6:
+        BSTA,UN INC_IP           ; consume '$'
+PF_CHRT7:
+        BSTA,UN WSKIP
+        LODA,R0 *IPH
+        COMI,R0 A'('
+        BCTA,EQ PF_CHRARG
+        LODI,R0 A'C'
+        BCTA,UN PF_VAR
+PF_CHRARG:
+        BSTA,UN INC_IP           ; consume '('
+PF_CHREA:
+        BSTA,UN PARSE_EXPR       ; [+1]  evaluate argument
+        LODA,R0 ERRFLG
+        COMI,R0 $00
+        BCTA,EQ PF_CHROK
+        RETC,UN
+PF_CHROK:
+        BSTA,UN WSKIP
+        BSTA,UN INC_IP           ; consume ')'
+PF_CHRDN:
+        LODI,R0 1
+        STRA,R0 NEGFLG           ; signal DO_PRINT to output as char
+        EORZ,R0
         STRA,R0 ERRFLG
         RETC,UN
 
@@ -1931,14 +2039,15 @@ PARSE_U16:
         LODI,R0 1               ; BUG-BASIC-06 FIX: ERRFLG=1 = "no digits yet" (failure)
         STRA,R0 ERRFLG          ; was EORZ,R0 meaning "success" before any digit seen
 PU16_LP:
-        BSTA,UN WSKIP                    ; [+1]
+        ; RAS-FIX: WSKIP removed entirely from PARSE_U16. All callers must
+        ; call WSKIP before invoking PARSE_U16 (PARSE_S16 does; DO_GOTO and
+        ; TRY_STORE_LINE have explicit WSKIP added). This saves 1 RAS slot
+        ; from the inner loop, preventing overflow at nested IF + CHR$().
         LODA,R0 *IPH
         COMI,R0 A'0'
-        ;BCTA,LT PU16_DONE
         RETC,LT
         COMI,R0 A'9'+1
         BCTA,LT PU16_DIG
-        ;BCTA,UN PU16_DONE
         RETC,UN
 PU16_DIG:
         SUBI,R0 A'0'
