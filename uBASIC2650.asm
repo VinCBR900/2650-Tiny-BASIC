@@ -497,7 +497,7 @@ DP_SDONE:
 DP_SEP:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
-        COMI,R0 A';'
+        COMI,R0 0x3b ; semicolon after PRINT 
         BCTR,EQ DP_SEMI  ; semicolon → no space, continue or end without CRLF
         COMI,R0 A','
         BCTR,EQ DP_COMMA
