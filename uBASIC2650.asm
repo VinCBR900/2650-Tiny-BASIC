@@ -1904,16 +1904,20 @@ PF_CHRT7:
 PF_CHRARG:
         BSTA,UN INC_IP           ; consume '('
 PF_CHREA:
-        ; Call PARSE_EXPR for the argument. PARSE_EXPR will see the digits/expr,
-        ; then hit ')' which has prec=0 so GET_PREC returns 0, PX_RALL fires,
-        ; PX_DONE returns. IP left pointing at ')'. We then consume it.
-        BSTA,UN PARSE_EXPR       ; [+1]  evaluate argument
+        ; RAS-FIX: call PARSE_FACTOR not PARSE_EXPR to avoid depth overflow.
+        ; CHR$ argument is a single atom: literal number or variable only.
+        ; CHR$(A+32) not supported — use LET T=A+32:PRINT CHR$(T) workaround.
+        ; Depth: outer PARSE_FACTOR(4)→PF_CHREA→inner PARSE_FACTOR(5)
+        ;        →PARSE_S16(6)→PARSE_U16(6)→INC_IP(6) ← max 6, safe.
+        ; Note: PARSE_FACTOR clears CHRFLG at entry; PF_CHRDN restores it after.
+        BSTA,UN WSKIP            ; skip leading spaces (saves using PARSE_EXPR's PX_ATOM)
+        BSTA,UN PARSE_FACTOR     ; [+1]  evaluate single atom
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ PF_CHROK
         RETC,UN
 PF_CHROK:
-        BSTA,UN WSKIP            ; skip any space before ')'
+        BSTA,UN WSKIP            ; skip trailing spaces before ')'
         BSTA,UN INC_IP           ; consume ')'
 PF_CHRDN:
         LODI,R0 $FF
@@ -2007,9 +2011,15 @@ PRO_GEN:
 ; ─── PARSE_S16 ────────────────────────────────────────────────────────────────
 ; Parse optional leading '-' then decimal digits → EXPH:EXPL. ERRFLG=$00 if digits.
 PARSE_S16:
+        ; RAS-FIX: WSKIP removed. PX_ATOM already called WSKIP before PARSE_FACTOR,
+        ; and PARSE_S16 is only called from PARSE_FACTOR(PF_NUM) or DO_INPUT.
+        ; DO_INPUT calls PARSE_S16 after RDLINE which starts a fresh buffer — no
+        ; leading spaces possible. Saves 1 RAS slot on the hot path:
+        ;   REPL→STMT_EXEC→DO_PRINT→PARSE_EXPR→PARSE_FACTOR→PARSE_S16→PARSE_U16
+        ; was 6 deep; with WSKIP removed from PARSE_S16, deepest is now
+        ;   ...→PARSE_S16→PARSE_U16→INC_IP = 6 (SP=6, safe).
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG
-        BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
         COMI,R0 A'-'
         BCTA,EQ PS16_NEG
