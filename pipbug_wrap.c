@@ -1,5 +1,5 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
- * Version: 1.2
+ * Version: 1.1
  * Date:    2026-04-15
  *
  * Purpose:
@@ -32,8 +32,8 @@
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
- *   v1.2  Added configurable program entry address switch (--entry).
- *   v1.1  Added configurable CHIN/COUT/CRLF intercept addresses and
+ *   v1.1  Added configurable program entry address switch (--entry),
+ *         configurable CHIN/COUT/CRLF intercept addresses and
  *         explicit help/version command-line switches.
  *   v1.0  Initial release.
  */
@@ -333,7 +333,7 @@ static void print_usage(const char *prog)
 
 static void print_version(void)
 {
-    fprintf(stderr, "pipbug_wrap v1.2\n");
+    fprintf(stderr, "pipbug_wrap v1.1\n");
 }
 
 /* ── Minimal PIPBUG stubs ─────────────────────────────────────────────────
@@ -508,7 +508,7 @@ int main(int argc, char **argv)
     iar = entry_addr;
     print_version();
     fprintf(stderr,
-        "PIPBUG 1 mode: COUT=$%04X  CHIN=$%04X  CRLF=$%04X  entry=$%04X\n",
+        "Config mode: COUT=$%04X  CHIN=$%04X  CRLF=$%04X  entry=$%04X\n",
         cout_addr, chin_addr, crlf_addr, entry_addr);
 
     /* ── Run loop ── */
