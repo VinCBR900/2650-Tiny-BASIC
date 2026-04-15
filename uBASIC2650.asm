@@ -12,11 +12,8 @@
 ; Build:
 ;   gcc -Wall -O2 -o asm2650 asm2650.c
 ;   gcc -Wall -O2 -o sim2650 sim2650.c
-;   ./asm2650 uBASIC2650.asm uBASIC2650.hex
-;   ./sim2650 --pipbug uBASIC2650.hex
-;   ./sim2650 --pipbug -t uBASIC2650.hex             # CPU trace
-;   ./sim2650 --pipbug -b 0xADDR uBASIC2650.hex      # breakpoint
-;   ./sim2650 --pipbug -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
+;   asm2650 uBASIC2650.asm uBASIC2650.hex
+;   pipbug_wrap uBASIC2650.hex
 ;
 ; NOTE: Winarcadia assembler expects LABELS: to be on a dedicated line
 ;
