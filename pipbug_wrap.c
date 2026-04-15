@@ -1,6 +1,6 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
- * Version: 1.0
- * Date:    2026-04-07
+ * Version: 1.2
+ * Date:    2026-04-15
  *
  * Purpose:
  *   Wraps 2650.c (the WinArcadia CPU core, compiled -DGAMER to strip all UI
@@ -16,6 +16,12 @@
  *   -m 0xADDR LEN   Dump LEN bytes from address at halt
  *   -s              Step mode: pause at every instruction, press Enter to continue
  *   -n N            Instruction limit (default 5000000, 0=unlimited)
+ *   --chin 0xADDR   CHIN intercept address (default 0x0286)
+ *   --cout 0xADDR   COUT intercept address (default 0x02B4)
+ *   --crlf 0xADDR   CRLF intercept address (default 0x008A)
+ *   --entry 0xADDR  Program entry address (default 0x0440)
+ *   -h, --help      Show usage help
+ *   -v, --version   Show version number
  *
  * PIPBUG 1 intercepts (entry points match Oracle / uBASIC2650 EQUs):
  *   COUT  $02B4  putchar(R0)
@@ -26,6 +32,9 @@
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
+ *   v1.2  Added configurable program entry address switch (--entry).
+ *   v1.1  Added configurable CHIN/COUT/CRLF intercept addresses and
+ *         explicit help/version command-line switches.
  *   v1.0  Initial release.
  */
 
@@ -298,6 +307,34 @@ static long inst_limit    = 5000000;
 static int  step_mode     = 0;      /* -s step mode                        */
 static int  trace_mode    = 0;      /* -t trace mode                       */
 static int  eof_hit       = 0;
+static UWORD chin_addr    = 0x0286; /* --chin                              */
+static UWORD cout_addr    = 0x02B4; /* --cout                              */
+static UWORD crlf_addr    = 0x008A; /* --crlf                              */
+static UWORD entry_addr   = 0x0440; /* --entry                             */
+
+static void print_usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s [options] program.hex\n"
+        "Options:\n"
+        "  -t              Trace every instruction to stderr\n"
+        "  -s              Step mode: pause each instruction\n"
+        "  -b 0xADDR       Breakpoint at address (hex)\n"
+        "  -m 0xADDR LEN   Dump LEN bytes from address at halt\n"
+        "  -n LIMIT        Instruction limit (default 5000000, 0=unlimited)\n"
+        "  --chin 0xADDR   CHIN intercept address (default 0x0286)\n"
+        "  --cout 0xADDR   COUT intercept address (default 0x02B4)\n"
+        "  --crlf 0xADDR   CRLF intercept address (default 0x008A)\n"
+        "  --entry 0xADDR  Program entry address (default 0x0440)\n"
+        "  -h, --help      Show this help message\n"
+        "  -v, --version   Show version\n",
+        prog);
+}
+
+static void print_version(void)
+{
+    fprintf(stderr, "pipbug_wrap v1.2\n");
+}
 
 /* ── Minimal PIPBUG stubs ─────────────────────────────────────────────────
  *  We do NOT simulate PIPBUG ROM.  Instead we intercept the three entry
@@ -422,20 +459,30 @@ int main(int argc, char **argv)
             dump_len  = (int)strtol(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "-n") && i+1 < argc) {
             inst_limit = atol(argv[++i]);
+        } else if (!strcmp(argv[i], "--chin") && i+1 < argc) {
+            chin_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
+        } else if (!strcmp(argv[i], "--cout") && i+1 < argc) {
+            cout_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
+        } else if (!strcmp(argv[i], "--crlf") && i+1 < argc) {
+            crlf_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
+        } else if (!strcmp(argv[i], "--entry") && i+1 < argc) {
+            entry_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
+        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
+            print_version();
+            return 0;
         } else if (argv[i][0] != '-') {
             hexfile = argv[i];
         } else {
             fprintf(stderr, "Unknown option '%s'\n", argv[i]);
-            fprintf(stderr,
-                "Usage: pipbug_wrap [-t] [-s] [-b 0xADDR] "
-                "[-m 0xADDR LEN] [-n LIMIT] program.hex\n");
+            print_usage(argv[0]);
             return 1;
         }
     }
     if (!hexfile) {
-        fprintf(stderr,
-            "Usage: pipbug_wrap [-t] [-s] [-b 0xADDR] "
-            "[-m 0xADDR LEN] [-n LIMIT] program.hex\n");
+        print_usage(argv[0]);
         return 1;
     }
 
@@ -457,20 +504,20 @@ int main(int argc, char **argv)
     /* ── Load program ── */
     if (!load_hex(hexfile)) return 1;
 
-    /* ── Entry point: $0440 (PIPBUG user code start) ── */
-    iar = 0x0440;
+    /* ── Entry point (default $0440, override with --entry) ── */
+    iar = entry_addr;
+    print_version();
     fprintf(stderr,
-        "pipbug_wrap v1.0\n"
-        "PIPBUG 1 mode: COUT=$02B4  CHIN=$0286  CRLF=$008A  entry=$%04X\n",
-        iar);
+        "PIPBUG 1 mode: COUT=$%04X  CHIN=$%04X  CRLF=$%04X  entry=$%04X\n",
+        cout_addr, chin_addr, crlf_addr, entry_addr);
 
     /* ── Run loop ── */
     long count = 0;
     for (;;) {
         /* PIPBUG entry-point intercepts (before instruction fetch) */
-        if (iar == 0x02B4) { pb_cout(); continue; }
-        if (iar == 0x0286) { pb_chin(); if (eof_hit) break; continue; }
-        if (iar == 0x008A) { pb_crlf(); continue; }
+        if (iar == cout_addr) { pb_cout(); continue; }
+        if (iar == chin_addr) { pb_chin(); if (eof_hit) break; continue; }
+        if (iar == crlf_addr) { pb_crlf(); continue; }
 
         /* Breakpoint check */
         if (bp_addr >= 0 && iar == (UWORD)bp_addr) {
