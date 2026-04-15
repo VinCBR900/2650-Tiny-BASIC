@@ -221,8 +221,8 @@ CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 
 ; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
 ; BUG-ASM-10 FIX: Addres $1500 pins variables regardless of code growth.
-; Code ceiling: ~$14FF (code must not reach $1600 or assembler will error).
-; Variables: $1600-$16B8 (185 bytes). Program store: $16B9
+; Code ceiling: ~$14FF (code must not reach $1500 or assembler will error).
+; Variables: $1500-$15B8 (185 bytes). Program store: $15B9-$1BFF (1607 bytes).
 IPH     EQU $1600   ; interpreter pointer hi
 IPL     EQU $1601   ; interpreter pointer lo
 PEH     EQU $1602   ; program end pointer hi
@@ -250,10 +250,11 @@ STKIDX  EQU $162C   ; parser stack top ($FF=empty)
 SWSP    EQU $162D   ; SW call stack pointer ($FF=empty)
 SWSTK   EQU $162E   ; SW call stack 8×2 bytes  $152E-$153D
 RELOP   EQU $163E   ; relational op 1-6
+CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
 IBUF    EQU $1644   ; input buffer 64 bytes  $1544-$1583
 VARS    EQU $1684   ; A-Z variables 2 bytes each  $1584-$15B7
 PROG    EQU $16B8   ; program store base
-PROGLIM EQU $1d00   ; one past end of program store
+PROGLIM EQU $1c00   ; one past end of program store
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
         ORG     $0440
@@ -459,7 +460,7 @@ DP_ITEM:
         COMI,R0 DQ
         BCTR,EQ DP_STRING
         EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG  ; clear CHR$ flag before parse
+        STRA,R0 CHRFLG  ; clear CHR$ flag before parse
         BSTA,UN PARSE_EXPR               ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
@@ -467,7 +468,7 @@ DP_ITEM:
         BSTA,UN PRTSTR_IP
         BCTA,UN DP_NL  ; [+1] raw text fallback
 DP_NUM:
-        LODA,R0 NEGFLG
+        LODA,R0 CHRFLG
         COMI,R0 $01
         BCTR,EQ DP_CHAR
         BSTA,UN PRINT_S16
@@ -497,7 +498,7 @@ DP_SDONE:
 DP_SEP:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
-        COMI,R0 $3b ; semicolon after PRINT 
+        COMI,R0 $3B              ; ';' = $3B (A';' rejected by WinArcadia assembler)
         BCTR,EQ DP_SEMI  ; semicolon → no space, continue or end without CRLF
         COMI,R0 A','
         BCTR,EQ DP_COMMA
@@ -1799,7 +1800,7 @@ AO_SLN:
 ; CHR$ result: sets NEGFLG=$01 so DO_PRINT outputs EXPL as a character.
 PARSE_FACTOR:
         EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG  ; clear CHR$ flag
+        STRA,R0 CHRFLG  ; clear CHR$ flag
         LODA,R0 *IPH
         ; RAS-FIX: inline UPCASE here instead of BSTA UPCASE (+1 slot).
         ; Saves 1 RAS slot so CHR$(expr) path stays within 7 levels.
@@ -1903,17 +1904,26 @@ PF_CHRT7:
 PF_CHRARG:
         BSTA,UN INC_IP           ; consume '('
 PF_CHREA:
+        ; Call PARSE_EXPR for the argument. PARSE_EXPR will see the digits/expr,
+        ; then hit ')' which has prec=0 so GET_PREC returns 0, PX_RALL fires,
+        ; PX_DONE returns. IP left pointing at ')'. We then consume it.
         BSTA,UN PARSE_EXPR       ; [+1]  evaluate argument
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ PF_CHROK
         RETC,UN
 PF_CHROK:
-        BSTA,UN WSKIP
+        BSTA,UN WSKIP            ; skip any space before ')'
         BSTA,UN INC_IP           ; consume ')'
 PF_CHRDN:
+        LODI,R0 $FF
+        STRA,R0 STKIDX           ; BUG-CHR-02: restore outer PARSE_EXPR stack index.
+        ; Inner PARSE_EXPR (called from PF_CHREA) initialised STKIDX=$FF and
+        ; incremented it to $00 when pushing its result. The outer PARSE_EXPR
+        ; at PX_ATOM has not yet called PX_PUSHV, so it expects STKIDX=$FF.
+        ; Resetting here lets outer PX_PUSHV store result at slot [0]. Correct.
         LODI,R0 1
-        STRA,R0 NEGFLG           ; signal DO_PRINT to output as char
+        STRA,R0 CHRFLG           ; signal DO_PRINT to output as char
         EORZ,R0
         STRA,R0 ERRFLG
         RETC,UN
@@ -2452,14 +2462,14 @@ RL_LP:
         BCTA,EQ RL_BS
         ; buffer full?  IP >= IBUF+63
         ; BUG-BASIC-17 FIX: was SUBA (absolute read) not SUBI (immediate compare).
-        ; SUBA,R0 <IBUF reads mem[$0015] (PIPBUG ROM), not the constant $15.
+        ; SUBA,R0 <IBUF reads mem[$0016] (now at $1600+) (PIPBUG ROM), not the constant $15.
         ; All four pointer comparisons here must use SUBI.
         LODA,R0 IPH
-        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($15)
+        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($16)
         BCTA,GT RL_FULL
         BCTA,LT RL_STORE
         LODA,R0 IPL
-        SUBI,R0 >IBUF+63        ; compare IPL against IBUF lo byte + 63 ($83)
+        SUBI,R0 >IBUF+63        ; compare IPL against IBUF lo byte + 63 ($83 at $1644+63)
         BCTA,LT RL_STORE
 RL_FULL:
         BCTA,UN RL_LP
@@ -2472,11 +2482,11 @@ RL_STORE:
 RL_BS:
         ; at IBUF start? — no backspace if buffer empty
         LODA,R0 IPH
-        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($15)
+        SUBI,R0 <IBUF           ; compare IPH against IBUF hi byte ($16)
         BCTA,GT RL_BSDO
         BCTA,LT RL_LP
         LODA,R0 IPL
-        SUBI,R0 >IBUF           ; compare IPL against IBUF lo byte ($44)
+        SUBI,R0 >IBUF           ; compare IPL against IBUF lo byte ($44 at $1644)
         BCTA,EQ RL_LP
 RL_BSDO:
         LODA,R0 IPL
