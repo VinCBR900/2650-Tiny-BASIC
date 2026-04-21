@@ -2429,6 +2429,11 @@ PS16P_NZ:
         STRA,R0 TMPL
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG  ; leading-zero flag
+        ; PRINT_S16 needs unsigned compares for the digit loop (value >= divisor).
+        ; Save PSL in R2 and set COM=1 (unsigned compare mode).
+        SPSL
+        STRZ,R2
+        PPSL $02
 PS16P_DIVLP:
         ; load next divisor pair from DIVTAB
         LODA,R0 *TMPH
@@ -2447,29 +2452,37 @@ PS16P_D2:
         COMI,R0 $00
         BCTA,EQ PS16P_LAST
 PS16P_CNT:
-        ; count subtractions using R3 (BIRR: increment and branch while nonzero)
+        ; count subtractions using R3
         LODI,R3 $00
 PS16P_SLP:
+        ; Unsigned compare (COM=1): if value < divisor → emit digit.
+        ; Compare high byte first.
         LODA,R0 EXPH
-        SUBA,R0 SC0
+        LODA,R1 SC0
+        COMZ,R1
         BCTA,LT PS16P_EMIT
         BCTA,GT PS16P_DO
+        ; High bytes equal → compare low
         LODA,R0 EXPL
-        SUBA,R0 SC1
+        LODA,R1 SC1
+        COMZ,R1
         BCTA,LT PS16P_EMIT
 PS16P_DO:
+        ; 16-bit subtract with low-borrow propagation
         LODA,R0 EXPL
         SUBA,R0 SC1
         STRA,R0 EXPL
-        BCFA,LT PS16P_SNB
+        TPSL $01
+        BCTA,EQ PS16P_NB             ; C=1 → no borrow from low byte
         LODA,R0 EXPH
         SUBI,R0 1
         STRA,R0 EXPH
-PS16P_SNB:
+PS16P_NB:
         LODA,R0 EXPH
         SUBA,R0 SC0
         STRA,R0 EXPH
-        BIRR,R3 PS16P_SLP       ; R3++  ; loop
+        ADDI,R3 1                    ; digit++
+        BCTA,UN PS16P_SLP
 PS16P_EMIT:
         ; R3 = digit value
         LODA,R0 NEGFLG
@@ -2490,6 +2503,9 @@ PS16P_LAST:
         LODA,R0 EXPL
         ADDI,R0 A'0'
         BSTA,UN COUT
+        ; restore PSL (undo COM=1)
+        LODZ,R2
+        LPSL
         RETC,UN
 
 ; ─── GETKEY ───────────────────────────────────────────────────────────────────
