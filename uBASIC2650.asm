@@ -1,54 +1,114 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v1.15 - CHR$(), PRINT semicolons, modulo %, nested IF; RAS fix (PARSE_U16 WSKIP removed)
+; Version: v2.0-dev
 ;
-; Initial Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
-;   Code base $0440.  Variables pinned at $0100 (ORG).  Program store $01B8+.
+; Size: 4234 bytes ($0440-$14C9)
+;
+; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
+;   Code base $0440.
 ;   I/O via PIPBUG ROM entry points (BSTA,UN):
 ;     COUT $02B4  — output char in R0
 ;     CHIN $0286  — blocking input, char returned in R0
-;     CRLF $008A  — emit CR+LF (R0 not significant on entry or exit)
+;     CRLF $008A  — emit CR+LF
 ;
-; Assembler: asm2650.c v1.6   Simulator: sim2650.c v1.9
+; Assembler: asm2650.c v1.7   Simulator: pipbug_wrap v1.1
 ; Build:
 ;   gcc -Wall -O2 -o asm2650 asm2650.c
-;   gcc -Wall -O2 -o sim2650 sim2650.c
+;   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
 ;   ./asm2650 uBASIC2650.asm uBASIC2650.hex
-;   ./sim2650 --pipbug uBASIC2650.hex
-;   ./sim2650 --pipbug -t uBASIC2650.hex             # CPU trace
-;   ./sim2650 --pipbug -b 0xADDR uBASIC2650.hex      # breakpoint
-;   ./sim2650 --pipbug -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
+;   ./pipbug_wrap uBASIC2650.hex
+;   ./pipbug_wrap -t uBASIC2650.hex             # CPU trace
+;   ./pipbug_wrap -b 0xADDR uBASIC2650.hex      # breakpoint
+;   ./pipbug_wrap -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
 ;
-; NOTE: Winarcadia assembler expects LABELS: to be on a dedicated line
+; ── KNOWN OPEN BUGS ──────────────────────────────────────────────────────────
 ;
-; CC SEMANTICS (2650 ALU — SUB sets opposite of most CPUs):
-;   ADD: no-carry->GT  carry+zero->EQ  carry+nonzero->LT
-;   SUB: no-borrow+nonzero->GT  no-borrow+zero->EQ  borrow->LT
-;   Carry skip:  BCTA,GT lbl  (GT = C=0 = no carry)
-;   Borrow skip: BCFA,LT lbl  (NOT LT = no borrow, covers GT+EQ)
+; BUG-PRINT-01 (ACTIVE): PRINT_S16 corrupts output for values >= 10000.
+;   Symptom: PRINT 32767 outputs "3150#", PRINT 12345 outputs "13113".
+;   Root cause: UNKNOWN — identical algorithm to working v1.17 archive.
+;   TMPH:TMPL clobbered between PRINT_S16 calls? Page-boundary carry
+;   issue in PS16P_DIVLP INC_TMP? Requires tracing with -t -b.
+;   Workaround: single/two digit numbers print correctly.
+;   Affects: all numbers >= 10000 in PRINT, LIST line numbers >= 10000.
 ;
-; HI/LO OPERATOR CONVENTION (WinArcadia / asm2650.py standard):
-;   <ADDR = HIGH byte (bits 15:8)   e.g. <$0184 = $15
-;   >ADDR = LOW  byte (bits  7:0)   e.g. >$0184 = $84
+; BUG-CHR-01 (ACTIVE): A-Z CHR$() loop overflows hardware RAS (SP=8).
+;   Path: DO_RUN(1)→STMT_EXEC(2)→DO_PRINT(3)→PARSE_EXPR(4)→
+;         PARSE_FACTOR/CHR$(5)→inner PARSE_FACTOR(6)→PARSE_S16(7)→
+;         PARSE_U16(7, INC_IP inlined)→back→INC_IP(7)→COUT(8 OVERFLOW).
+;   Symptom: crash/garbage after ~3 iterations of CHR$() loop.
+;   Fix plan: move PARSE_EXPR to SW stack (v2.0 phase 2).
+;   Workaround: LET T=65: PRINT CHR$(T) works (simpler expr avoids depth).
 ;
-; DO_ERROR convention: LODI,R0 <code>; BCTA,UN DO_ERROR
-;   Saves RUNFLG, clears run state, then BCTA,UN REPL (flushes hardware RAS).
+; ── MEMORY MAP ───────────────────────────────────────────────────────────────
+;   $0000-$03FF  PIPBUG ROM (read-only)
+;   $0400-$043F  PIPBUG RAM (reserved)
+;   $0440-$14C9  uBASIC code (this file, 4234 bytes)
+;   $1600-$163F  RAM variables (see EQU block)
+;   $1640-$165F  SW call stack (32 bytes = 16 frames, v2.0 — not yet active)
+;   $1660-$1662  SW stack workspace (TEMPRETH, TEMPRETL, R3SAVE)
+;   $1658-$165C  PRINT_S16 digit buffer P16BUF (5 bytes — not yet used)
+;   $1663-$16A2  IBUF input buffer (64 bytes)
+;   $1A00-$1A33  VARS A-Z variables (52 bytes)
+;   $1A34-$1BFF  PROG program store (460 bytes — NOTE: reduced from 1607)
+;   $1C00        PROGLIM
 ;
-; RAS DEPTH BUDGET (8-level hardware stack, shared by BSTA and BSTR):
-;   PIPBUG COUT: uses BSTR DLAY inside = caller+2. CRLF: BSTR COUT→BSTR DLAY = caller+3.
-;   PIPBUG CHIN: uses BSTR DLAY/DLY inside = caller+2.
-;   Our deepest path: STMT_EXEC(1)→PARSE_EXPR(2)→APPLY_OP(3)→MUL16(4)→INC_EXP(5)
-;                  or STMT_EXEC(1)→PRINT_S16(2)→COUT(3)→[BSTR DLAY inside COUT](4)
-;   Verified max depth = 5. Limit = 8. Margin = 3. DO_IF adds 2 more → max 7. Safe.
+; ── CC SEMANTICS (2650 ALU) ──────────────────────────────────────────────────
+;   ADD: result>=128→LT  result>0,<128→GT  result=0→EQ
+;   SUB: result>=128→LT  result>0,<128→GT  result=0→EQ
+;   Carry bit (PSL bit 0) set independently: C=1 means carry/no-borrow.
+;   CORRECT carry skip: TPSL $01 then RETC,LT / BCTA,LT = branch if C=0.
+;   WRONG: BCTA,GT after ADD (tests result sign, not carry — only safe $01-$7F).
 ;
-; SCRATCH REGISTER ALLOCATION:
-;   SC0:SC1   — general scratch; clobbered by STMT_EXEC (do NOT use for inter-
-;               statement state — see BUG-BASIC-13)
-;   SWSTK[0:1] ($012E:$012F) — DO_RUN next-line-pointer save across STMT_EXEC
-;   LNUMH:LNUML — scratch line number; also used as save in DO_LIST (BUG-BASIC-12)
-;   R2        — never written by any routine; safe as long-lived scratch
-;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (loads DIVTAB ptr)
+; ── HI/LO OPERATOR CONVENTION ────────────────────────────────────────────────
+;   <ADDR = HIGH byte (bits 15:8)   e.g. <$1A34 = $1A
+;   >ADDR = LOW  byte (bits  7:0)   e.g. >$1A34 = $34
+;
+; ── RAS DEPTH BUDGET (8-level hardware stack) ────────────────────────────────
+;   PIPBUG COUT/CHIN: depth+2 internally. CRLF: depth+3.
+;   Safe max user call depth from REPL: 5 levels.
+;   Deepest working path: REPL(0)→STMT_EXEC(1)→DO_IF(2)→STMT_EXEC(3)→
+;     DO_PRINT(4)→PARSE_EXPR(5)→PARSE_FACTOR(6)→PARSE_S16(7) = SP=7. Safe.
+;   CHR$() path: adds one more → SP=8 = overflow (BUG-CHR-01).
+;
+; ── SCRATCH REGISTER ALLOCATION ──────────────────────────────────────────────
+;   R0       — working register, arithmetic, I/O
+;   R1       — index register; also PRINT_S16 digit buffer index (P16BUF)
+;   R2       — never written by any routine; long-lived scratch (DO_LET var letter)
+;   R3       — loop counter (BDRR/BIRR); SW stack index (v2.0, not yet active)
+;   SC0:SC1  — general scratch (clobbered by STMT_EXEC — not inter-statement safe)
+;   SWSTK[0:1] ($162E:$162F) — DO_RUN next-line-pointer save across STMT_EXEC
+;   LNUMH:LNUML — scratch line number; save area in DO_LIST (BUG-BASIC-12 fix)
+;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (BUG-BASIC-12 fix)
+;
+; ── v2.0 SW STACK INFRASTRUCTURE (EQUs added, not yet activated) ─────────────
+;   SWBASE=$1640, TEMPRETH=$1660, TEMPRETL=$1661, R3SAVE=$1662, P16BUF=$1658.
+;   Auto-index semantics confirmed: *BASE,R1+ = pre-increment (R1++ then access).
+;   Correct PRINT_S16 digit push pattern: init R1=$FF, *BUF,R1+ writes BUF+0 first.
+;   Correct pop pattern: increment R1 once after N pushes, loop *BUF,R1- until R1=0.
+;   SWRETURN implementation deferred pending PRINT-01 fix and CHR-01 investigation.
 ;
 ; Change history:
+;   v2.0-dev  SW stack EQU infrastructure added (SWBASE/TEMPRETH/TEMPRETL/R3SAVE/
+;               P16BUF). Memory layout: IBUF→$1663, VARS→$1A00, PROG→$1A34.
+;             PRINT_S16 alternative implementations explored (auto-index digit buf,
+;               recursive SW stack) — reverted due to BUG-PRINT-01 interaction.
+;             DIVTAB removed from shared tables (now inline in PRINT_S16 only).
+;             Banner updated to v2.0.
+;             Auto-index addressing confirmed: *BASE,Rn+ and *BASE,Rn- are both
+;               pre-modify (R3±1 before EA calc). Correct push/pop sequences
+;               documented above.
+;             BUG-PRINT-01 identified as pre-existing (present in v1.17 archive).
+;             Regression status: PRINT 0..9999 ✓, PRINT >=10000 ✗ (BUG-PRINT-01),
+;               CHR$() simple ✓, CHR$() loop ✗ (BUG-CHR-01), all IF relops ✓,
+;               GOTO ✓, LIST ✓ (line numbers <10000), LET ✓, INPUT ✓.
+;             BCTA→BCTR/BSTR size-reduction pass deferred (many candidates flagged
+;               by assembler --no-warn-local-branch; estimated ~50 bytes saving).
+;   v1.17  Conditional returns replacing BCTA+RETC patterns (~15 bytes).
+;          Relop bitmask parser: <1 =2 >4 in R1; TMI test in DO_IF (~120 bytes).
+;          FIND_LINE calls FIND_INS, sharing walk code (~57 bytes).
+;          KW_TAB [c1][c2][hi][lo]; STMT_EXEC indirect dispatch via *GOTOH.
+;          Paren bug FIXED (PX_POPSENT copies value down, decrements STKIDX).
+;          HW stack overflow FIXED (INC_IP inlined in PARSE_U16 digit loop).
+;   v1.15  CHR$(), PRINT semicolons, modulo %; RAS fix (PARSE_U16 WSKIP removed).
 ;   v1.11 BUG-SCA-12 FIXED: DO_RUN next-line-pointer save/restore used
 ;           STRA,R0 *SWSTK / LODA,R0 *SWSTK (indirect — dereferences the value
 ;           stored AT SWSTK as a pointer, then accesses that address). After
@@ -251,9 +311,21 @@ SWSP    EQU $162D   ; SW call stack pointer ($FF=empty)
 SWSTK   EQU $162E   ; SW call stack 8×2 bytes  $012E-$013D
 RELOP   EQU $163E   ; relational op 1-6
 CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
-IBUF    EQU $1644   ; input buffer 64 bytes  $0144-$0183
-VARS    EQU $1684   ; A-Z variables 2 bytes each  $0184-$01B7
-PROG    EQU $16B8   ; program store base
+; ── SW call stack (v2.0) ─────────────────────────────────────────────────────
+; R3 = index (0=empty, grows up). Each frame = [lo][hi] (lo pushed first).
+; Push sequence: STRA,R0 *SWBASE,R3+ (lo first), STRA,R0 *SWBASE,R3+ (hi)
+; Pop sequence:  LODA,R0 *SWBASE,R3- (hi first), LODA,R0 *SWBASE,R3- (lo)
+; Auto-index on 2650: *base,R3+ = post-increment (write/read then R3++)
+;                     *base,R3- = pre-decrement  (R3-- then write/read)
+; R3=0 at startup (CLRV loop exits with R3=0). SW stack empty = R3=0.
+SWBASE   EQU $1640  ; SW stack base: 32 bytes = 16 frames (2 bytes each)
+                    ; $1640-$165F  (16 levels deep minimum per spec)
+TEMPRETH EQU $1660  ; SW return address hi (workspace for SWRETURN only)
+TEMPRETL EQU $1661  ; SW return address lo
+R3SAVE   EQU $1662  ; save/restore R3 when SW routine calls HW routine using R3
+IBUF    EQU $1663   ; input buffer 64 bytes  $1663-$16A2
+VARS    EQU $1A00   ; A-Z variables 2 bytes each  $1A00-$1A33
+PROG    EQU $1A34   ; program store base (VARS+52)
 PROGLIM EQU $1c00   ; one past end of program store
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
@@ -311,7 +383,7 @@ REPL:
 ; ─── TABLES ───────────────────────────────────────────────────────────────────
 BANNER:
         DB CR, LF
-        DB A'u',A'B',A'A',A'S',A'I',A'C',A' ',A'2',A'6',A'5',A'0',A' ',A'v',A'1',A'.',A'0'
+        DB A'u',A'B',A'A',A'S',A'I',A'C',A' ',A'2',A'6',A'5',A'0',A' ',A'v',A'2',A'.',A'0'
         DB CR, LF, NUL
 
 ; Keyword table: [c1][c2][token]  NUL-terminated.
