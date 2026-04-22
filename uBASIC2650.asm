@@ -22,37 +22,47 @@
 ;
 ; ── KNOWN OPEN BUGS (v2.0-dev, 2026-04-22) ──────────────────────────────────
 ;
-; BUG-RELOP-02 (ACTIVE — BLOCKS ALL IF/THEN):
-;   TMI,R0 RELOP in DIF_TMASK is wrong. TMI takes an immediate literal byte
-;   (not a memory address); assembler embeds $00 → test always trivially true.
-;   Fix: LODA,R1 RELOP / ANDZ,R1 / BCTR,EQ DIF_FALSE — see ── KNOWN BUGS below.
-;
-; BUG-PRINT-MIN (ACTIVE — minor):
-;   PRINT -32768 outputs "-0". Negation of $8000 overflows back to $8000.
-;   Fix: special-case EXPH=$80,EXPL=$00 → print literal "32768" after "-".
-;
 ; BUG-CHR-01 (ACTIVE — deferred):
-;   CHR$() loop overflows hardware RAS (SP=8). Fix: SW stack for PARSE_EXPR.
+;   CHR$() loop overflows hardware RAS (SP=8) at depth 8 via:
+;   DO_RUN→STMT_EXEC→DO_PRINT→PARSE_EXPR→PARSE_FACTOR(CHR$)→
+;   inner PARSE_FACTOR→PARSE_S16→COUT = overflow.
+;   Fix plan: move PARSE_EXPR to SW stack (v2.0 phase 2).
+;   Workaround: LET T=65 : PRINT CHR$(T)  — avoids deep nesting.
 ;
 ; ── FIXED THIS SESSION ───────────────────────────────────────────────────────
 ;
+; BUG-RELOP-02 (FIXED): TMI,R0 RELOP wrong — TMI takes immediate literal byte,
+;   assembler embedded $00 → all IF conditions trivially true.
+;   Fix: LODA,R1 RELOP / ANDZ,R1 / BCTR,EQ DIF_FALSE (runtime AND test).
+;
+; BUG-PRINT-MIN (FIXED): PRINT -32768 output "-0" — negation of $8000 overflows.
+;   Fix: detect EXPH=$80,EXPL=$00 before negation, print "32768" directly.
+;
 ; BUG-PRINT-01 (FIXED): PRINT >=10000 corrupted (e.g. 32767→"3150#").
-;   Root cause: digit subtraction loop used wrong borrow propagation (BCFA,LT
-;   not TPSL $01), BIRR off-by-one, signed compare instead of unsigned.
-;   Fix: PPSL $02 (unsigned mode), COMZ,R1, ADDI,R3 1, TPSL $01 for borrow,
-;   SPSL/STRZ,R2 save+restore PSL around the whole routine.
+;   Fix: PPSL $02 unsigned mode, COMZ,R1, ADDI,R3 1, TPSL $01 borrow.
 ;
-; BUG-RELOP-01a (FIXED): EORZ,R1 in PARSE_RELOP entry leaves R1 dirty.
-;   EORZ,rn computes R0 ^= rn, not rn = 0. Fix: EORZ,R0 / STRZ,R1.
+; BUG-RELOP-01a (FIXED): EORZ,R1 in PARSE_RELOP entry does R0^=R1 not R1=0.
+;   Fix: EORZ,R0 / STRZ,R1.
 ;
-; BUG-RELOP-01b (FIXED): STRZ,R1 before LODZ,R1 on PARSE_RELOP exit
-;   overwrote the accumulated mask in R1 with the non-relop char in R0.
-;   Fix: removed STRZ,R1.
+; BUG-RELOP-01b (FIXED): STRZ,R1 before LODZ,R1 on PARSE_RELOP exit clobbered
+;   mask with non-relop char. Fix: removed STRZ,R1.
+;
+; ── REGRESSION STATUS (2026-04-22) ───────────────────────────────────────────
+;   PRINT numeric (all range)  ✓   including -32768, 32767
+;   Arithmetic +/-/*///%       ✓
+;   Parentheses                ✓
+;   IF relops =<><=>=<>        ✓   all 6 operators
+;   Nested IF                  ✓
+;   GOTO counted loop          ✓
+;   LET / PRINT variable       ✓
+;   LIST / NEW / RUN           ✓
+;   PRINT CHR$(n) simple       ✓
+;   CHR$() in loop             ✗   BUG-CHR-01 (RAS depth = 8)
 ;
 ; ── MEMORY MAP ───────────────────────────────────────────────────────────────
 ;   $0000-$03FF  PIPBUG ROM (read-only)
 ;   $0400-$043F  PIPBUG RAM (reserved)
-;   $0440-$14D6  uBASIC code (this file, 4247 bytes)
+;   $0440-$1506  uBASIC code (this file, 4295 bytes)
 ;   $1600-$163F  RAM variables (see EQU block)
 ;   $1640-$165F  SW call stack (32 bytes = 16 frames, v2.0 — not yet active)
 ;   $1660-$1662  SW stack workspace (TEMPRETH, TEMPRETL, R3SAVE)
@@ -855,31 +865,33 @@ DIF_TH2:
 DIF_EW:
         BSTA,UN EATWORD                  ; [+1]
 
-        ; Bitmask comparison using RELOP and comparison result SC1:
-        ;   SC1 = $FF → left < right  → LT result → bit 0 → mask $01
-        ;   SC1 = $00 → left == right → EQ result → bit 1 → mask $02
-        ;   SC1 = $01 → left > right  → GT result → bit 2 → mask $04
-        ; TMI,R0 RELOP: CC=EQ if all tested bits set (mask matches) → true
-        ; CC=LT if any tested bit clear → false
+        ; BUG-RELOP-02 FIX: TMI,R0 RELOP was wrong — TMI uses RELOP as an
+        ; immediate byte (not a runtime RAM read), always assembling as $00.
+        ; Fix: map SC1 result to a bitmask in R0, then AND against RELOP at runtime.
+        ;   SC1=$FF → LT → bit 0 ($01)
+        ;   SC1=$00 → EQ → bit 1 ($02)
+        ;   SC1=$01 → GT → bit 2 ($04)
+        ; ANDZ,R1: R0 &= R1.  If result=0: no match → false.
         LODA,R0 SC1
         COMI,R0 $FF
         BCTR,EQ DIF_IS_LT
         COMI,R0 $00
         BCTR,EQ DIF_IS_EQ
-        LODI,R0 4                        ; GT result → test bit 2
-        BCTA,UN DIF_TMASK
+        LODI,R0 4                        ; GT → bit 2
+        BCTA,UN DIF_ANDTEST
 DIF_IS_LT:
-        LODI,R0 1                        ; LT result → test bit 0
-        BCTA,UN DIF_TMASK
+        LODI,R0 1                        ; LT → bit 0
+        BCTA,UN DIF_ANDTEST
 DIF_IS_EQ:
-        LODI,R0 2                        ; EQ result → test bit 1
-DIF_TMASK:
-        TMI,R0 RELOP                     ; CC=EQ if bit set in RELOP → condition true
-        BCTR,EQ DIF_TRUE
-DIF_FALSE:
-        RETC,UN
-DIF_TRUE:
+        LODI,R0 2                        ; EQ → bit 1
+DIF_ANDTEST:
+        LODA,R1 RELOP                    ; R1 = runtime bitmask from RAM
+        ANDZ,R1                          ; R0 &= R1  (ANDZ,rn: R0 &= rn)
+        BCTR,EQ DIF_FALSE                ; zero → no bit match → condition false
+        ; fall through to DIF_TRUE
         BSTA,UN STMT_EXEC                ; [+1]  execute THEN body
+        RETC,UN
+DIF_FALSE:
         RETC,UN
 
 DO_GOTO:
@@ -2510,7 +2522,13 @@ PRINT_S16:
         BCTA,EQ PS16P_POS
         LODI,R0 A'-'
         BSTA,UN COUT
-        ; negate
+        ; BUG-PRINT-MIN FIX: -32768 ($8000) negation overflows back to $8000.
+        ; Detect EXPH=$80,EXPL=$00 and print "32768" directly.
+        LODA,R0 EXPH
+        COMI,R0 $80
+        BCTR,EQ PS16P_CHKMIN
+PS16P_NEGNORM:
+        ; normal negation: flip bits, add 1
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
@@ -2518,6 +2536,25 @@ PRINT_S16:
         EORI,R0 $FF
         STRA,R0 EXPL
         BSTA,UN INC_EXP
+        BCTA,UN PS16P_POS
+PS16P_CHKMIN:
+        LODA,R0 EXPL
+        COMI,R0 $00
+        BCTR,EQ PS16P_MIN        ; exactly $8000 = -32768
+        BCTA,UN PS16P_NEGNORM    ; $80xx with non-zero lo — normal negative
+PS16P_MIN:
+        ; print "32768" as ASCII literals
+        LODI,R0 A'3'
+        BSTA,UN COUT
+        LODI,R0 A'2'
+        BSTA,UN COUT
+        LODI,R0 A'7'
+        BSTA,UN COUT
+        LODI,R0 A'6'
+        BSTA,UN COUT
+        LODI,R0 A'8'
+        BSTA,UN COUT
+        RETC,UN
 PS16P_POS:
         LODA,R0 EXPH
         COMI,R0 $00
