@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.7
+ * Version: 1.8
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -12,6 +12,11 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.7 -> v1.8:
+ *   Inline label+instruction warning now applies only to explicit
+ *   colon-terminated labels ("LABEL: OPCODE ...").
+ *   Non-colon forms like "LABEL EQU 42" no longer emit the warning.
  *
  * Changes v1.6 -> v1.7:
  *   Added warning controls:
@@ -44,7 +49,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.7"
+#define ASM2650_VERSION "1.8"
 
 typedef struct { char name[32]; int value; } Label;
 static Label labels[MAX_LABELS];
@@ -203,16 +208,18 @@ static void assemble_line(char *line){
     char *p=buf; while(*p){ if(*p==';'){*p=0;break;} p++; }
     p=skip_ws(buf); if(!*p) return;
     char lbl[32]="";
+    int lbl_has_colon = 0;
     if(!isspace((unsigned char)buf[0])&&buf[0]){
         int i=0;
         while((isalnum((unsigned char)*p)||*p=='_')&&i<31) lbl[i++]=*p++;
         lbl[i]=0;
         if(*p==':'){
+            lbl_has_colon = 1;
             p++;
         }
         p=skip_ws(p);
         if(pass==1) label_define(lbl,pc);
-        if(*lbl && *p && pass==2 && warn_inline_label){
+        if(*lbl && lbl_has_colon && *p && pass==2 && warn_inline_label){
             fprintf(stderr,"WARN line %d: label and instruction on same line\n",lineno);
         }
     }
