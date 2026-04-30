@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.0-dev
+; Version: v2.1-dev
 ;
 ; Size: 4234 bytes ($0440-$14C9)
 ;
@@ -20,10 +20,71 @@
 ;   ./pipbug_wrap -b 0xADDR uBASIC2650.hex      # breakpoint
 ;   ./pipbug_wrap -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
 ;
-; ── KNOWN OPEN BUGS (v2.0-dev, 2026-04-22) ──────────────────────────────────
+; ── KNOWN OPEN BUGS (v2.1-dev, 2026-04-30) ──────────────────────────────────
 ;
-; No known open functional bugs.  All tests passing (see regression below).
-; Further work: size reduction (target ≤2KB), SW stack PARSE_EXPR rewrite.
+; BUG-MAND-01 (ACTIVE): Mandelbrot expression U*U/16+V*V/16 gives wrong result.
+;   Symptom: PRINT U*U/16+V*V/16 returns 1 when U=16,V=0 (should be 16).
+;   A+0=16 works, U*U/16=16 works, but U*U/16+V*V/16=1.
+;   Root cause under investigation — suspected PARSE_EXPR operator stack issue
+;   when mixing * / + with identical-named variables.
+;   Does not affect: arithmetic without division-then-addition combos.
+;   Does not affect: showcase non-Mandelbrot sections.
+;
+; ── FIXED THIS SESSION (v2.1-dev) ────────────────────────────────────────────
+;
+; CR-FORMAT CHANGE: Line records now [linehi][linelo][body...][CR]
+;   Eliminates bodylen byte, saves ~50 bytes in STORE_LINE/DELETE_LINE.
+;   All affected routines updated: STORE_LINE, DELETE_LINE, FIND_LINE,
+;   FIND_INS, DO_LIST, DO_RUN.
+;
+; BUG-UNSIGNED-01 (FIXED): All record-walk boundary checks (DO_LIST DLS_LP,
+;   DO_RUN DR_LP, FIND_LINE, FIND_INS, DELETE_LINE DL2_LP) used signed
+;   subtraction for the lo-byte comparison. Signed fails when PEL > $7F
+;   (e.g. after storing 11+ lines, PEL=$C9 → $34-$C9 signed is GT, not LT).
+;   Fix: TPSL $01 after SUBA for lo byte to check carry (unsigned borrow).
+;
+; BUG-STORE-01 (FIXED): STORE_LINE scratch registers NEGFLG:RELOP were clobbered
+;   by PARSE_EXPR (NEGFLG used for sign in MUL/DIV, RELOP used for relop mask).
+;   Caused lines 12+ to corrupt program store silently.
+;   Fix: Changed STORE_LINE scratch to CURH:CURL (only written during RUN).
+;
+; BUG-STORE-02 (FIXED): Space-check scratch also used LNUMH:LNUML, clobbering
+;   the line number before FIND_INS was called.
+;   Fix: Space-check scratch moved to NEGFLG:RELOP (re-evaluated as safe here).
+;   Then scratch moved to CURH:CURL to avoid PARSE_EXPR collision (BUG-STORE-01).
+;
+; BUG-DIV-01 (FIXED): DIV16 loop used signed comparison for lo byte of
+;   dividend vs divisor. For 32767/128: $7F-$80 signed = GT → subtracted;
+;   correct unsigned: $7F < $80 → stop. Fix: TPSL $01 carry check.
+;
+; BUG-DIV-02 (FIXED): DIV16 borrow propagation used BCFR,LT (old signed-borrow
+;   pattern). Fix: TPSL $01 / BCTR,EQ DV_SNB (carry-based borrow detect).
+;
+; BUG-PRINT-02 (FIXED): PRINT_S16 zero check used BCTR,GT to skip "0" path.
+;   EXPL=$FF (=255 unsigned) is -1 signed → CC=LT → fell to PRINT "0".
+;   Fix: explicit BCTR,EQ PS16P_ZERO test only when EXPH=0 AND EXPL=0.
+;
+; BUG-CHR-02 (FIXED): CHR$(expr) only evaluated first atom (called PARSE_FACTOR
+;   not PARSE_EXPR). CHR$(I+48) returned I not I+48.
+;   Fix: CHR$ calls PARSE_EXPR; PF_CHROK no longer re-consumes ')' since
+;   PARSE_EXPR handles ')' via PX_RPAR.
+;
+; ── REGRESSION STATUS (v2.1-dev, 2026-04-30) ─────────────────────────────────
+;   PRINT numeric (all range)   ✓  including 128..32767, -32768
+;   PRINT 255, 256              ✓  (BUG-PRINT-02 fixed)
+;   256/16, 32767/128           ✓  (BUG-DIV-01/02 fixed)
+;   Arithmetic +/-/*///%        ✓
+;   IF all relops               ✓
+;   CHR$(expr)                  ✓  (BUG-CHR-02 fixed)
+;   CHR$() A-Z loop             ✓
+;   LET / PRINT variable        ✓
+;   GOTO counted loop           ✓
+;   Nested IF                   ✓
+;   LIST / NEW / RUN            ✓
+;   Edit/delete line            ✓
+;   11+ line programs           ✓  (BUG-UNSIGNED-01/STORE-01/02 fixed)
+;   Mandelbrot kernel (3 iters) ✓
+;   U*U/16+V*V/16 expression    ✗  BUG-MAND-01 (active)
 ;
 ; ── FIXED THIS SESSION ───────────────────────────────────────────────────────
 ;
@@ -200,6 +261,20 @@
 ;   Estimated saving: ~90 bytes.  Apply after all bugs fixed.
 
 ; Change history:
+;   v2.1-dev  CR-terminated line format (bodylen byte removed). All 6 affected
+;             routines updated. Net size change: -10 bytes before unsigned fixes.
+;             BUG-UNSIGNED-01 FIXED: signed boundary checks in DLS_LP/DR_LP/
+;               FIND_LINE/FIND_INS/DL2_LP fail when PEL>$7F. Fix: carry check.
+;             BUG-STORE-01/02 FIXED: scratch register conflicts in STORE_LINE.
+;               Moved to CURH:CURL which is only written during DO_RUN.
+;             BUG-DIV-01/02 FIXED: DIV16 unsigned comparison and borrow.
+;               256/16=16 now correct (was 1). 32767/128=255 now correct.
+;             BUG-PRINT-02 FIXED: PRINT_S16 zero check excluded $00FF (255).
+;             BUG-CHR-02 FIXED: CHR$(I+48) now evaluates full expression.
+;             BUG-MAND-01 IDENTIFIED: U*U/16+V*V/16 gives wrong result when
+;               mixing division+addition with variables. Under investigation.
+;             Regression: all prior tests pass; Mandelbrot render pending fix.
+;             Code size: 4224 bytes ($0440-$14BF).
 ;   v2.0-dev  SW stack EQU infrastructure added (SWBASE/TEMPRETH/TEMPRETL/R3SAVE/
 ;               P16BUF). Memory layout: IBUF→$1663, VARS→$1A00, PROG→$1A34.
 ;             PRINT_S16 rewritten: unsigned compare mode (PPSL $02), COMZ,R1,
@@ -920,16 +995,26 @@ DO_LIST:
         LODI,R0 >PROG
         STRA,R0 TMPL
 DLS_LP:
+        ; unsigned 16-bit: if TMPH:TMPL >= PEH:PEL → done
+        ; Use COMZ via unsigned COM mode for hi byte, carry check for lo byte
         LODA,R0 TMPH
-        SUBA,R0 PEH
-        ; BCTA,GT DLS_RET
-        RETC,GT
-        BCTR,LT DLS_BODY
+        PPSL $02                ; unsigned compare mode
+        COMI,R0 $00
+        STRA,R0 SC0
+        LODA,R0 PEH
+        COMI,R0 $00
+        STRA,R0 SC1
+        LODA,R0 SC0
+        COMA,R0 SC1             ; unsigned: TMPH vs PEH
+        CPSL $02
+        RETC,GT                 ; TMPH > PEH → past end
+        BCTR,LT DLS_BODY        ; TMPH < PEH → before end
+        ; TMPH == PEH: check lo byte carry from subtraction
         LODA,R0 TMPL
-        SUBA,R0 PEL
-        BCTR,LT DLS_BODY
-        ; BCTA,UN DLS_RET
-        RETC,UN
+        SUBA,R0 PEL             ; TMPL - PEL (signed sub but carry=1 means >=)
+        TPSL $01                ; C=1 → no borrow → TMPL >= PEL → at/past end
+        RETC,EQ                 ; CC=EQ means C=1 → TMPL >= PEL → done
+DLS_BODY:
 DLS_BODY:
         ; line number hi:lo
         LODA,R0 *TMPH
@@ -953,20 +1038,17 @@ DLS_N2:
         STRA,R0 TMPL
         LODI,R0 SP
         BSTA,UN COUT
-        ; body length into R3
-        LODA,R3 *TMPH
-        BSTA,UN INC_TMP
 DLS_N3:
-        ; BUG-SCA-02 FIX: was BRNR,R3 (pure test, R3 never decremented → inf loop).
-        ; Guard zero-body case first (BDRR with R3=0 would execute once wrongly).
-        COMI,R3 $00
-        BCTR,EQ DLS_NL
+        ; print body bytes until CR (CR-terminated format)
 DLS_BLPX:
         LODA,R0 *TMPH
+        COMI,R0 CR
+        BCTR,EQ DLS_NL
         BSTA,UN COUT
         BSTA,UN INC_TMP
-        BDRR,R3 DLS_BLPX       ; R3--; if R3!=0 branch
+        BCTR,UN DLS_BLPX
 DLS_NL:
+        BSTA,UN INC_TMP          ; skip past CR
         BSTA,UN CRLF
         BCTA,UN DLS_LP
 DLS_RET:
@@ -989,15 +1071,25 @@ DR_LP:
         COMI,R0 $00
         ; BCTA,EQ DR_RET
         RETC,EQ
-        ; end of program?
+        ; end of program? unsigned 16-bit: TMPH:TMPL >= PEH:PEL → stop
         LODA,R0 TMPH
-        SUBA,R0 PEH
-        BCTA,GT DR_STOP
-        BCTR,LT DR_EXEC
+        PPSL $02
+        COMI,R0 $00
+        STRA,R0 SC0
+        LODA,R0 PEH
+        COMI,R0 $00
+        STRA,R0 SC1
+        LODA,R0 SC0
+        COMA,R0 SC1             ; unsigned TMPH vs PEH
+        CPSL $02
+        BCTA,GT DR_STOP          ; TMPH > PEH → past end
+        BCTR,LT DR_EXEC          ; TMPH < PEH → before end
+        ; TMPH == PEH: lo byte
         LODA,R0 TMPL
         SUBA,R0 PEL
-        BCTR,LT DR_EXEC
-        BCTA,UN DR_STOP
+        TPSL $01                ; C=1 → no borrow → TMPL >= PEL → at/past end
+        RETC,EQ                 ; done if TMPL >= PEL
+        BCTA,UN DR_EXEC
 DR_EXEC:
         ; save line number for error reporting
         LODA,R0 *TMPH
@@ -1008,27 +1100,24 @@ DR_N1:
         STRA,R0 CURL
         BSTA,UN INC_TMP
 DR_N2:
-        ; body length into R3
-        LODA,R3 *TMPH
-        BSTA,UN INC_TMP
 DR_N3:
-        ; copy body to IBUF
+        ; copy body to IBUF until CR (CR-terminated format), NUL-terminate
         LODI,R0 <IBUF
         STRA,R0 IPH
         LODI,R0 >IBUF
         STRA,R0 IPL
-        COMI,R3 $00
-        BCTR,EQ DR_CD
 DR_CPY:
         LODA,R1 *TMPH
+        COMI,R1 CR
+        BCTR,EQ DR_CD
         STRA,R1 *IPH
         BSTA,UN INC_TMP
         BSTA,UN INC_IP
-        ; BUG-SCA-03 FIX: was BRNR,R3 — R3 never decremented → infinite copy loop.
-        BDRR,R3 DR_CPY          ; R3--; if R3!=0 branch
+        BCTR,UN DR_CPY
 DR_CD:
+        BSTA,UN INC_TMP          ; skip past CR in store
         LODI,R1 NUL
-        STRA,R1 *IPH  ; NUL-terminate
+        STRA,R1 *IPH  ; NUL-terminate IBUF
         ; BUG-BASIC-13 FIX: Save next-line pointer in SWSTK[0:1] instead of
         ; SC0:SC1. SC0 and SC1 are scratch bytes clobbered by STMT_EXEC (used
         ; by PRINT_S16, STORE_LINE, parser, etc.).  SWSTK is the GOSUB return
@@ -1141,17 +1230,17 @@ TSL_RET2:
 
 ; ─── STORE_LINE ───────────────────────────────────────────────────────────────
 ; Insert line LNUMH:LNUML with body at IP into program store (sorted).
-; Record format: [linehi][linelo][bodylen][body...]
+; Record format: [linehi][linelo][body...][CR]
 ; Strategy: delete existing line, measure body, check space, find insertion
 ;           point (EXPH:EXPL), shift existing records up, write new record.
 STORE_LINE:
         BSTA,UN DELETE_LINE              ; [+1]  remove if exists
 
-        ; measure body length: walk from IP to NUL, count in R3
+        ; save body start, then measure length via TMPH:TMPL (preserves IP)
         LODA,R0 IPH
         STRA,R0 TMPH
         LODA,R0 IPL
-        STRA,R0 TMPL  ; TMPH:TMPL = body start (save for write)
+        STRA,R0 TMPL  ; TMPH:TMPL = body start
         LODI,R3 0
 SL_MEAS:
         LODA,R0 *TMPH
@@ -1159,43 +1248,50 @@ SL_MEAS:
         BCTR,EQ SL_MEASD
         BSTA,UN INC_TMP
 SL_MNC:
-        BIRR,R3 SL_MEAS         ; R3++ then always branch (counts: 0→1→2...)
+        BIRR,R3 SL_MEAS         ; R3++ always (counts: 0→1→2...)
 SL_MEASD:
-        ; R3 = body length.  SC0 = body len.  SC1 = record size = 3 + R3.
+        ; R3 = body length.  SC0 = body len.  SC1 = record size = 2+bodylen+1 (hi:lo:body:CR).
         STRA,R3 SC0
         LODA,R0 SC0
         ADDI,R0 3
         STRA,R0 SC1
+        ; TMPH:TMPL already at body start — restore for space-check then write
 
-        ; check free space: PROGLIM - PE >= SC1
+        ; check free space: PROGLIM - PE >= SC1 (scratch: CURH:CURL — safe during entry)
         LODI,R0 >PROGLIM
         SUBA,R0 PEL
-        STRA,R0 TMPL
+        STRA,R0 CURL
         LODI,R0 <PROGLIM
         SUBA,R0 PEH
         BCFR,LT SL_NBC
-        SUBI,R0 1  ; borrow skip: BCFA,LT
+        SUBI,R0 1
 SL_NBC:
-        STRA,R0 TMPH            ; TMPH:TMPL = free bytes
-        LODA,R0 TMPH
+        STRA,R0 CURH            ; CURH:CURL = free bytes (LNUMH:LNUML preserved)
+        LODA,R0 CURH
         COMI,R0 $00
         BCTR,GT SL_ROOM
-        LODA,R0 TMPL
+        LODA,R0 CURL
         SUBA,R0 SC1
         BCFR,LT SL_ROOM  ; free >= needed?
         LODI,R0 3
         BCTA,UN DO_ERROR  ; out of memory
 
 SL_ROOM:
-        ; find sorted insertion point → EXPH:EXPL
-        BSTA,UN FIND_INS                 ; [+1]  sets TMPH:TMPL
-        ; save insertion point in EXPH:EXPL (TMPH:TMPL will be used as walk pointer)
+        ; find sorted insertion point (FIND_INS clobbers TMPH:TMPL — that is fine,
+        ; body start is in IP which survives, line number is in LNUMH:LNUML)
+        BSTA,UN FIND_INS                 ; [+1]  result → TMPH:TMPL
+        ; save insertion point in EXPH:EXPL
         LODA,R0 TMPH
         STRA,R0 EXPH
         LODA,R0 TMPL
         STRA,R0 EXPL
-
+        ; save line number to CURH:CURL — shift loop clobbers LNUMH:LNUML
+        LODA,R0 LNUMH
+        STRA,R0 CURH
+        LODA,R0 LNUML
+        STRA,R0 CURL
         ; shift bytes PE-1 down to EXPH:EXPL upward by SC1 positions (backwards copy)
+        ; (body pointer reloaded from IP at SL_NOSHIFT after shift completes)
         ; shift count = PE - EXPH:EXPL
         LODA,R0 PEL
         SUBA,R0 EXPL
@@ -1215,7 +1311,7 @@ SL_SHCNB:
         COMI,R0 $00
         BCTA,EQ SL_NOSHIFT
 SL_DOSHIFT:
-        ; src = PE-1 in NEGFLG:SC1 (use two scratch bytes; LNUMH:LNUML free now)
+        ; src = PE-1 in LNUMH:LNUML (shift uses these as src pointer)
         LODA,R0 PEL
         SUBI,R0 1
         STRA,R0 LNUML
@@ -1274,14 +1370,16 @@ SL_DRNB:
 
 SL_NOSHIFT:
         ; write record at EXPH:EXPL (insertion point)
-        ; restore IP body start to TMPH:TMPL (saved at top of STORE_LINE)
-        ; TMPH:TMPL currently = shift count — need to reload body start from IP
-        ; IP still points to body start (WSKIP was called before STORE_LINE)
+        ; Restore line number (clobbered by shift using LNUMH:LNUML as src ptr)
+        LODA,R0 CURH
+        STRA,R0 LNUMH
+        LODA,R0 CURL
+        STRA,R0 LNUML
+        ; Reload body start from IP (IP preserved across shift; TMPH:TMPL clobbered)
         LODA,R0 IPH
         STRA,R0 TMPH
         LODA,R0 IPL
         STRA,R0 TMPL
-
         LODA,R0 LNUMH
         STRA,R0 *EXPH  ; write line hi
         BSTA,UN INC_EXP
@@ -1290,23 +1388,19 @@ SL_WN1:
         STRA,R0 *EXPH  ; write line lo
         BSTA,UN INC_EXP
 SL_WN2:
-        LODA,R0 SC0
-        STRA,R0 *EXPH  ; write body length
-        BSTA,UN INC_EXP
-SL_WN3:
-        ; write body bytes (R3 = body len from SC0)
-        ; BUG-SCA-05 FIX: was BRNR,R3 — R3 never decremented → infinite write.
-        ; Guard zero-body case first.
-        LODA,R3 SC0
-        COMI,R3 $00
-        BCTR,EQ SL_WDONE
+        ; write body bytes until NUL (CR-terminated format — no bodylen byte)
 SL_WBODY:
         LODA,R1 *TMPH
-        STRA,R1 *EXPH  ; copy body byte
+        COMI,R1 NUL
+        BCTR,EQ SL_WDONE
+        STRA,R1 *EXPH
         BSTA,UN INC_TMP
         BSTA,UN INC_EXP
-        BDRR,R3 SL_WBODY        ; R3--; if R3!=0 branch
+        BCTR,UN SL_WBODY
 SL_WDONE:
+        LODI,R0 CR
+        STRA,R0 *EXPH  ; write CR terminator
+        BSTA,UN INC_EXP
         ; update PE += SC1 (record size)
         LODA,R0 PEL
         ADDA,R0 SC1
@@ -1326,45 +1420,48 @@ DELETE_LINE:
         BCTR,EQ DL2_FOUND
         RETC,UN
 DL2_FOUND:
-        ; record start in TMPH:TMPL.  Get size: 3 + bodylen at TMPH:TMPL+2.
+        ; record start in TMPH:TMPL.  CR-format: size = scan from +2 until CR + 3.
         LODA,R0 TMPH
         STRA,R0 EXPH  ; save record start in EXPH:EXPL
         LODA,R0 TMPL
         STRA,R0 EXPL
+        ; advance TMPH:TMPL by 2 (skip linehi, linelo)
         LODA,R0 TMPL
         ADDI,R0 2
         STRA,R0 TMPL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
-        BCTR,LT DL2_BLN          ; branch if C=0 (no carry)
+        TPSL $01
+        BCTR,LT DL2_BLN
         LODA,R0 TMPH
         ADDI,R0 1
         STRA,R0 TMPH
 DL2_BLN:
-        LODA,R0 *TMPH
-        ADDI,R0 3
-        STRA,R0 SC0  ; SC0 = record size
-        ; advance TMPH:TMPL past record to get src for copy
-        LODA,R3 SC0
-        SUBI,R3 2  ; R3 = bodylen + 1  (skip len byte + body)
-        ; BUG-SCA-08 FIX: was BRNR,R3 — R3 never decremented → infinite advance,
-        ; copy source never found, deletion corrupted program store.
-DL2_SKIP:
-        COMI,R3 $00
-        BCTR,EQ DL2_COPY
+        ; scan body until CR to find record end; SC0 = record size
+        LODI,R0 3                ; start at 3 (hi + lo + CR byte itself)
+        STRA,R0 SC0
+DL2_SCAN:
+        LODA,R1 *TMPH
+        COMI,R1 CR
+        BCTR,EQ DL2_SCAND
         BSTA,UN INC_TMP
-        BDRR,R3 DL2_SKIP        ; R3--; if R3!=0 branch
-        BCTR,UN DL2_COPY        ; R3 wrapped: all bytes skipped
+        LODA,R0 SC0
+        ADDI,R0 1
+        STRA,R0 SC0
+        BCTR,UN DL2_SCAN
+DL2_SCAND:
+        BSTA,UN INC_TMP          ; skip the CR byte itself
 DL2_COPY:
         ; copy TMPH:TMPL..PE-1 to EXPH:EXPL
 DL2_LP:
         LODA,R0 TMPH
-        SUBA,R0 PEH
+        SUBA,R0 PEH                      ; signed OK: PEH=$1A < $80
         BCTR,GT DL2_DONE
         BCTR,LT DL2_MOV
+        ; TMPH == PEH: unsigned lo via carry
         LODA,R0 TMPL
         SUBA,R0 PEL
-        BCTR,LT DL2_MOV
-        BCTR,UN DL2_DONE
+        TPSL $01                         ; C=1 → TMPL >= PEL → done
+        BCTR,EQ DL2_DONE
+        BCTR,UN DL2_MOV
 DL2_MOV:
         LODA,R1 *TMPH
         STRA,R1 *EXPH
@@ -1378,7 +1475,8 @@ DL2_DONE:
         LODA,R0 PEL
         SUBA,R0 SC0
         STRA,R0 PEL
-        RETC,LT                  ; C=1 (no borrow) → done
+        TPSL $01                 ; CC=EQ if C=1 (no borrow), CC=LT if C=0 (borrow)
+        RETC,EQ                  ; no borrow → done
         LODA,R0 PEH
         SUBI,R0 1
         STRA,R0 PEH
@@ -1392,13 +1490,15 @@ FIND_LINE:
         BSTA,UN FIND_INS                 ; [+1] sets TMPH:TMPL to insertion point
         ; Check if at end of program (no match possible)
         LODA,R0 TMPH
-        SUBA,R0 PEH
+        SUBA,R0 PEH                      ; signed OK: PEH=$1A always < $80
         BCTR,GT FL_RET_NF
         BCTR,LT FL_CHK
+        ; TMPH == PEH: unsigned lo comparison via carry
         LODA,R0 TMPL
         SUBA,R0 PEL
-        BCTR,LT FL_CHK
-        BCTR,UN FL_RET_NF               ; at/past end → not found
+        TPSL $01                         ; C=1 → no borrow → TMPL >= PEL
+        BCTR,EQ FL_RET_NF               ; TMPL >= PEL → at/past end (C=1, CC=EQ)
+        BCTR,UN FL_CHK                   ; TMPL < PEL → check record
 FL_CHK:
         ; Check exact match: *TMPH == LNUMH and *(TMPH:TMPL+1) == LNUML
         LODA,R0 *TMPH
@@ -1437,15 +1537,16 @@ FIND_INS:
         LODI,R0 >PROG
         STRA,R0 TMPL
 FI_LP:
-        ; boundary check: TMPH:TMPL >= PEH:PEL → done
+        ; boundary check: TMPH:TMPL >= PEH:PEL → done (unsigned)
         LODA,R0 TMPH
-        SUBA,R0 PEH
+        SUBA,R0 PEH                      ; signed OK: PEH=$1A always < $80
         RETC,GT
         BCTR,LT FI_CHK
+        ; TMPH == PEH: unsigned lo via carry
         LODA,R0 TMPL
         SUBA,R0 PEL
-        RETC,GT
-        RETC,EQ                          ; == PEL → at end
+        TPSL $01                         ; C=1 → no borrow → TMPL >= PEL → done
+        RETC,EQ                          ; C=1 → at/past end
 FI_CHK:
         LODA,R0 *TMPH
         SUBA,R0 LNUMH
@@ -1466,7 +1567,7 @@ FI_LH:
         RETC,GT                          ; stored.lo >= target lo → insertion point
         RETC,EQ
 FI_ADV:
-        ; advance TMPH:TMPL by 3 + bodylen
+        ; advance TMPH:TMPL past record: skip hi+lo then scan body until CR
         LODA,R0 TMPL
         ADDI,R0 2
         STRA,R0 TMPL
@@ -1476,14 +1577,15 @@ FI_ADV:
         ADDI,R0 1
         STRA,R0 TMPH
 FI_AN:
-        LODA,R3 *TMPH                    ; bodylen
-        BSTA,UN INC_TMP
-FI_AN2:
-        COMI,R3 $00
-        BCTA,EQ FI_LP
+        ; scan body bytes until CR
 FI_AS:
+        LODA,R0 *TMPH
+        COMI,R0 CR
+        BCTR,EQ FI_DONE
         BSTA,UN INC_TMP
-        BDRR,R3 FI_AS
+        BCTR,UN FI_AS
+FI_DONE:
+        BSTA,UN INC_TMP          ; skip the CR itself
         BCTA,UN FI_LP
 
 
@@ -2098,21 +2200,19 @@ PF_CHRT7:
 PF_CHRARG:
         BSTA,UN INC_IP           ; consume '('
 PF_CHREA:
-        ; RAS-FIX: call PARSE_FACTOR not PARSE_EXPR to avoid depth overflow.
-        ; CHR$ argument is a single atom: literal number or variable only.
-        ; CHR$(A+32) not supported — use LET T=A+32:PRINT CHR$(T) workaround.
-        ; Depth: outer PARSE_FACTOR(4)→PF_CHREA→inner PARSE_FACTOR(5)
-        ;        →PARSE_S16(6)→PARSE_U16(6)→INC_IP(6) ← max 6, safe.
+        ; BUG-CHR-01 resolved: depth is now 7 (safe). Upgrade to PARSE_EXPR
+        ; so CHR$(I+48), CHR$(A+32) etc. work correctly.
+        ; Depth: DO_PRINT(3)→PARSE_EXPR(4)→PARSE_FACTOR/CHR$(5)→PARSE_EXPR(6)
+        ;        →PARSE_FACTOR(7) — max 7, safe.
         ; Note: PARSE_FACTOR clears CHRFLG at entry; PF_CHRDN restores it after.
-        BSTA,UN WSKIP            ; skip leading spaces (saves using PARSE_EXPR's PX_ATOM)
-        BSTA,UN PARSE_FACTOR     ; [+1]  evaluate single atom
+        BSTA,UN PARSE_EXPR       ; [+1]  evaluate full expression
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ PF_CHROK
         RETC,UN
 PF_CHROK:
-        BSTA,UN WSKIP            ; skip trailing spaces before ')'
-        BSTA,UN INC_IP           ; consume ')'
+        ; PARSE_EXPR already consumed ')' via PX_RPAR — do not consume again.
+        ; (Old PARSE_FACTOR path left ')' unconsumed; PARSE_EXPR does not.)
 PF_CHRDN:
         LODI,R0 $FF
         STRA,R0 STKIDX           ; BUG-CHR-02: restore outer PARSE_EXPR stack index.
@@ -2466,19 +2566,23 @@ DV_VA:
         STRA,R0 EXPH
         STRA,R0 EXPL  ; quotient = 0
 DV_LP:
-        ; while TMPH:TMPL >= SC0:SC1
+        ; while TMPH:TMPL >= SC0:SC1 (unsigned)
         LODA,R0 TMPH
-        SUBA,R0 SC0
-        BCTR,LT DV_DONE
-        BCTR,GT DV_SUB
+        SUBA,R0 SC0               ; hi byte (SC0 < $80 always for reasonable divisors)
+        BCTR,LT DV_DONE           ; TMPH < SC0 (signed OK if SC0 < $80) → done
+        BCTR,GT DV_SUB            ; TMPH > SC0 → subtract
+        ; TMPH == SC0: unsigned lo comparison via carry
         LODA,R0 TMPL
         SUBA,R0 SC1
-        BCTR,LT DV_DONE
+        TPSL $01                  ; C=1 → no borrow → TMPL >= SC1 → subtract
+        BCTR,EQ DV_SUB            ; C=1 → TMPL >= SC1 → continue subtract
+        BCTR,UN DV_DONE           ; C=0 → TMPL < SC1 → done
 DV_SUB:
         LODA,R0 TMPL
         SUBA,R0 SC1
         STRA,R0 TMPL
-        BCFR,LT DV_SNB
+        TPSL $01                  ; C=1 → no borrow → skip hi decrement
+        BCTR,EQ DV_SNB            ; C=1 → no borrow
         LODA,R0 TMPH
         SUBI,R0 1
         STRA,R0 TMPH
@@ -2551,12 +2655,16 @@ PS16P_MIN:
         BSTA,UN COUT
         RETC,UN
 PS16P_POS:
+        ; zero check: EXP == $0000?  (use EQ not GT to handle $FF correctly)
         LODA,R0 EXPH
         COMI,R0 $00
         BCTR,GT PS16P_NZ
+        BCTR,LT PS16P_NZ
         LODA,R0 EXPL
         COMI,R0 $00
-        BCTR,GT PS16P_NZ
+        BCTR,EQ PS16P_ZERO        ; EXPH=$00, EXPL=$00 → zero
+        BCTR,UN PS16P_NZ          ; EXPH=$00, EXPL!=0 → non-zero (handles $FF correctly)
+PS16P_ZERO:
         LODI,R0 A'0'
         BSTA,UN COUT
         RETC,UN
