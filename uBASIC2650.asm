@@ -20,106 +20,6 @@
 ;   ./pipbug_wrap -b 0xADDR uBASIC2650.hex      # breakpoint
 ;   ./pipbug_wrap -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
 ;
-; BUG-MAND-01 (FIXED): SC1 conflict in PARSE_EXPR/APPLY_OP.
-;   cur_prec saved in SC1; APPLY_OP clobbered SC1 with left.lo.
-;   Fix: use PRECTMP ($163D) to hold cur_prec across APPLY_OP.
-;
-; ── KNOWN OPEN BUGS (v2.1-dev, 2026-04-30) ──────────────────────────────────
-;
-; BUG-MAND-01 (ACTIVE): Mandelbrot expression U*U/16+V*V/16 gives wrong result.
-;   Symptom: PRINT U*U/16+V*V/16 returns 1 when U=16,V=0 (should be 16).
-;   A+0=16 works, U*U/16=16 works, but U*U/16+V*V/16=1.
-;   Root cause under investigation — suspected PARSE_EXPR operator stack issue
-;   when mixing * / + with identical-named variables.
-;   Does not affect: arithmetic without division-then-addition combos.
-;   Does not affect: showcase non-Mandelbrot sections.
-;
-; ── FIXED THIS SESSION (v2.1-dev) ────────────────────────────────────────────
-;
-; CR-FORMAT CHANGE: Line records now [linehi][linelo][body...][CR]
-;   Eliminates bodylen byte, saves ~50 bytes in STORE_LINE/DELETE_LINE.
-;   All affected routines updated: STORE_LINE, DELETE_LINE, FIND_LINE,
-;   FIND_INS, DO_LIST, DO_RUN.
-;
-; BUG-UNSIGNED-01 (FIXED): All record-walk boundary checks (DO_LIST DLS_LP,
-;   DO_RUN DR_LP, FIND_LINE, FIND_INS, DELETE_LINE DL2_LP) used signed
-;   subtraction for the lo-byte comparison. Signed fails when PEL > $7F
-;   (e.g. after storing 11+ lines, PEL=$C9 → $34-$C9 signed is GT, not LT).
-;   Fix: TPSL $01 after SUBA for lo byte to check carry (unsigned borrow).
-;
-; BUG-STORE-01 (FIXED): STORE_LINE scratch registers NEGFLG:RELOP were clobbered
-;   by PARSE_EXPR (NEGFLG used for sign in MUL/DIV, RELOP used for relop mask).
-;   Caused lines 12+ to corrupt program store silently.
-;   Fix: Changed STORE_LINE scratch to CURH:CURL (only written during RUN).
-;
-; BUG-STORE-02 (FIXED): Space-check scratch also used LNUMH:LNUML, clobbering
-;   the line number before FIND_INS was called.
-;   Fix: Space-check scratch moved to NEGFLG:RELOP (re-evaluated as safe here).
-;   Then scratch moved to CURH:CURL to avoid PARSE_EXPR collision (BUG-STORE-01).
-;
-; BUG-DIV-01 (FIXED): DIV16 loop used signed comparison for lo byte of
-;   dividend vs divisor. For 32767/128: $7F-$80 signed = GT → subtracted;
-;   correct unsigned: $7F < $80 → stop. Fix: TPSL $01 carry check.
-;
-; BUG-DIV-02 (FIXED): DIV16 borrow propagation used BCFR,LT (old signed-borrow
-;   pattern). Fix: TPSL $01 / BCTR,EQ DV_SNB (carry-based borrow detect).
-;
-; BUG-PRINT-02 (FIXED): PRINT_S16 zero check used BCTR,GT to skip "0" path.
-;   EXPL=$FF (=255 unsigned) is -1 signed → CC=LT → fell to PRINT "0".
-;   Fix: explicit BCTR,EQ PS16P_ZERO test only when EXPH=0 AND EXPL=0.
-;
-; BUG-CHR-02 (FIXED): CHR$(expr) only evaluated first atom (called PARSE_FACTOR
-;   not PARSE_EXPR). CHR$(I+48) returned I not I+48.
-;   Fix: CHR$ calls PARSE_EXPR; PF_CHROK no longer re-consumes ')' since
-;   PARSE_EXPR handles ')' via PX_RPAR.
-;
-; ── REGRESSION STATUS (v2.1-dev, 2026-04-30) ─────────────────────────────────
-;   PRINT numeric (all range)   ✓  including 128..32767, -32768
-;   PRINT 255, 256              ✓  (BUG-PRINT-02 fixed)
-;   256/16, 32767/128           ✓  (BUG-DIV-01/02 fixed)
-;   Arithmetic +/-/*///%        ✓
-;   IF all relops               ✓
-;   CHR$(expr)                  ✓  (BUG-CHR-02 fixed)
-;   CHR$() A-Z loop             ✓
-;   LET / PRINT variable        ✓
-;   GOTO counted loop           ✓
-;   Nested IF                   ✓
-;   LIST / NEW / RUN            ✓
-;   Edit/delete line            ✓
-;   11+ line programs           ✓  (BUG-UNSIGNED-01/STORE-01/02 fixed)
-;   Mandelbrot kernel (3 iters) ✓
-;   U*U/16+V*V/16 expression    ✗  BUG-MAND-01 (active)
-;
-; ── FIXED THIS SESSION ───────────────────────────────────────────────────────
-;
-; BUG-RELOP-02 (FIXED): TMI,R0 RELOP wrong — TMI takes immediate literal byte,
-;   assembler embedded $00 → all IF conditions trivially true.
-;   Fix: LODA,R1 RELOP / ANDZ,R1 / BCTR,EQ DIF_FALSE (runtime AND test).
-;
-; BUG-PRINT-MIN (FIXED): PRINT -32768 output "-0" — negation of $8000 overflows.
-;   Fix: detect EXPH=$80,EXPL=$00 before negation, print "32768" directly.
-;
-; BUG-PRINT-01 (FIXED): PRINT >=10000 corrupted (e.g. 32767→"3150#").
-;   Fix: PPSL $02 unsigned mode, COMZ,R1, ADDI,R3 1, TPSL $01 borrow.
-;
-; BUG-RELOP-01a (FIXED): EORZ,R1 in PARSE_RELOP entry does R0^=R1 not R1=0.
-;   Fix: EORZ,R0 / STRZ,R1.
-;
-; BUG-RELOP-01b (FIXED): STRZ,R1 before LODZ,R1 on PARSE_RELOP exit clobbered
-;   mask with non-relop char. Fix: removed STRZ,R1.
-;
-; ── REGRESSION STATUS (2026-04-22) ───────────────────────────────────────────
-;   PRINT numeric (all range)  ✓   including -32768, 32767
-;   Arithmetic +/-/*///%       ✓
-;   Parentheses                ✓
-;   IF relops =<><=>=<>        ✓   all 6 operators
-;   Nested IF                  ✓
-;   GOTO counted loop          ✓
-;   LET / PRINT variable       ✓
-;   LIST / NEW / RUN           ✓
-;   PRINT CHR$(n) simple       ✓
-;   CHR$() A-Z loop            ✓   (BUG-CHR-01 self-resolved after BCTA→BCTR pass)
-;
 ; ── MEMORY MAP ───────────────────────────────────────────────────────────────
 ;   $0000-$03FF  PIPBUG ROM (read-only)
 ;   $0400-$043F  PIPBUG RAM (reserved)
@@ -170,66 +70,6 @@
 ;
 ; ── KNOWN BUGS (as of v2.0-dev, 2026-04-22) ──────────────────────────────────
 ;
-; BUG-RELOP-02 (ACTIVE — BLOCKS ALL IF/THEN):
-;   Root cause: `TMI,R0 RELOP` in DIF_TMASK is semantically wrong.
-;   TMI is a 2-byte immediate instruction: TMI,rn mask — the mask is a
-;   LITERAL BYTE embedded in the instruction, not a memory address.
-;   The assembler resolves RELOP=$163E and truncates to immediate=$3E (or $00
-;   depending on truncation), so the test is always against a fixed constant,
-;   not the runtime RELOP value.  This makes ALL relational tests wrong.
-;
-;   Fix: Replace the TMI approach with a runtime AND:
-;     DIF_TMASK:
-;         LODA,R1 RELOP        ; R1 = runtime bitmask from RAM
-;         ANDZ,R1              ; R0 &= R1  (R0 had the result-bit: 1=LT, 2=EQ, 4=GT)
-;         BCTR,EQ DIF_FALSE    ; zero → no bit match → condition false
-;         BCTA,UN DIF_TRUE     ; non-zero → condition true
-;   Cost: net neutral (was 2 bytes TMI+branch, now 4 bytes — but removes two
-;   redundant intermediate labels DIF_IS_LT/DIF_IS_EQ).
-;   After fix, the whole DIF_IS_LT/DIF_IS_EQ/DIF_TMASK block simplifies to:
-;     ; SC1 = $FF→LT, $00→EQ, $01→GT
-;     LODA,R0 SC1
-;     COMI,R0 $FF
-;     BCTR,EQ DIF_BIT_LT       ; map LT→bit 0
-;     COMI,R0 $00
-;     BCTR,EQ DIF_BIT_EQ       ; map EQ→bit 1
-;     LODI,R0 4                 ; GT→bit 2
-;     BCTA,UN DIF_ANDTEST
-;   DIF_BIT_LT: LODI,R0 1 ; fall to DIF_ANDTEST (already done above)
-;   DIF_BIT_EQ: LODI,R0 2
-;   DIF_ANDTEST:
-;     LODA,R1 RELOP
-;     ANDZ,R1
-;     BCTR,EQ DIF_FALSE
-;     ; fall through to DIF_TRUE
-;
-; BUG-RELOP-01 (FIXED this session — two sub-bugs):
-;   BUG-RELOP-01a: `EORZ,R1` in PARSE_RELOP entry was used to zero R1 but
-;     EORZ,rn computes R0 ^= rn, leaving rn unchanged.  R1 stayed dirty with
-;     leftover INC_IP value, OR'd into the mask → wrong RELOP for <=, >=.
-;     Fix: replaced with EORZ,R0 / STRZ,R1.
-;   BUG-RELOP-01b: `STRZ,R1` before `LODZ,R1` on the PARSE_RELOP exit path
-;     overwrote R1 (the accumulated mask) with the non-relop char in R0.
-;     LODZ,R1 then loaded the corrupted char into R0 → RELOP = ASCII char.
-;     Fix: removed STRZ,R1, kept only LODZ,R1.
-;
-; BUG-PRINT-01 (FIXED this session):
-;   Root cause: the digit subtraction loop used BIRR,R3 (increment-and-branch)
-;   as a counter, but BIRR increments BEFORE testing — R3 count was off by one
-;   for values crossing place-value boundaries.  Also, the original borrow
-;   propagation tested BCFA,LT (no-borrow) instead of TPSL $01 (carry test),
-;   producing wrong hi-byte adjustment on borrow.  New version uses unsigned
-;   compare mode (PPSL $02), COMZ,R1 for comparison, ADDI,R3 1 for clean
-;   incrementing.  Restores PSL from R2 (saved via SPSL/STRZ,R2) on exit.
-;   Status: 0–32767 correct. -32768 still fails (two's-complement min-value
-;   negation overflow: -32768 negated is still -32768).
-;
-; BUG-PRINT-MIN (ACTIVE — minor):
-;   PRINT -32768 outputs "-0".  Negation of $8000: XOR→$7FFF, INC_EXP→$8000,
-;   sign bit still set → treated as negative again.
-;   Fix: special-case $8000 before negation: if EXPH=$80 and EXPL=$00, print
-;   literal "32768" after printing "-".
-;   Impact: minor — values 0 to 32767 all correct.
 ;
 ; BUG-CHR-01 (FIXED — self-resolved):
 ;   CHR$() loop was overflowing hardware RAS at depth 8. After the BCTA→BCTR
@@ -239,26 +79,6 @@
 ; BUG-COLON (UNCONFIRMED):
 ;   Multi-statement lines "LET A=1:PRINT A" may not be implemented.
 ;   Not tested — investigate after relop fix.
-;
-; ── REGRESSION STATUS (v2.0-dev, 2026-04-22) ────────────────────────────────
-;   PRINT numeric (0-9999)     ✓
-;   PRINT numeric (10000-32767)✓  (fixed BUG-PRINT-01 this session)
-;   PRINT -32768               ✗  (BUG-PRINT-MIN)
-;   IF relops (=, <, >, <=, >=, <>)  ✗  (BUG-RELOP-02 — all wrong)
-;   PRINT CHR$(n) simple       ✓
-;   CHR$() in loop             ✗  (BUG-CHR-01)
-;   LET A=expr / PRINT A       needs re-test after relop fix
-;   GOTO counted loop          needs re-test after relop fix
-;   LIST / NEW / RUN           ✓
-;   Arithmetic +/-/*///%       ✓
-;   Parentheses                ✓
-;
-; ── NEXT STEPS (priority order) ──────────────────────────────────────────────
-;   1. Fix BUG-RELOP-02: replace TMI,R0 RELOP with LODA,R1 RELOP / ANDZ,R1
-;      in DIF_TMASK. ~4 lines changed, net neutral size.
-;   2. Fix BUG-PRINT-MIN: special-case -32768 in PRINT_S16 prologue. ~8 bytes.
-;   3. Full regression after 1+2: GOTO loop, LET, nested IF.
-;   4. BUG-CHR-01: SW stack for PARSE_EXPR (major restructuring).
 ;
 ; ── BCTA→BCTR SIZE REDUCTION (deferred) ─────────────────────────────────────
 ;   Assembler --no-warn-local-branch reports ~90 BCTA that could be BCTR.
@@ -757,8 +577,8 @@ DP_SEP:
         BCTR,EQ DP_COMMA
         ; fall through to DP_NL (NUL, or any non-separator = end of PRINT)
 DP_NL:
-        BSTA,UN CRLF
-        RETC,UN
+        BCTA,UN CRLF
+        ; RETC,UN
 DP_SEMI:
         BSTA,UN INC_IP                   ; consume ';'
 DP_SEMI2:
@@ -962,12 +782,12 @@ DIF_IS_EQ:
 DIF_ANDTEST:
         LODA,R1 RELOP                    ; R1 = runtime bitmask from RAM
         ANDZ,R1                          ; R0 &= R1  (ANDZ,rn: R0 &= rn)
-        BCTR,EQ DIF_FALSE                ; zero → no bit match → condition false
+        RETC,EQ ; DIF_FALSE                ; zero → no bit match → condition false
         ; fall through to DIF_TRUE
-        BSTA,UN STMT_EXEC                ; [+1]  execute THEN body
-        RETC,UN
-DIF_FALSE:
-        RETC,UN
+        BCTA,UN STMT_EXEC                ; [+1]  execute THEN body
+        ; RETC,UN
+;DIF_FALSE:
+        ; RETC,UN
 
 DO_GOTO:
         BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
@@ -1019,7 +839,6 @@ DLS_LP:
         SUBA,R0 PEL             ; TMPL - PEL (signed sub but carry=1 means >=)
         TPSL $01                ; C=1 → no borrow → TMPL >= PEL → at/past end
         RETC,EQ                 ; CC=EQ means C=1 → TMPL >= PEL → done
-DLS_BODY:
 DLS_BODY:
         ; line number hi:lo
         LODA,R0 *TMPH
@@ -2262,16 +2081,20 @@ PRO_LP:
         RETC,UN
 PRO_LT:
         IORI,R1 1                        ; set LT bit
-        BSTA,UN INC_IP
-        BCTR,UN PRO_LP
+        BSTR,UN PRO_JMP
+        ; BSTA,UN INC_IP
+        ; BCTR,UN PRO_LP
 PRO_EQ:
         IORI,R1 2                        ; set EQ bit
-        BSTA,UN INC_IP
-        BCTR,UN PRO_LP
+        BSTR,UN PRO_JMP
+        ; BSTA,UN INC_IP
+        ; BCTR,UN PRO_LP
 PRO_GT:
         IORI,R1 4                        ; set GT bit
+PRO_JMP:
         BSTA,UN INC_IP
         BCTR,UN PRO_LP
+
 PRO_NONE:
         LODI,R0 1
         STRA,R0 ERRFLG
@@ -2671,8 +2494,8 @@ PS16P_POS:
         BCTR,UN PS16P_NZ          ; EXPH=$00, EXPL!=0 → non-zero (handles $FF correctly)
 PS16P_ZERO:
         LODI,R0 A'0'
-        BSTA,UN COUT
-        RETC,UN
+        BCTA,UN COUT
+        ; RETC,UN
 
 PS16P_NZ:
         LODI,R0 <DIVTAB
@@ -2767,7 +2590,7 @@ PS16P_LAST:
 ; Later Implement Proprietary Bitbanged SENSE input when basic working
 ; Returns char in R0.  Clobbers R0 only.
 GETKEY:
-;        BSTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
+        BCTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
 ;        RETC,UN
 
 ; ─── RDLINE ───────────────────────────────────────────────────────────────────
@@ -2841,8 +2664,8 @@ RL_BSNB:
 RL_EOL:
         LODI,R1 NUL
         STRA,R1 *IPH            ; NUL-terminate buffer
-        BSTA,UN CRLF
-        RETC,UN
+        BCTA,UN CRLF
+        ;RETC,UN
 
 ; ─── PRTSTR / PRTSTR_IP ───────────────────────────────────────────────────────
 ; Print NUL-terminated string at IPH:IPL.
