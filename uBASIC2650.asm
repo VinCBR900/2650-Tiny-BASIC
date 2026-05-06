@@ -1,6 +1,6 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.1-dev
-;
+; Version: v2.1
+; Date:    2026-05-06
 ; Size: 4234 bytes ($0440-$14C9)
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
@@ -19,6 +19,10 @@
 ;   ./pipbug_wrap -t uBASIC2650.hex             # CPU trace
 ;   ./pipbug_wrap -b 0xADDR uBASIC2650.hex      # breakpoint
 ;   ./pipbug_wrap -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
+;
+; BUG-MAND-01 (FIXED): SC1 conflict in PARSE_EXPR/APPLY_OP.
+;   cur_prec saved in SC1; APPLY_OP clobbered SC1 with left.lo.
+;   Fix: use PRECTMP ($163D) to hold cur_prec across APPLY_OP.
 ;
 ; ── KNOWN OPEN BUGS (v2.1-dev, 2026-04-30) ──────────────────────────────────
 ;
@@ -496,6 +500,7 @@ VALSL   EQU $1624   ; value stack lo  [8]  $0124-$012B
 STKIDX  EQU $162C   ; parser stack top ($FF=empty)
 SWSP    EQU $162D   ; SW call stack pointer ($FF=empty)
 SWSTK   EQU $162E   ; SW call stack 8×2 bytes  $012E-$013D
+PRECTMP EQU $163D   ; PARSE_EXPR cur_prec save (survives APPLY_OP which clobbers SC1)
 RELOP   EQU $163E   ; relational op 1-6
 CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
 ; ── SW call stack (v2.0) ─────────────────────────────────────────────────────
@@ -1709,7 +1714,7 @@ PX_PEEKOP:
         BSTA,UN GET_PREC                 ; [+1]  R0 = prec(cur op)  ; 0=not an op
         COMI,R0 $00
         BCTA,EQ PX_RALL  ; end of expression → reduce all
-        STRA,R0 SC1                      ; SC1 = cur op prec
+        STRA,R0 PRECTMP                      ; PRECTMP = cur op prec (SC1 is scratch for APPLY_OP)
 
 PX_REDLP:
         ; while STKIDX >= 1 and top-op-prec >= SC1: reduce
@@ -1731,7 +1736,7 @@ PX_TOPNC:
         COMI,R0 A'('
         BCTR,EQ PX_PUSHOP  ; sentinel → stop reducing
         BSTA,UN GET_PREC_SC0             ; [+1]  R0 = prec(SC0)
-        SUBA,R0 SC1                      ; top_prec - cur_prec
+        SUBA,R0 PRECTMP                      ; top_prec - cur_prec (SC1 clobbered by APPLY_OP, use PRECTMP)
         BCTR,LT PX_PUSHOP                ; top_prec < cur_prec → push new op
         BSTA,UN APPLY_OP                 ; [+1]  reduce top pair
         BCTR,UN PX_REDLP
