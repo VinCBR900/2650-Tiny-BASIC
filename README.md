@@ -14,7 +14,7 @@ So far, this has been much more difficult than writing the [6502 Tiny BASIC](htt
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
 - 8kbyte memory pages - shouldn't matter here as expect max 4kbyte ROM, 4kbyte RAM
   
-The biggest challange is that, unlike MOS 6502, Claude, Gemini and CODEX dont really know the 2650 CPU architecture, probably because training data is limited.  Available period PDF data sheets and App notes have been poorely OCR'ed so cant just feed in to the AI.
+The biggest challange is that, unlike MOS 6502, Claude, Gemini and CODEX dont really know the 2650 CPU architecture, probably because training data is limited.  Available period PDF data sheets and App notes are poorely OCR'ed (Probably scanned in the 1990s) so can't just feed into the AI.
 
 So they all **confidently** write code that is plain wrong.
 
