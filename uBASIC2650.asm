@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.1
+; Version: v2.2-dev
 ; Date:    2026-05-06
 ; Size: 4234 bytes ($0440-$14C9)
 ;
@@ -16,23 +16,8 @@
 ;   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
 ;   ./asm2650 uBASIC2650.asm uBASIC2650.hex
 ;   ./pipbug_wrap uBASIC2650.hex
-;   ./pipbug_wrap -t uBASIC2650.hex             # CPU trace
-;   ./pipbug_wrap -b 0xADDR uBASIC2650.hex      # breakpoint
-;   ./pipbug_wrap -m 0xADDR LEN uBASIC2650.hex  # mem dump at halt
-;
-; ── MEMORY MAP ───────────────────────────────────────────────────────────────
-;   $0000-$03FF  PIPBUG ROM (read-only)
-;   $0400-$043F  PIPBUG RAM (reserved)
-;   $0440-$147D  uBASIC code (this file, 4158 bytes)
-;   $1600-$163F  RAM variables (see EQU block)
-;   $1640-$165F  SW call stack (32 bytes = 16 frames, v2.0 — not yet active)
-;   $1660-$1662  SW stack workspace (TEMPRETH, TEMPRETL, R3SAVE)
-;   $1658-$165C  PRINT_S16 digit buffer P16BUF (5 bytes — not yet used)
-;   $1663-$16A2  IBUF input buffer (64 bytes)
-;   $1A00-$1A33  VARS A-Z variables (52 bytes)
-;   $1A34-$1BFF  PROG program store (460 bytes — NOTE: reduced from 1607)
-;   $1C00        PROGLIM
-;
+
+
 ; ── CC SEMANTICS (2650 ALU) ──────────────────────────────────────────────────
 ;   ADD: result>=128→LT  result>0,<128→GT  result=0→EQ
 ;   SUB: result>=128→LT  result>0,<128→GT  result=0→EQ
@@ -68,8 +53,19 @@
 ;   Correct pop pattern: increment R1 once after N pushes, loop *BUF,R1- until R1=0.
 ;   SWRETURN implementation deferred pending BUG-RELOP-02 fix and BUG-CHR-01 fix.
 ;
-; ── KNOWN BUGS (as of v2.0-dev, 2026-04-22) ──────────────────────────────────
+; ── KNOWN BUGS (as of v2.2-dev, 2026-05-16) ──────────────────────────────────
 ;
+; BUG-FL-01 (ACTIVE — blocks 14+ line programs):
+;   FIND_LINE FL_CHKLO sets up EXPH:EXPL = TMPH:(TMPL+1) to read the
+;   stored lo byte of a line number. The page-carry check used RETC,LT
+;   which returned before STRA EXPH — leaving EXPH stale. LODA *EXPH
+;   then read from the wrong address. False positive matches caused
+;   DELETE_LINE to delete valid records for line numbers where the
+;   target-stored comparison wraps past $7F.
+;   Fix attempt: BCTR,LT FL_LH (branch instead of return) — assembles
+;   correctly but causes a 2-line regression (root cause not yet found).
+;   Impact: any program with 14+ lines may corrupt the program store.
+;   Basic 3-line store/edit/delete still works correctly.
 ;
 ; BUG-CHR-01 (FIXED — self-resolved):
 ;   CHR$() loop was overflowing hardware RAS at depth 8. After the BCTA→BCTR
@@ -80,11 +76,27 @@
 ;   Multi-statement lines "LET A=1:PRINT A" may not be implemented.
 ;   Not tested — investigate after relop fix.
 ;
-; ── BCTA→BCTR SIZE REDUCTION (deferred) ─────────────────────────────────────
+; ── SIZE REDUCTIONS (deferred) ─────────────────────────────────────
 ;   Assembler --no-warn-local-branch reports ~90 BCTA that could be BCTR.
-;   Estimated saving: ~90 bytes.  Apply after all bugs fixed.
+;      Estimated saving: ~90 bytes.  Apply after all bugs fixed.
+;   Look for Relative jumps to RETC, UN to be reviewed after all bugs fixed.        
 
 ; Change history:
+;   v2.2-dev  BUG-RAS-01 FIXED: BSTR,UN PRO_JMP in PARSE_RELOP leaked RAS slot
+;               per relop char. All IF/THEN conditions were broken.
+;               Fix: BSTR→BCTR in PRO_LT/PRO_EQ.
+;             BUG-MAND-01 FIXED: SC1 conflict between PARSE_EXPR cur_prec
+;               and APPLY_OP left.lo. U*U/16+V*V/16 gave 1 instead of 16.
+;               Fix: dedicated PRECTMP ($163D).
+;             BUG-FI-01 FIXED: FI_CHK comparison stored-target wraps when
+;               values span $7F ($0A-$8C=$7E=GT, false deletion). Fix: reversed
+;               to target-stored in FIND_INS FI_CHK.
+;             BUG-FL-01 (ACTIVE): FL_CHKLO in FIND_LINE reads stale EXPH
+;               when page-carry path taken — RETC,LT skipped STRA EXPH so
+;               LODA *EXPH read wrong address. Fix attempt (BCTR,LT FL_LH)
+;               introduced 2-line regression. Incomplete. Programs >13 lines
+;               corrupt program store.
+;             Code size: 4218 bytes ($0440-$14B9).
 ;   v2.1-dev  CR-terminated line format (bodylen byte removed). All 6 affected
 ;             routines updated. Net size change: -10 bytes before unsigned fixes.
 ;             BUG-UNSIGNED-01 FIXED: signed boundary checks in DLS_LP/DR_LP/
@@ -113,170 +125,6 @@
 ;             Auto-index semantics confirmed: *BASE,Rn+/- are pre-modify.
 ;             Regression: PRINT numeric ✓, IF/THEN ✗ (BUG-RELOP-02),
 ;               CHR$() simple ✓, CHR$() loop ✗ (BUG-CHR-01).
-;   v1.17  Conditional returns replacing BCTA+RETC patterns (~15 bytes).
-;          Relop bitmask parser: <1 =2 >4 in R1; TMI test in DO_IF (~120 bytes).
-;          FIND_LINE calls FIND_INS, sharing walk code (~57 bytes).
-;          KW_TAB [c1][c2][hi][lo]; STMT_EXEC indirect dispatch via *GOTOH.
-;          Paren bug FIXED (PX_POPSENT copies value down, decrements STKIDX).
-;          HW stack overflow FIXED (INC_IP inlined in PARSE_U16 digit loop).
-;   v1.15  CHR$(), PRINT semicolons, modulo %; RAS fix (PARSE_U16 WSKIP removed).
-;   v1.11 BUG-SCA-12 FIXED: DO_RUN next-line-pointer save/restore used
-;           STRA,R0 *SWSTK / LODA,R0 *SWSTK (indirect — dereferences the value
-;           stored AT SWSTK as a pointer, then accesses that address). After
-;           CLRV, SWSTK=$00:$00, so the first RUN wrote the next-line pointer
-;           hi byte into PIPBUG ROM at $0000. Fix: STRA,R0 SWSTK / LODA,R0 SWSTK
-;           (direct), matching the correct SWSTK+1 usage on adjacent lines.
-;         BUG-SCA-13 FIXED: WinArcadia assembler requires labels to be on their
-;           own dedicated line (per header comment). Three labels had code on the
-;           same line: UC_DO:, UC_RET:, EW_DS:. WinArcadia silently dropped the
-;           instruction on the label line, so UC_DO jumped to RETC,UN instead of
-;           SUBI,R0 32 — lowercase input was never uppercased, so every keyword
-;           scan failed and every direct command returned ?0. Fix: split all
-;           three labels onto their own lines.
-;   v1.10 BUG-SCA-11 FIXED: BDRR/BDRA semantics are rn--; if(rn!=0) branch —
-;           exit when rn hits zero (not signed underflow to $FF as previously
-;           assumed). All v1.9 BDRR conversions that load a count from memory
-;           (bodylen, shift count) are correct because N iterations occur for
-;           load value N. Two sites had hardcoded wrong loads:
-;           (a) CLRV: load was $33 → only 51 iterations, missing last VARS byte
-;               at $01B7. Fix: load $34 for 52 iterations.
-;           (b) PU16_M10: load was 9 → only 9 multiplications (off by 1 in
-;               every multi-digit number). Fix: load 10 for 10 iterations.
-;           Also corrected all BDRR loop comments to say "if R3!=0 branch"
-;           instead of "while R3>=0 signed".
-;   v1.9  BUG-SCA-01 FIXED: CLRV loop used BRNR,R3 (pure test, no decrement) →
-;           infinite loop on startup. R3 never reached zero. Fix: BDRR,R3 with
-;           initial load adjusted for BDRR semantics (exits after N+1 iters when
-;           loaded with N; load $33 for 52 clears, guard zero case not needed as
-;           VARS is always 52 bytes). Label CLRV_NC removed (no longer needed).
-;         BUG-SCA-02 FIXED: DO_LIST DLS_BLPX body-print loop used BRNR,R3 →
-;           infinite loop printing first byte of every stored line body.
-;           Fix: BDRR,R3. R3 loaded from memory; guard COMI,R3 $00 / BCTA,EQ
-;           DLS_NL before loop entry retained (BDRR with R3=0 would execute once).
-;           Label DLS_BNC removed.
-;         BUG-SCA-03 FIXED: DO_RUN DR_CPY copy-to-IBUF loop used BRNR,R3 →
-;           infinite loop copying line body. Fix: BDRR,R3.
-;           Labels DR_TNC, DR_INC removed.
-;         BUG-SCA-04 FIXED: STORE_LINE SL_SHLOOP shift loop used BRNR,R3 →
-;           infinite loop during any line insertion that requires shifting.
-;           Fix: BDRR,R3. Existing zero-count guard (COMI,R3 / BCTA,EQ SL_NOSHIFT)
-;           at loop entry retained (BDRR with R3=0 executes once).
-;         BUG-SCA-05 FIXED: STORE_LINE SL_WBODY write-body loop used BRNR,R3 →
-;           infinite loop writing body bytes. Fix: BDRR,R3.
-;           Labels SL_WBNC, SL_WENC removed.
-;         BUG-SCA-06 FIXED: FIND_LINE FL_AS advance loop used BRNR,R3 →
-;           infinite loop advancing past body bytes; search never found any line
-;           beyond the first record. Fix: BDRR,R3. Label FL_ASN removed.
-;         BUG-SCA-07 FIXED: FIND_INS FI_AS advance loop — same as BUG-SCA-06.
-;           Fix: BDRR,R3. Label FI_ASN removed.
-;         BUG-SCA-08 FIXED: DELETE_LINE DL2_SKIP advance loop used BRNR,R3 →
-;           infinite loop; deletion never found copy start. Fix: BDRR,R3.
-;           Label DL2_SN removed.
-;         BUG-SCA-09 FIXED: MUL16 right-operand abs() NEGFLG toggle was inside
-;           the carry path only (BCTA,GT jumped over both the hi-byte increment
-;           AND the EORI/STRA toggle). For most negative right values (e.g. -3:
-;           abs complement+1 = no carry), NEGFLG was never toggled, giving wrong
-;           sign: 3*(-3)=+9 instead of -9. Fix: introduce MU_RA_NC label so the
-;           no-carry path skips only the hi-byte increment but falls through to
-;           the NEGFLG toggle. Same fix applied to DIV16 DV_VA block (BUG-SCA-09b).
-;         BUG-SCA-10 FIXED: PARSE_U16 multiply-by-10 loop used BRNR,R3 with
-;           LODI,R3 10 — R3 never decremented, so any number with 2+ digits
-;           entered an infinite loop during parsing. Fix: BDRR,R3 with load
-;           adjusted to 9 (BDRR gives 10 iterations: 9→8→...→0→exit).
-;   v1.8  ISSUE-01 RE-FIX: MUL16/DIV16 NEGFLG placement was still wrong.
-;           The LODI,R0 1 / STRA,R0 NEGFLG in v1.7 was placed after the
-;           hi-byte carry increment, which is only reached on carry. For
-;           values like -3 ($FFFD): XOR→$0002, +1→$0003 — no carry, so
-;           BCTA,GT branched past NEGFLG=1 to MU_LA/DV_DA. Sign was lost,
-;           result printed positive. Fix: introduce MU_LNC/DV_DNC labels,
-;           branch there on carry (skipping hi-byte inc), then BOTH paths
-;           fall into LODI,R0 1 / STRA,R0 NEGFLG before MU_LA/DV_DA.
-;   v1.7  ISSUE-03 FIXED: DO_GOTO set GOTOFLG=$00 (EORZ/STRA) instead of $01.
-;           GOTO was silently ignored during RUN — DR_GOTO path never triggered.
-;           Fix: LODI,R0 1 / STRA,R0 GOTOFLG.
-;         ISSUE-01 FIXED: MUL16/DIV16 NEGFLG reset bug. The abs(left) block
-;           contained EORZ,R0 / STRA,R0 NEGFLG AFTER the two's-complement
-;           negation carry propagation step. This unconditionally cleared NEGFLG
-;           to zero even after it had been set to 1 for a negative left operand.
-;           Net effect: negative×anything gave wrong sign (e.g. -3*2=6 not -6).
-;           Fix: replace EORZ/STRA in abs(left) blocks with LODI,R0 1 / STRA,R0
-;           NEGFLG in both MUL16 and DIV16.
-;         ISSUE-02 FIXED: STORE_LINE shift-dest carry corrupted GOTOH.
-;           After ADDA,R0 SC1 / STRA,R0 GOTOL, the carry from the low-byte add
-;           was lost when LODA,R0 LNUMH loaded LNUMH (clobbering CC). The
-;           subsequent BCTA,GT SL_DSNCA tested LNUMH's sign/zero, not carry.
-;           Fix: test carry with BCTA,GT before LODA, duplicate LODA on both
-;           paths (carry / no-carry), store GOTOH on both paths.
-;         ISSUE-05 FIXED: PARSE_RELOP no-match path returned ERRFLG=$00 (success)
-;           when no relop character found. DO_IF proceeded as if relop was valid,
-;           using the previous RELOP value — silent wrong comparison.
-;           Fix: set ERRFLG=$01 before RETC,UN on the no-match path.
-;         ISSUE-04 FIXED: SE_SCAN / SE_C2N table-advance used BCTR,GT (relative
-;           short branch) to skip TMPH hi-byte increment, but CC after STRA is
-;           set by the stored value not the carry. Replaced with carry-safe idiom:
-;           test carry via BCTA,GT before STRA, then branch two paths.
-;           Note: practical risk was near-zero (KW_TAB <64B, no page wrap), but
-;           corrected for correctness.
-;         ISSUE-06 FIXED: Removed redundant second NUL check in RDLINE. After
-;           BUG-ASM-08 fix (v1.6), the first NUL check at RL_LP entry catches
-;           EOF. The second check after RL_STORE was unreachable dead code.
-;   v1.6  BUG-BASIC-14 FIXED: DO_LET variable letter saved to SC0 before
-;           PARSE_EXPR, but PARSE_EXPR clobbers SC0 (operator stack writes it
-;           repeatedly). DL_STORE read the token id, not the letter. All LET
-;           statements wrote to the wrong VARS slot.
-;           Fix: STRZ,R2 saves letter to R2 (never written by any routine);
-;           DL_STORE restores with LODZ,R2 before computing VARS address.
-;           DO_INPUT also updated for consistency.
-;         BUG-BASIC-15 FIXED: PF_LOADVAR saved variable letter to SC0, called
-;           INC_IP (clobbers R0 with new IPL), then used R0 directly for the
-;           VARS offset calculation instead of reloading from SC0.
-;           Fix: LODA,R0 SC0 added after INC_IP call.
-;         BUG-BASIC-16 FIXED: All 15 indexed VARS/stack accesses used
-;           STRA,R1 TMPL after ADDZ,R1. ADDZ,R1 means R0 += R1 (ends-in-Z
-;           affects R0); R1 is unchanged. Storing R1 always wrote the base
-;           address low byte, not the computed offset. This is the v1.4
-;           BUG-BASIC-07 "fix" applied backwards — it swapped R0→R1 but R0
-;           is correct (R0 holds the sum after ADDZ). The original code was
-;           right; the v1.4 fix broke it. All 15 STRA,R1 TMPL → STRA,R0 TMPL.
-;         BUG-ASM-08 FIXED: RDLINE entered infinite NUL loop after stdin EOF.
-;           GETKEY returns NUL ($00) forever once stdin is exhausted. RDLINE
-;           stored NULs filling IBUF, then overflowed into VARS ($0184+),
-;           zeroing variable values set by LET during RUN. This is why LET
-;           worked (confirmed by watchpoint at $0185) but the value was then
-;           clobbered before PRINT could read it.
-;           Fix: added COMI,R0 NUL / BCTA,EQ RL_EOL immediately after GETKEY
-;           in RL_LP. NUL from stdin EOF is treated as end-of-line.
-;   v1.5  BUG-BASIC-09 FIXED: TRY_STORE_LINE/TSL_DONE cleared ERRFLG to $00
-;           after storing a numbered line. REPL checks ERRFLG=$01 to skip
-;           execution, so every stored line was immediately executed too.
-;           Fix: TSL_DONE sets ERRFLG=$01.
-;         BUG-BASIC-10 FIXED: FIND_LINE never set ERRFLG=$01 for "not found".
-;           ERRFLG was cleared at entry and never set to $01; FL_RET returned
-;           with ERRFLG=$00 (same as "found"), so DELETE_LINE always believed
-;           a line existed and corrupted the program store on every STORE_LINE.
-;           Fix: FL_RET sets ERRFLG=$01 before returning.
-;         BUG-BASIC-11 FIXED: FIND_INS used BCTA,UN FI_RET on both GT and EQ
-;           hi-byte compare, making the lo-byte check dead code. Lines sharing
-;           the same hi byte (e.g. 10 and 20, both hi=$00) were always inserted
-;           at the first record found, corrupting sort order.
-;           Fix: BCTA,GT FI_RET so EQ falls through to lo-byte comparison.
-;         BUG-BASIC-12 FIXED: DO_LIST called PRINT_S16 without saving TMPH:TMPL.
-;           PRINT_S16 loads DIVTAB address into TMPH:TMPL, destroying the LIST
-;           iterator. Result: infinite loop printing garbage after first line
-;           number. Fix: save/restore TMPH:TMPL via LNUMH:LNUML around call.
-;         BUG-BASIC-13 FIXED: DO_RUN saved the next-line pointer in SC0:SC1,
-;           but SC0:SC1 are general scratch clobbered by STMT_EXEC (PRINT_S16,
-;           STORE_LINE, parser all write SC0/SC1). After executing any line the
-;           restored TMPH:TMPL was garbage, causing RUN to jump to a random
-;           address. Fix: save next-line pointer in SWSTK[0:1] ($012E:$012F),
-;           which are unused until GOSUB is implemented.
-;   v1.4  BUG-BASIC-07 (INCORRECTLY FIXED — re-fixed in v1.6 above):
-;           Changed STRA,R0 TMPL to STRA,R1 TMPL, believing ADDZ,R1 stored
-;           the result in R1. Correct understanding: ADDZ,R1 = R0 += R1.
-;   v1.3  BUG-BASIC-03..06, BUG-ASM-04/06/10 fixed (see earlier sessions).
-;   v1.2  BUG-BASIC-01: All HI/LO operators corrected (66 swapped lines).
-;   v1.1  Initial PIPBUG 1 port.
-
 ; ─── ASCII ────────────────────────────────────────────────────────────────────
 CR      EQU     $0D
 LF      EQU     $0A
@@ -1338,7 +1186,7 @@ FL_CHKLO:
         STRA,R0 EXPL
         LODA,R0 TMPH
         TPSL $01
-        RETC,LT                          ; no carry → EXPH = TMPH
+        BCTR,LT FL_LH                    ; no carry → EXPH = TMPH (was RETC_LT: skipped STRA!)
         ADDI,R0 1
 FL_LH:
         STRA,R0 EXPH
@@ -1372,10 +1220,13 @@ FI_LP:
         TPSL $01                         ; C=1 → no borrow → TMPL >= PEL → done
         RETC,EQ                          ; C=1 → at/past end
 FI_CHK:
-        LODA,R0 *TMPH
-        SUBA,R0 LNUMH
-        BCTR,LT FI_ADV
-        RETC,GT                          ; stored.hi > target → insertion point found
+        ; Compare target (LNUMH:LNUML) vs stored record line number.
+        ; Reverse subtraction: LNUMH - stored.hi avoids signed byte-wrap bug.
+        ; (stored - target wraps when values span $7F, giving wrong CC)
+        LODA,R0 LNUMH
+        SUBA,R0 *TMPH                    ; LNUMH - stored.hi
+        BCTR,GT FI_ADV                   ; target.hi > stored.hi → advance
+        BCTR,LT FI_RET                   ; target.hi < stored.hi → insertion point
         ; hi bytes equal: check lo
         LODA,R0 TMPL
         ADDI,R0 1
@@ -1386,10 +1237,12 @@ FI_CHK:
         ADDI,R0 1
 FI_LH:
         STRA,R0 EXPH
-        LODA,R0 *EXPH
-        SUBA,R0 LNUML
-        RETC,GT                          ; stored.lo >= target lo → insertion point
-        RETC,EQ
+        LODA,R0 LNUML
+        SUBA,R0 *EXPH                    ; LNUML - stored.lo (reverse to avoid wrap bug)
+        BCTR,GT FI_ADV                   ; target.lo > stored.lo → advance
+        ; LNUML <= stored.lo → insertion point (EQ = exact match)
+FI_RET:
+        RETC,UN
 FI_ADV:
         ; advance TMPH:TMPL past record: skip hi+lo then scan body until CR
         LODA,R0 TMPL
@@ -2081,14 +1934,10 @@ PRO_LP:
         RETC,UN
 PRO_LT:
         IORI,R1 1                        ; set LT bit
-        BSTR,UN PRO_JMP
-        ; BSTA,UN INC_IP
-        ; BCTR,UN PRO_LP
+        BCTR,UN PRO_JMP                  ; BUG-RAS-01 FIX: was BSTR (leaked RAS slot)
 PRO_EQ:
         IORI,R1 2                        ; set EQ bit
-        BSTR,UN PRO_JMP
-        ; BSTA,UN INC_IP
-        ; BCTR,UN PRO_LP
+        BCTR,UN PRO_JMP                  ; BUG-RAS-01 FIX: was BSTR (leaked RAS slot)
 PRO_GT:
         IORI,R1 4                        ; set GT bit
 PRO_JMP:
