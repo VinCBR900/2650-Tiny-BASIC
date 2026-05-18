@@ -9,8 +9,8 @@ First attempt at writing a Signetics 2650 Tiny BASIC Interpreter in Claude with 
 So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Archtectural Challanges are: 
 
 - 8 level hardware stack. Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
-  - Even worse, this is User Inaccessible - no `push`/`pop`s allowed 
-  - Option is to use SW stack but thatconsumes a register and adds 10-20 bytes of overhead each call, so best be worth it...  
+  - Even worse, this is User Inaccessible - no `push`/`pop`s allowed to clean up the stack
+  - Option is to use SW stack but that consumes a register and adds 10-20 bytes of overhead each call, so best be worth it...  
 - Although it has nice features like auto-increment and decrement, and branch on condition code, these are not size optimized
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
 - 8kbyte memory pages - shouldn't matter here as expect max 4kbyte ROM, 4kbyte RAM
