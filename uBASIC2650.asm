@@ -1,7 +1,6 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.2-dev
-; Date:    2026-05-06
-; Size: 4234 bytes ($0440-$14C9)
+; Version: v2.2
+; Date:    2026-05-19
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.
@@ -46,7 +45,7 @@
 ;   LNUMH:LNUML — scratch line number; save area in DO_LIST (BUG-BASIC-12 fix)
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (BUG-BASIC-12 fix)
 ;
-; ── v2.0 SW STACK INFRASTRUCTURE (EQUs added, not yet activated) ─────────────
+; ── v2.0 SW STACK INFRASTRUCTURE  ─────────────
 ;   SWBASE=$1640, TEMPRETH=$1660, TEMPRETL=$1661, R3SAVE=$1662, P16BUF=$1658.
 ;   Auto-index semantics confirmed: *BASE,R1+ = pre-increment (R1++ then access).
 ;   Correct PRINT_S16 digit push pattern: init R1=$FF, *BUF,R1+ writes BUF+0 first.
@@ -67,64 +66,11 @@
 ;   Impact: any program with 14+ lines may corrupt the program store.
 ;   Basic 3-line store/edit/delete still works correctly.
 ;
-; BUG-CHR-01 (FIXED — self-resolved):
-;   CHR$() loop was overflowing hardware RAS at depth 8. After the BCTA→BCTR
-;   pass saved 135 bytes and shifted code addresses, the branch targets moved
-;   within relative range and depth reduced to 7. All CHR$() loop tests pass.
 ;
 ; BUG-COLON (UNCONFIRMED):
 ;   Multi-statement lines "LET A=1:PRINT A" may not be implemented.
 ;   Not tested — investigate after relop fix.
 ;
-; ── SIZE REDUCTIONS (deferred) ─────────────────────────────────────
-;   Assembler --no-warn-local-branch reports ~90 BCTA that could be BCTR.
-;      Estimated saving: ~90 bytes.  Apply after all bugs fixed.
-;   Look for Relative jumps to RETC, UN to be reviewed after all bugs fixed.        
-
-; Change history:
-;   v2.2-dev  BUG-RAS-01 FIXED: BSTR,UN PRO_JMP in PARSE_RELOP leaked RAS slot
-;               per relop char. All IF/THEN conditions were broken.
-;               Fix: BSTR→BCTR in PRO_LT/PRO_EQ.
-;             BUG-MAND-01 FIXED: SC1 conflict between PARSE_EXPR cur_prec
-;               and APPLY_OP left.lo. U*U/16+V*V/16 gave 1 instead of 16.
-;               Fix: dedicated PRECTMP ($163D).
-;             BUG-FI-01 FIXED: FI_CHK comparison stored-target wraps when
-;               values span $7F ($0A-$8C=$7E=GT, false deletion). Fix: reversed
-;               to target-stored in FIND_INS FI_CHK.
-;             BUG-FL-01 (ACTIVE): FL_CHKLO in FIND_LINE reads stale EXPH
-;               when page-carry path taken — RETC,LT skipped STRA EXPH so
-;               LODA *EXPH read wrong address. Fix attempt (BCTR,LT FL_LH)
-;               introduced 2-line regression. Incomplete. Programs >13 lines
-;               corrupt program store.
-;             Code size: 4218 bytes ($0440-$14B9).
-;   v2.1-dev  CR-terminated line format (bodylen byte removed). All 6 affected
-;             routines updated. Net size change: -10 bytes before unsigned fixes.
-;             BUG-UNSIGNED-01 FIXED: signed boundary checks in DLS_LP/DR_LP/
-;               FIND_LINE/FIND_INS/DL2_LP fail when PEL>$7F. Fix: carry check.
-;             BUG-STORE-01/02 FIXED: scratch register conflicts in STORE_LINE.
-;               Moved to CURH:CURL which is only written during DO_RUN.
-;             BUG-DIV-01/02 FIXED: DIV16 unsigned comparison and borrow.
-;               256/16=16 now correct (was 1). 32767/128=255 now correct.
-;             BUG-PRINT-02 FIXED: PRINT_S16 zero check excluded $00FF (255).
-;             BUG-CHR-02 FIXED: CHR$(I+48) now evaluates full expression.
-;             BUG-MAND-01 IDENTIFIED: U*U/16+V*V/16 gives wrong result when
-;               mixing division+addition with variables. Under investigation.
-;             Regression: all prior tests pass; Mandelbrot render pending fix.
-;             Code size: 4224 bytes ($0440-$14BF).
-;   v2.0-dev  SW stack EQU infrastructure added (SWBASE/TEMPRETH/TEMPRETL/R3SAVE/
-;               P16BUF). Memory layout: IBUF→$1663, VARS→$1A00, PROG→$1A34.
-;             PRINT_S16 rewritten: unsigned compare mode (PPSL $02), COMZ,R1,
-;               ADDI,R3 1, TPSL $01 borrow, PSL save/restore via R2.
-;             DIVTAB now inline in PRINT_S16 (not a shared table).
-;             BUG-PRINT-01 FIXED: PRINT 10000–32767 now correct.
-;             BUG-RELOP-01a FIXED: EORZ,R0/STRZ,R1 replaces EORZ,R1 in PARSE_RELOP.
-;             BUG-RELOP-01b FIXED: removed STRZ,R1 from PARSE_RELOP exit path.
-;             BUG-RELOP-02 IDENTIFIED (ACTIVE): TMI,R0 RELOP uses RELOP as
-;               immediate byte (assembles to $00), not runtime memory read.
-;               All IF/THEN conditions broken. Fix is LODA,R1 RELOP / ANDZ,R1.
-;             Auto-index semantics confirmed: *BASE,Rn+/- are pre-modify.
-;             Regression: PRINT numeric ✓, IF/THEN ✗ (BUG-RELOP-02),
-;               CHR$() simple ✓, CHR$() loop ✗ (BUG-CHR-01).
 ; ─── ASCII ────────────────────────────────────────────────────────────────────
 CR      EQU     $0D
 LF      EQU     $0A
@@ -2290,8 +2236,7 @@ DV_ZERO:
         BCTA,UN DO_ERROR  ; divide by zero error
 
 ; ─── PRINT_S16 ────────────────────────────────────────────────────────────────
-; Print signed 16-bit value EXPH:EXPL as decimal.
-; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
+; Recursive Print signed 16-bit value EXPH:EXPL as decimal.
 PRINT_S16:
         ; Save caller R3 and switch to dedicated recursive print SW stack.
         STRA,R3 R3SAVE
