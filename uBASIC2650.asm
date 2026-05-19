@@ -1,7 +1,6 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.2-dev
-; Date:    2026-05-06
-; Size: 4234 bytes ($0440-$14C9)
+; Version: v2.2
+; Date:    2026-05-19
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.
@@ -46,7 +45,7 @@
 ;   LNUMH:LNUML — scratch line number; save area in DO_LIST (BUG-BASIC-12 fix)
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (BUG-BASIC-12 fix)
 ;
-; ── v2.0 SW STACK INFRASTRUCTURE (EQUs added, not yet activated) ─────────────
+; ── v2.0 SW STACK INFRASTRUCTURE  ─────────────
 ;   SWBASE=$1640, TEMPRETH=$1660, TEMPRETL=$1661, R3SAVE=$1662, P16BUF=$1658.
 ;   Auto-index semantics confirmed: *BASE,R1+ = pre-increment (R1++ then access).
 ;   Correct PRINT_S16 digit push pattern: init R1=$FF, *BUF,R1+ writes BUF+0 first.
@@ -67,10 +66,6 @@
 ;   Impact: any program with 14+ lines may corrupt the program store.
 ;   Basic 3-line store/edit/delete still works correctly.
 ;
-; BUG-CHR-01 (FIXED — self-resolved):
-;   CHR$() loop was overflowing hardware RAS at depth 8. After the BCTA→BCTR
-;   pass saved 135 bytes and shifted code addresses, the branch targets moved
-;   within relative range and depth reduced to 7. All CHR$() loop tests pass.
 ;
 ; BUG-COLON (UNCONFIRMED):
 ;   Multi-statement lines "LET A=1:PRINT A" may not be implemented.
@@ -2306,8 +2301,7 @@ DV_ZERO:
         BCTA,UN DO_ERROR  ; divide by zero error
 
 ; ─── PRINT_S16 ────────────────────────────────────────────────────────────────
-; Print signed 16-bit value EXPH:EXPL as decimal.
-; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
+; Recursive Print signed 16-bit value EXPH:EXPL as decimal.
 PRINT_S16:
         ; Save caller R3 and switch to dedicated recursive print SW stack.
         STRA,R3 R3SAVE
