@@ -39,7 +39,7 @@
 ;   R0       — working register, arithmetic, I/O
 ;   R1       — index register; also PRINT_S16 digit buffer index (P16BUF)
 ;   R2       — never written by any routine; long-lived scratch (DO_LET var letter)
-;   R3       — loop counter (BDRR/BIRR); SW stack index (v2.0, not yet active)
+;   R3       — loop counter (BDRR/BIRR); SW stack index 
 ;   SC0:SC1  — general scratch (clobbered by STMT_EXEC — not inter-statement safe)
 ;   SWSTK[0:1] ($162E:$162F) — DO_RUN next-line-pointer save across STMT_EXEC
 ;   LNUMH:LNUML — scratch line number; save area in DO_LIST (BUG-BASIC-12 fix)
@@ -58,19 +58,15 @@
 ;   suspected to be due to 256 page overflow - only using low byte of TMPH:TMPL in
 ;   STORE_LINE.  Potentially SL_MEASD is not propagating carry between sequential SUB
 ;
-; BUG-COLON (UNCONFIRMED):
-;   Multi-statement lines "LET A=1:PRINT A" may not be implemented.
-;   Not tested — investigate after relop fix.
+; BUG-COLON (Not a Bug):
+;   Multi-statement lines "LET A=1: PRINT A"  not supported (yet).
 ;
 ; ── CHANGE HISTORY ──────────────────────────────────
-;   V2.4-dev  SHOWCASE appended inc Mandelbrot
+;   V2.4-dev  SHOWCASE appended inc Mandelbrot, Optimize PRT_STR
 ;   V2.3-dev  Recursive PRINT_S16 = 4268 bytes assembled
 ;   v2.2v  BUG-DIV-ZCHK-01 FIXED: DIV16 divisor zero-check now treats any
 ;               EXPH<0 as non-zero (added BCTR,LT DV_NZ). Previous logic could
 ;               misclassify values like $FF00 as zero divisor.
-;   v2.2-dev  STAGE-PORT-01: Added compatibility aliases (LEFTH/LEFTL/SAVEH/SAVEL/
-;               E1SAVH/E1SAVL/DIVH/DIVL) to support incremental import/testing of
-;               recursive expr_test routines without immediate call-site rewiring.
 ;   v2.2-dev  BUG-RAS-01 FIXED: BSTR,UN PRO_JMP in PARSE_RELOP leaked RAS slot
 ;               per relop char. All IF/THEN conditions were broken.
 ;               Fix: BSTR→BCTR in PRO_LT/PRO_EQ.
@@ -93,6 +89,13 @@ BS      EQU     $08
 SP      EQU     $20
 NUL     EQU     $00
 DQ      EQU     $22
+
+; ─── ERRORS ────────────────────────────────────────────────────────────────────
+ERR_SYN         EQU '0'
+ERR_UND_LINE    EQU '1'
+ERR_DIV_ZERO    EQU '2'
+ERR_OOM         EQU '3'
+ERR_VAR         EQU '4'
 
 ; ─── PIPBUG 1 I/O entry points ────────────────────────────────────────────────
 COUT    EQU     $02B4   ; putchar: R0 = char to output
@@ -130,15 +133,6 @@ SWSTK   EQU $162E   ; SW call stack 8×2 bytes  $012E-$013D
 PRECTMP EQU $163D   ; PARSE_EXPR cur_prec save (survives APPLY_OP which clobbers SC1)
 RELOP   EQU $163E   ; relational op 1-6
 CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
-; Compatibility aliases for staged recursive-port routines (expr_test naming).
-LEFTH   EQU CURH
-LEFTL   EQU CURL
-SAVEH   EQU LNUMH
-SAVEL   EQU LNUML
-E1SAVH  EQU GOTOH
-E1SAVL  EQU GOTOL
-DIVH    EQU PEH
-DIVL    EQU PEL
 ; ── SW call stack (v2.0) ─────────────────────────────────────────────────────
 ; R3 = index (0=empty, grows up). Each frame = [lo][hi] (lo pushed first).
 ; Push sequence: STRA,R0 *SWBASE,R3+ (lo first), STRA,R0 *SWBASE,R3+ (hi)
@@ -152,8 +146,8 @@ TEMPRETH EQU $1660  ; SW return address hi (workspace for SWRETURN only)
 TEMPRETL EQU $1661  ; SW return address lo
 R3SAVE   EQU $1662  ; save/restore R3 when SW routine calls HW routine using R3
 IBUF    EQU $1663   ; input buffer 64 bytes  $1663-$16A2
-VARS    EQU $1A00   ; A-Z variables 2 bytes each  $1A00-$1A33
-PROG    EQU $1A34   ; program store base (VARS+52)
+VARS    EQU $16A3   ; A-Z variables 2 bytes each  
+PROG    EQU $16d7   ; program store base (VARS+52)
 PROGLIM EQU $1fff   ; one past end of program store
 
 ; ─── CODE starts at $0440 (after Pipbug 1kB ROM + 64B RAM) ───────────────────
@@ -161,16 +155,14 @@ PROGLIM EQU $1fff   ; one past end of program store
 
 ; ─── RESET / ENTRY ────────────────────────────────────────────────────────────
 RESET:
-        LODI,R0 <PROG
+        ; Sets up showcase
+        LODI,R0 <SHOWCASE_END
         STRA,R0 PEH
-        LODI,R0 >PROG
+        LODI,R0 <SHOWCASE_END   
         STRA,R0 PEL
-        LODI,R0 $FF
-        STRA,R0 SWSP
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG
-        STRA,R0 GOTOFLG
-
+        ; Actual start
+        BSTA,UN DO_END      ; setup RUNFLAG etc - Change to DO_NEW for no showcase 
+        
         ; clear A-Z variables (52 bytes) using IPH:IPL as scratch pointer
         LODI,R0 <VARS
         STRA,R0 IPH
@@ -192,12 +184,10 @@ CLRV:
         STRA,R0 IPL
         BSTA,UN PRTSTR
 
-; ─── REPL ────────────────────────────────────────────────────────────────────
+; ─── Main Loop ────────────────────────────────────────────────────────────────────
 REPL:
-        LODI,R0 A'>'
-        BSTA,UN COUT
-        LODI,R0 SP
-        BSTA,UN COUT
+        BSTA,UN PRT_CHEV    ; print chevron
+        BSTA,UN PRT_SPACE
         BSTA,UN RDLINE
         LODI,R0 <IBUF
         STRA,R0 IPH
@@ -207,34 +197,8 @@ REPL:
         LODA,R0 ERRFLG
         COMI,R0 $01
         BCTR,EQ REPL
-        BSTA,UN STMT_EXEC
+        BSTR,UN STMT_EXEC
         BCTR,UN REPL
-
-; ─── TABLES ───────────────────────────────────────────────────────────────────
-BANNER:
-        DB CR, LF
-        DB "uBASIC 2650 V2.4"
-        DB CR, LF, NUL
-
-; Keyword table: [c1][c2][token]  NUL-terminated.
-; Matched on first two uppercase chars; EATWORD skips the rest.
-; Token 11 (THEN) matched internally by DO_IF — not dispatched here.
-; Keyword table: [c1][c2][hi][lo]  NUL-terminated.
-; hi:lo = address of handler routine. Matched on first two uppercase chars.
-; SE_SCAN loads hi:lo, stores to TMPH:TMPL, branches via *TMPH (indirect jump).
-; Token 11 (THEN) matched internally by DO_IF — not dispatched here.
-KW_TAB:
-        DB A'P',A'R', <DO_PRINT, >DO_PRINT   ; PRINT
-        DB A'L',A'E', <DO_LET,   >DO_LET     ; LET
-        DB A'L',A'I', <DO_LIST,  >DO_LIST    ; LIST
-        DB A'R',A'E', <DO_REM,   >DO_REM     ; REM
-        DB A'R',A'U', <DO_RUN,   >DO_RUN     ; RUN
-        DB A'E',A'N', <DO_END,   >DO_END     ; END
-        DB A'I',A'N', <DO_INPUT, >DO_INPUT   ; INPUT
-        DB A'I',A'F', <DO_IF,    >DO_IF      ; IF
-        DB A'N',A'E', <DO_NEW,   >DO_NEW     ; NEW
-        DB A'G',A'O', <DO_GOTO,  >DO_GOTO    ; GOTO
-        DB NUL
 
 ; ─── STMT_EXEC ────────────────────────────────────────────────────────────────
 ; Decode and dispatch one statement from IP.
@@ -264,7 +228,7 @@ STMT_EXEC:
 SE_SCAN:
         LODA,R0 *TMPH                    ; c1
         COMI,R0 NUL
-        BCTA,EQ SE_SYNERR                ; end of table
+        BCTA,EQ JSYNERR                ; end of table
         SUBA,R0 SC0
         BCTR,EQ SE_CHK2
 SE_SKIP:
@@ -309,11 +273,12 @@ SE_MATCH:
         LODA,R0 EXPL
         STRA,R0 GOTOL
         BCTA,UN *GOTOH                   ; indirect jump to handler
-SE_SYNERR:
-        EORZ,R0
+
+JSYNERR:
+        LODI,R0 ERR_SYN
         BCTA,UN DO_ERROR
 
-; Should probably clear memory
+; Should probably clear PROG memory
 DO_NEW:
         LODI,R0 <PROG
         STRA,R0 PEH
@@ -321,8 +286,11 @@ DO_NEW:
         STRA,R0 PEL
         ; drop through
 DO_END:
+        LODI,R0 $FF
+        STRA,R0 SWSP
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG
+        STRA,R0 GOTOFLG
         ; drop through
 ; ─── SIMPLE STATEMENTS ────────────────────────────────────────────────────────
 PRTSTR_RET:
@@ -411,11 +379,11 @@ DO_LET:
         LODA,R0 *IPH
         BSTA,UN UPCASE  ; [+1]
         COMI,R0 A'A'
-        BCTR,LT DL_ERR
+        BCTR,LT JERRVAR
         COMI,R0 A'Z'+1
         BCTR,LT DL_VAROK
-DL_ERR:
-        LODI,R0 4
+JERRVAR:
+        LODI,R0 ERR_VAR
         BCTA,UN DO_ERROR
 DL_VAROK:
         STRA,R0 SC0                      ; save variable letter in SC0 (immediate use)
@@ -429,8 +397,7 @@ DL_EQ:
         LODA,R0 *IPH
         COMI,R0 A'='
         BCTR,EQ DL_EQC
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DL_EQC:
         BSTA,UN INC_IP
 DL_EX:
@@ -439,7 +406,7 @@ DL_EX:
         COMI,R0 $00
         BCTR,EQ DL_STORE
         EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DL_STORE:
         ; address = VARS + (SC0 - 'A') * 2
         ; BUG-BASIC-14 FIX: restore variable letter from R2 (SC0 was clobbered
@@ -476,17 +443,14 @@ DO_INPUT:
         COMI,R0 A'Z'+1
         BCTR,LT DIN_VAROK
 DIN_ERR:
-        LODI,R0 4
-        BCTA,UN DO_ERROR
+        BCTA,UN JERRVAR
 DIN_VAROK:
         STRA,R0 SC0                      ; save variable letter
         STRZ,R2                          ; also save in R2 for DL_STORE (SC0 clobbered by PARSE_S16)
         BSTA,UN INC_IP
 DIN_PR:
-        LODI,R0 A'?'
-        BSTA,UN COUT
-        LODI,R0 SP
-        BSTA,UN COUT
+        BSTA,UN PRT_QUEST
+        BSTA,UN PRT_SPACE
         BSTA,UN RDLINE                   ; [+1]
         LODI,R0 <IBUF
         STRA,R0 IPH
@@ -496,8 +460,7 @@ DIN_PR:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DL_STORE
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 
 ; ─── DO_IF ────────────────────────────────────────────────────────────────────
 ; IF expr relop expr THEN stmt
@@ -509,8 +472,7 @@ DO_IF:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ DIF_LS
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DIF_LS:
         LODA,R0 EXPH
         STRA,R0 LNUMH  ; BUG-T6 FIX: save left in LNUMH:LNUML (TMPH:TMPL clobbered
@@ -520,15 +482,13 @@ DIF_LS:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ DIF_RP
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DIF_RP:
         BSTA,UN PARSE_EXPR               ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ DIF_EVAL
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DIF_EVAL:
         ; signed 16-bit compare: LNUMH:LNUML (left) vs EXPH:EXPL (right)
         ; bias hi bytes by XOR $80 → unsigned compare
@@ -562,14 +522,12 @@ DIF_TH:
         BSTA,UN GETCI_UC                 ; [+1]  must be A'T'
         COMI,R0 A'T'
         BCTR,EQ DIF_TH2
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DIF_TH2:
         BSTA,UN GETCI_UC                 ; [+1]  must be A'H'
         COMI,R0 A'H'
         BCTR,EQ DIF_EW
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DIF_EW:
         BSTA,UN EATWORD                  ; [+1]
 
@@ -596,11 +554,7 @@ DIF_ANDTEST:
         LODA,R1 RELOP                    ; R1 = runtime bitmask from RAM
         ANDZ,R1                          ; R0 &= R1  (ANDZ,rn: R0 &= rn)
         RETC,EQ ; DIF_FALSE                ; zero → no bit match → condition false
-        ; fall through to DIF_TRUE
         BCTA,UN STMT_EXEC                ; [+1]  execute THEN body
-        ; RETC,UN
-;DIF_FALSE:
-        ; RETC,UN
 
 DO_GOTO:
         BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
@@ -608,8 +562,7 @@ DO_GOTO:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ DG_OK
-        EORZ,R0 ; Clear 
-        BCTA,UN DO_ERROR
+        BCTA,UN JSYNERR
 DG_OK:
         LODA,R0 EXPH
         STRA,R0 GOTOH
@@ -619,7 +572,6 @@ DG_OK:
         STRA,R0 GOTOFLG
         LODA,R0 RUNFLG
         COMI,R0 $01
-        ;BCTR,EQ DG_RET
         RETC,EQ
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG  ; start run if in immediate mode
@@ -798,9 +750,9 @@ DR_GOTO:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTA,EQ DR_LP
-        LODI,R0 1
-        BSTA,UN DO_ERROR  ; [+1] undefined line — returns to REPL
-        BCTA,UN DR_LP
+JERRLINE:
+        LODI,R0 ERR_UND_LINE
+        BCTA,UN DO_ERROR  ; [+1] undefined line — returns to REPL
 DR_STOP:
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG
@@ -909,7 +861,8 @@ SL_NBC:
         LODA,R0 CURL
         SUBA,R0 SC1
         BCFR,LT SL_ROOM  ; free >= needed?
-        LODI,R0 3
+JERROOM:
+        LODI,R0 ERR_OOM
         BCTA,UN DO_ERROR  ; out of memory
 
 SL_ROOM:
@@ -2148,7 +2101,7 @@ DIV16:
         BCTR,LT DV_NZ
         LODA,R0 EXPL
         COMI,R0 $00
-        BCTA,EQ DV_ZERO
+        BCTA,EQ JERRDIVZER
 DV_NZ:
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG
@@ -2250,8 +2203,8 @@ DV_RET:
         EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
         STRA,R0 NEGFLG                   ; exit — dual-use with CHR$ flag in DO_PRINT
         RETC,UN
-DV_ZERO:
-        LODI,R0 2
+JERRDIVZER:
+        LODI,R0 ERR_DIV_ZERO
         BCTA,UN DO_ERROR  ; divide by zero error
 
 ; ─── PRINT_S16 ────────────────────────────────────────────────────────────────
@@ -2617,10 +2570,23 @@ DEC_TMP:
         STRA,R0 TMPH
         RETC,UN
 
+; ─── Shared Character PRINT routines ─────────────────────────────────────────────────────────────────
+PRT_CHEV:
+        LODI,R0 '>'
+        db $EC     ; consume next 2 bytes with COMA,R0 opcode 
+PRT_SPACE:
+        LODI,R0 32
+        db $EC     ; consume next 2 bytes with COMA,R0 opcode 
+PRT_AT:
+        LODI,R0 '@'
+        db $EC     ; consume next 2 bytes with COMA,R0 opcode 
+PRT_QUEST:
+        LODI,R0 '?'
+        BCTA,UN COUT    ; tail call
 
 ; ─── DO_ERROR ─────────────────────────────────────────────────────────────────
 ; Entry: R0 = error code (0-5).
-; Saves RUNFLG, clears all run state, prints "?n [IN line]", jumps to REPL.
+; Saves RUNFLG, clears all run state, prints "?n[@line]", jumps to REPL.
 ; This is a tail-jump (BCTA,UN DO_ERROR from callers), so it kills the full RAS.
 DO_ERROR:
         STRA,R0 SC0                      ; save error code
@@ -2630,24 +2596,16 @@ DO_ERROR:
         STRA,R0 RUNFLG  ; clear run
         LODI,R0 $FF
         STRA,R0 SWSP  ; clear GOSUB stack
-        LODI,R0 A'?'
-        BSTA,UN COUT
+        BSTR,UN PRT_QUEST
         LODA,R0 SC0
-        ADDI,R0 A'0'
-        BSTA,UN COUT
+        BSTA,UN COUT    ; print error number
         LODA,R0 SC1
         COMI,R0 $01
         BCTR,EQ DE_IN
         BCTR,UN DE_NL
 DE_IN:
-        LODI,R0 SP
-        BSTA,UN COUT
-        LODI,R0 A'I'
-        BSTA,UN COUT
-        LODI,R0 A'N'
-        BSTA,UN COUT
-        LODI,R0 SP
-        BSTA,UN COUT
+        BSTR,UN PRT_SPACE
+        BSTR,UN PRT_AT
         LODA,R0 CURH
         STRA,R0 EXPH
         LODA,R0 CURL
@@ -2656,10 +2614,34 @@ DE_IN:
 DE_NL:
         BSTA,UN CRLF
         BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
+
+; ─── TABLES ───────────────────────────────────────────────────────────────────
+BANNER:
+        DB CR, LF
+        DB "uBASIC 2650 V2.4"
+        DB CR, LF, NUL
+
+; Keyword table: [c1][c2][hi][lo]  NUL-terminated.
+; hi:lo = address of handler routine. Matched on first two uppercase chars.
+; SE_SCAN loads hi:lo, stores to TMPH:TMPL, branches via *TMPH (indirect jump).
+; THEN matched internally by DO_IF — not dispatched here.
+KW_TAB:
+        DB A'P',A'R', <DO_PRINT, >DO_PRINT   ; PRINT
+        DB A'L',A'E', <DO_LET,   >DO_LET     ; LET
+        DB A'L',A'I', <DO_LIST,  >DO_LIST    ; LIST
+        DB A'R',A'E', <DO_REM,   >DO_REM     ; REM
+        DB A'R',A'U', <DO_RUN,   >DO_RUN     ; RUN
+        DB A'E',A'N', <DO_END,   >DO_END     ; END
+        DB A'I',A'N', <DO_INPUT, >DO_INPUT   ; INPUT
+        DB A'I',A'F', <DO_IF,    >DO_IF      ; IF
+        DB A'N',A'E', <DO_NEW,   >DO_NEW     ; NEW
+        DB A'G',A'O', <DO_GOTO,  >DO_GOTO    ; GOTO
+        DB NUL
+
 ROMEND: ; so we can measure Binary rom size
 
 ; =============================================================================
-; Pre-loaded showcase program  ($0200)
+; Pre-loaded showcase program  
 ;
 ;   Stored as raw ASCII.  Line format: <lineno_lo> <lineno_hi> <body> <CR>
 ;
@@ -2671,8 +2653,8 @@ ROMEND: ; so we can measure Binary rom size
 ; =============================================================================
          ORG PROG
 
-         DB $00,$0A,$52,$45,$4D,$20,$75,$42,$41,$53,$49,$43,$20,$76,$31,$33,$20,$2D,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$0D  ; 10 REM uBASIC v13 - SHOWCASE
-         DB $00,$14,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$20,$75,$42,$41,$53,$49,$43,$20,$76,$31,$33,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$20,$2D,$2D,$22,$0D  ; 20 PRINT "-- uBASIC v13 SHOWCASE --"
+         DB $00,$0A,$52,$45,$4D,$20,$75,$42,$41,$53,$49,$43,$20,$2D,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$0D  ; 10 REM uBASIC v13 - SHOWCASE
+         DB $00,$0A,"PRINT ", $22, "-- uBASIC 2650 V2.4 Showcase --",$22, $0D ; 
          DB $00,$1E,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$50,$52,$49,$4E,$54,$20,$2F,$20,$43,$48,$52,$24,$20,$2D,$2D,$2D,$22,$0D  ; 30 PRINT "--- PRINT / CHR$ ---"
          DB $00,$28,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$36,$35,$29,$3B,$43,$48,$52,$24,$28,$36,$36,$29,$3B,$43,$48,$52,$24,$28,$36,$37,$29,$0D  ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
          DB $00,$32,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$41,$52,$49,$54,$48,$4D,$45,$54,$49,$43,$20,$2D,$2D,$2D,$22,$0D  ; 50 PRINT "--- ARITHMETIC ---"
@@ -2685,15 +2667,18 @@ ROMEND: ; so we can measure Binary rom size
          DB $00,$78,$49,$46,$20,$34,$3C,$3E,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$34,$3C,$3E,$33,$20,$6F,$6B,$22,$0D  ; 120 IF 4<>3 THEN PRINT "4<>3 ok"
          DB $00,$82,$49,$46,$20,$33,$3D,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3D,$33,$20,$6F,$6B,$22,$0D  ; 130 IF 3=3 THEN PRINT "3=3 ok"
          DB $00,$8C,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4C,$4F,$4F,$50,$20,$76,$69,$61,$20,$47,$4F,$54,$4F,$20,$2D,$2D,$2D,$22,$0D  ; 140 PRINT "--- LOOP via GOTO ---"
-         DB $00,$96,$49,$3D,$31,$0D  ; 150 I=1
+         DB $00,$96, "LET I=1", $0D
          DB $00,$A0,$49,$46,$20,$49,$3E,$35,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$31,$39,$30,$0D  ; 160 IF I>5 THEN GOTO 190
          DB $00,$AA,$50,$52,$49,$4E,$54,$20,$49,$3B,$0D  ; 170 PRINT I;
-         DB $00,$B4,$49,$3D,$49,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$31,$36,$30,$0D  ; 180 I=I+1:GOTO 160
+         DB $00,$B4,"LET I=I+1",$0D  ; 180 I=I+1:GOTO 160
+         DB 0, 185, "GOTO 160", $0D
          DB $00,$BE,$50,$52,$49,$4E,$54,$20,$22,$22,$0D  ; 190 PRINT ""
          DB $00,$C8,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4E,$45,$53,$54,$45,$44,$20,$4C,$4F,$4F,$50,$20,$2D,$2D,$2D,$22,$0D  ; 200 PRINT "--- NESTED LOOP ---"
-         DB $00,$D2,$49,$3D,$31,$0D  ; 210 I=1
+         ; DB $00,$D2,$49,$3D,$31,$0D  ; 210 I=1
+         DB 0, 210, "LET I+1", $0D
          DB $00,$DC,$49,$46,$20,$49,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$37,$30,$0D  ; 220 IF I>3 THEN GOTO 270
-         DB $00,$E6,$4A,$3D,$31,$0D  ; 230 J=1
+         ; DB $00,$E6,$4A,$3D,$31,$0D  ; 230 J=1
+         DB 0, 230, "LET J=1", $0D
          DB $00,$F0,$49,$46,$20,$4A,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$36,$30,$0D  ; 240 IF J>3 THEN GOTO 260
          DB $00,$FA,$50,$52,$49,$4E,$54,$20,$4A,$3B,$0D  ; 250 PRINT J;
          DB $00,$FF,$4A,$3D,$4A,$2B,$31,$3A,$47,$4F,$54,$4F,$20,$32,$34,$30,$0D  ; 255 J=J+1:GOTO 240
@@ -2702,7 +2687,6 @@ ROMEND: ; so we can measure Binary rom size
          DB $01,$18,$49,$3D,$2D,$36,$34,$0D  ; 280 I=-64
          DB $01,$22,$49,$46,$20,$49,$3E,$35,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$38,$30,$0D  ; 290 IF I>56 THEN GOTO 480
          DB $01,$2C,$44,$3D,$49,$0D  ; 300 D=I
-; v1.1: line 310 C=-120 (was -128), line 320 C>4 (was C>16) — better-centred render
          DB $01,$36,$43,$3D,$2D,$31,$32,$30,$0D  ; 310 C=-120
          DB $01,$40,$49,$46,$20,$43,$3E,$34,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$35,$30,$0D  ; 320 IF C>4 THEN GOTO 450
          DB $01,$4A,$41,$3D,$43,$3A,$42,$3D,$44,$3A,$45,$3D,$30,$3A,$4E,$3D,$31,$0D  ; 330 A=C:B=D:E=0:N=1
@@ -2720,6 +2704,8 @@ ROMEND: ; so we can measure Binary rom size
          DB $01,$CC,$49,$3D,$49,$2B,$36,$0D  ; 460 I=I+6
          DB $01,$D6,$47,$4F,$54,$4F,$20,$32,$39,$30,$0D  ; 470 GOTO 290
          DB $01,$E0,$45,$4E,$44,$0D  ; 480 END
+
 SHOWCASE_END:
-        
+        DB $D, $D, $D, $D
+
         END
