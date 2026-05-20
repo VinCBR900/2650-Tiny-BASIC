@@ -155,6 +155,19 @@ PROGLIM EQU $1fff   ; one past end of program store
 
 ; ─── RESET / ENTRY ────────────────────────────────────────────────────────────
 RESET:
+
+        ; speed up Winarcadia pipbug - 4800 baud, delete for real system
+        LODI,R0 $C0
+        STRA,R0 $2A8
+        STRA,R0 $2AD
+        STRA,R0 $2AE
+        
+        LODI,R0 $4
+        STRA,R0 $2A9
+        LODI,R0 $7
+        STRA,R0 $2AA
+        STRA,R0 $2b0
+
         ; Sets up showcase
         LODI,R0 <SHOWCASE_END
         STRA,R0 PEH
@@ -168,7 +181,6 @@ RESET:
         STRA,R0 IPH
         LODI,R0 >VARS
         STRA,R0 IPL
-; BUG-SCA-01 FIX: was LODI,R3 $34 / BRNR,R3 — BRNR never decrements R3.
 ; BUG-SCA-11 FIX: BDRR semantics are rn--; if(rn!=0) branch — exits when rn
 ; hits zero. Load N for exactly N iterations: $34→$33→...→$01→$00→exit = 52.
         LODI,R3 $34             ; 52 iterations: R3 counts $34→$33→...→$01→$00→exit
@@ -1807,7 +1819,7 @@ PF_CHREA:
 PF_CHROK:
         ; PARSE_EXPR already consumed ')' via PX_RPAR — do not consume again.
         ; (Old PARSE_FACTOR path left ')' unconsumed; PARSE_EXPR does not.)
-PF_CHRDN:
+; PF_CHRDN:
         LODI,R0 $FF
         STRA,R0 STKIDX           ; BUG-CHR-02: restore outer PARSE_EXPR stack index.
         ; Inner PARSE_EXPR (called from PF_CHREA) initialised STKIDX=$FF and
@@ -1977,8 +1989,6 @@ PU16_DIG_NC:
         EORZ,R0 ; Clear R0
         STRA,R0 ERRFLG  ; success: at least one digit
         BCTA,UN PU16_LP
-PU16_DONE:
-        ; RETC,UN
 
 ; ─── MUL16 ────────────────────────────────────────────────────────────────────
 ; Signed TMPH:TMPL × EXPH:EXPL → EXPH:EXPL  (16-bit two's complement wrap)
@@ -2372,19 +2382,9 @@ PS_RET:
         LODA,R3 R3SAVE
         RETC,UN
 
-; ─── GETKEY ───────────────────────────────────────────────────────────────────
-; Blocking keyboard read via Pipbug CHIN.
-; CHIN is blocking — waits for a keypress before returning.
-;
-; Later Implement Proprietary Bitbanged SENSE input when basic working
-; Returns char in R0.  Clobbers R0 only.
-GETKEY:
-        BCTA,UN CHIN            ; R0 = char (CHIN blocks until key pressed)
-;        RETC,UN
-
 ; ─── RDLINE ───────────────────────────────────────────────────────────────────
 ; Read a line from input into IBUF, echo with backspace support. NUL-terminates.
-; Uses GETKEY (via CHIN) for blocking input. Char received in R0 at each step;
+; Uses PIPBUG CHIN for blocking input. Char received in R0 at each step;
 ; saved to R1 for storage/echo so R0 is free for pointer arithmetic.
 RDLINE:
         LODI,R0 <IBUF
@@ -2402,7 +2402,7 @@ RL_LP:
         COMI,R1 LF
         BCTA,EQ RL_EOL
         ; ISSUE-06 FIX: removed redundant second COMI,R1 NUL / BCTA,EQ RL_EOL here.
-        ; BUG-ASM-08 fix (first NUL check immediately after GETKEY above) already
+        ; BUG-ASM-08 fix (first NUL check immediately afterCHIN above) already
         ; catches EOF before we reach this point — second check was dead code.
         COMI,R1 BS
         BCTR,EQ RL_BS
