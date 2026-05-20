@@ -1,7 +1,6 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.2-dev
-; Date:    2026-05-06
-; Size: 4234 bytes ($0440-$14C9)
+; Version: v2.2
+; Date:    2026-05-19
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.
@@ -46,14 +45,14 @@
 ;   LNUMH:LNUML — scratch line number; save area in DO_LIST (BUG-BASIC-12 fix)
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (BUG-BASIC-12 fix)
 ;
-; ── v2.0 SW STACK INFRASTRUCTURE (EQUs added, not yet activated) ─────────────
+; ── v2.3 SW STACK INFRASTRUCTURE  ─────────────
 ;   SWBASE=$1640, TEMPRETH=$1660, TEMPRETL=$1661, R3SAVE=$1662, P16BUF=$1658.
 ;   Auto-index semantics confirmed: *BASE,R1+ = pre-increment (R1++ then access).
 ;   Correct PRINT_S16 digit push pattern: init R1=$FF, *BUF,R1+ writes BUF+0 first.
 ;   Correct pop pattern: increment R1 once after N pushes, loop *BUF,R1- until R1=0.
 ;   SWRETURN implementation deferred pending BUG-RELOP-02 fix and BUG-CHR-01 fix.
 ;
-; ── KNOWN BUGS (as of v2.2-dev, 2026-05-16) ──────────────────────────────────
+; ── KNOWN BUGS (as of v2.3-dev, 2026-05-19) ──────────────────────────────────
 ;
 ; BUG-FL-01 (ACTIVE — blocks 14+ line programs):
 ;   FIND_LINE FL_CHKLO sets up EXPH:EXPL = TMPH:(TMPL+1) to read the
@@ -67,10 +66,6 @@
 ;   Impact: any program with 14+ lines may corrupt the program store.
 ;   Basic 3-line store/edit/delete still works correctly.
 ;
-; BUG-CHR-01 (FIXED — self-resolved):
-;   CHR$() loop was overflowing hardware RAS at depth 8. After the BCTA→BCTR
-;   pass saved 135 bytes and shifted code addresses, the branch targets moved
-;   within relative range and depth reduced to 7. All CHR$() loop tests pass.
 ;
 ; BUG-COLON (UNCONFIRMED):
 ;   Multi-statement lines "LET A=1:PRINT A" may not be implemented.
@@ -92,6 +87,9 @@
 ;             BUG-SL-FLAG-02 FIXED: STORE_LINE free-space and shift-count
 ;               high-byte subtracts now preserve low-byte borrow across LODI/LODA.
 ;   v2.2-dev  BUG-DIV-ZCHK-01 FIXED: DIV16 divisor zero-check now treats any
+; ── CHANGE HISTORY ──────────────────────────────────
+;   V2.3-dev  Recursive PRINT_S16 = 4268 bytes assembled
+;   v2.2v  BUG-DIV-ZCHK-01 FIXED: DIV16 divisor zero-check now treats any
 ;               EXPH<0 as non-zero (added BCTR,LT DV_NZ). Previous logic could
 ;               misclassify values like $FF00 as zero divisor.
 ;   v2.2-dev  STAGE-PORT-01: Added compatibility aliases (LEFTH/LEFTL/SAVEH/SAVEL/
@@ -111,35 +109,7 @@
 ;               LODA *EXPH read wrong address. Fix attempt (BCTR,LT FL_LH)
 ;               introduced 2-line regression. Incomplete. Programs >13 lines
 ;               corrupt program store.
-;             Code size: 4218 bytes ($0440-$14B9).
-;   v2.1-dev  CR-terminated line format (bodylen byte removed). All 6 affected
-;             routines updated. Net size change: -10 bytes before unsigned fixes.
-;             BUG-UNSIGNED-01 FIXED: signed boundary checks in DLS_LP/DR_LP/
-;               FIND_LINE/FIND_INS/DL2_LP fail when PEL>$7F. Fix: carry check.
-;             BUG-STORE-01/02 FIXED: scratch register conflicts in STORE_LINE.
-;               Moved to CURH:CURL which is only written during DO_RUN.
-;             BUG-DIV-01/02 FIXED: DIV16 unsigned comparison and borrow.
-;               256/16=16 now correct (was 1). 32767/128=255 now correct.
-;             BUG-PRINT-02 FIXED: PRINT_S16 zero check excluded $00FF (255).
-;             BUG-CHR-02 FIXED: CHR$(I+48) now evaluates full expression.
-;             BUG-MAND-01 IDENTIFIED: U*U/16+V*V/16 gives wrong result when
-;               mixing division+addition with variables. Under investigation.
-;             Regression: all prior tests pass; Mandelbrot render pending fix.
-;             Code size: 4224 bytes ($0440-$14BF).
-;   v2.0-dev  SW stack EQU infrastructure added (SWBASE/TEMPRETH/TEMPRETL/R3SAVE/
-;               P16BUF). Memory layout: IBUF→$1663, VARS→$1A00, PROG→$1A34.
-;             PRINT_S16 rewritten: unsigned compare mode (PPSL $02), COMZ,R1,
-;               ADDI,R3 1, TPSL $01 borrow, PSL save/restore via R2.
-;             DIVTAB now inline in PRINT_S16 (not a shared table).
-;             BUG-PRINT-01 FIXED: PRINT 10000–32767 now correct.
-;             BUG-RELOP-01a FIXED: EORZ,R0/STRZ,R1 replaces EORZ,R1 in PARSE_RELOP.
-;             BUG-RELOP-01b FIXED: removed STRZ,R1 from PARSE_RELOP exit path.
-;             BUG-RELOP-02 IDENTIFIED (ACTIVE): TMI,R0 RELOP uses RELOP as
-;               immediate byte (assembles to $00), not runtime memory read.
-;               All IF/THEN conditions broken. Fix is LODA,R1 RELOP / ANDZ,R1.
-;             Auto-index semantics confirmed: *BASE,Rn+/- are pre-modify.
-;             Regression: PRINT numeric ✓, IF/THEN ✗ (BUG-RELOP-02),
-;               CHR$() simple ✓, CHR$() loop ✗ (BUG-CHR-01).
+
 ; ─── ASCII ────────────────────────────────────────────────────────────────────
 CR      EQU     $0D
 LF      EQU     $0A
@@ -154,9 +124,7 @@ CHIN    EQU     $0286   ; getchar: blocking: R0 =  key
 CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 
 ; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
-; BUG-ASM-10 FIX: Addres $0100 pins variables regardless of code growth.
-; Code ceiling: ~$15FF (code must not reach $0100 or assembler will error).
-; Variables: $0100-$01B8 (185 bytes). Program store: $01B9-$1BFF (1607 bytes).
+; Code ceiling: ~$15FF (code must not reach $1600 or crash).
 IPH     EQU $1600   ; interpreter pointer hi
 IPL     EQU $1601   ; interpreter pointer lo
 PEH     EQU $1602   ; program end pointer hi
@@ -261,13 +229,13 @@ REPL:
         LODA,R0 ERRFLG
         COMI,R0 $01
         BCTR,EQ REPL
-        BSTA,UN STMT_EXEC
+        BSTR,UN STMT_EXEC
         BCTR,UN REPL
 
 ; ─── TABLES ───────────────────────────────────────────────────────────────────
 BANNER:
         DB CR, LF
-        DB A'u',A'B',A'A',A'S',A'I',A'C',A' ',A'2',A'6',A'5',A'0',A' ',A'v',A'2',A'.',A'0'
+        DB "uBASIC 2650 V2.3"
         DB CR, LF, NUL
 
 ; Keyword table: [c1][c2][token]  NUL-terminated.
@@ -289,13 +257,6 @@ KW_TAB:
         DB A'N',A'E', <DO_NEW,   >DO_NEW     ; NEW
         DB A'G',A'O', <DO_GOTO,  >DO_GOTO    ; GOTO
         DB NUL
-
-DIVTAB:
-        DB $27,$10      ; 10000
-        DB $03,$E8      ;  1000
-        DB $00,$64      ;   100
-        DB $00,$0A      ;    10
-        DB $00,$00      ; sentinel
 
 ; ─── STMT_EXEC ────────────────────────────────────────────────────────────────
 ; Decode and dispatch one statement from IP.
@@ -785,7 +746,6 @@ DR_LP:
         SUBA,R0 PEL
         TPSL $01                ; C=1 → no borrow → TMPL >= PEL → at/past end
         RETC,EQ                 ; done if TMPL >= PEL
-        BCTA,UN DR_EXEC
 DR_EXEC:
         ; save line number for error reporting
         LODA,R0 *TMPH
@@ -2342,8 +2302,7 @@ DV_ZERO:
         BCTA,UN DO_ERROR  ; divide by zero error
 
 ; ─── PRINT_S16 ────────────────────────────────────────────────────────────────
-; Print signed 16-bit value EXPH:EXPL as decimal.
-; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
+; Recursive Print signed 16-bit value EXPH:EXPL as decimal.
 PRINT_S16:
         ; Save caller R3 and switch to dedicated recursive print SW stack.
         STRA,R3 R3SAVE
@@ -2400,9 +2359,9 @@ PS_ZERO:
 PS_NZ:
         ; SWJSR: push PS_DONE return addr, drop into PREC
         LODI,R0 >PS_DONE
-        STRA,R0 *SWBASE,R3+
+        STRA,R0 SWBASE,R3+
         LODI,R0 <PS_DONE
-        STRA,R0 *SWBASE,R3+
+        STRA,R0 SWBASE,R3+
         ; fall through into PREC
 
 ; PREC — SW recursive digit printer (divide EXP by 10, recurse, print)
@@ -2446,7 +2405,7 @@ PR_LP:
 
         LODA,R0 NEGFLG
         COMI,R0 $00
-        BCTA,GT PR_QBIT
+        BCTR,GT PR_QBIT
         LODA,R0 SC1
         COMI,R0 10
         BCTR,LT PR_NOQBIT
@@ -2471,33 +2430,31 @@ PR_NOQBIT:
         BCTA,GT PR_LP
 
         LODA,R0 SC1
-        STRA,R0 *SWBASE,R3+
+        STRA,R0 SWBASE,R3+
 
         LODA,R0 EXPH
         COMI,R0 $00
-        BCTA,GT PR_REC
+        BCTR,GT PR_REC
         LODA,R0 EXPL
         COMI,R0 $00
         BCTR,EQ PR_PRINT
 PR_REC:
         LODI,R0 >PR_PRINT
-        STRA,R0 *SWBASE,R3+
+        STRA,R0 SWBASE,R3+
         LODI,R0 <PR_PRINT
-        STRA,R0 *SWBASE,R3+
+        STRA,R0 SWBASE,R3+
         BCTA,UN PREC
 
 PR_PRINT:
-        LODA,R0 *SWBASE,R3
+        LODA,R0 SWBASE,R3
         SUBI,R3 1
         ADDI,R0 A'0'
         BSTA,UN COUT
-        BCTA,UN SWRETURN
-
 SWRETURN:
-        LODA,R0 *SWBASE,R3
+        LODA,R0 SWBASE,R3
         STRA,R0 TEMPRETH
         SUBI,R3 1
-        LODA,R0 *SWBASE,R3
+        LODA,R0 SWBASE,R3
         STRA,R0 TEMPRETL
         SUBI,R3 1
         BCTA,UN *TEMPRETH
