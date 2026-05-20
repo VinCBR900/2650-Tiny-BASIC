@@ -1,40 +1,4 @@
 # Signetics 2650 Instruction Set Oracle
-#### Version: 1.2, Updated: 2026-04-09
-
-### Changes v1.1 -> v1.2:
-*   BUG-ORACLE-02 FIXED: CC-after-ADD/ADDI description was wrong.
-    *   v1.1 said: no-carry→GT, carry+zero→EQ, carry+nonzero→LT
-    *   Correct:   CC = sign of result byte (WinArcadia hardware-validated)
-        *   result >= 128 (bit 7 set) → CC = LT  (even with no carry)
-        *   result > 0, < 128         → CC = GT
-        *   result == 0               → CC = EQ   (only occurs when carry)
-    *   Confirmed by WinArcadia 2650.c `add()` function:
-            `if (dest >= 128) psl |= 0x80; // CC = LT`
-            `elif (dest > 0)  psl |= 0x40; // CC = GT`
-    *   CRITICAL CONSEQUENCE: `BCTA,GT` / `RETC,GT` after ADD is NOT a
-        reliable carry-skip for lo-byte values >= $80. GT only fires when
-        result is positive-nonzero (0x01-0x7F) AND no carry occurred.
-        For values $80-$FE: result has bit 7 set → CC=LT even with no carry.
-    *   CORRECT carry-skip idiom:
-            ADDI,Rn imm
-            STRA,Rn addr      ; STRA does NOT clobber CC
-            TPSL $01          ; CC=EQ if carry set, CC=LT if carry clear
-            BCx,LT  skip      ; branch on no-carry (C=0)
-    *   OLD idiom (only safe for lo-byte < $80):
-            ADDI,R0 1 / RETC,GT  -- DO NOT USE for general pointers
-*   Corrected 16-bit increment idiom in INC_IP/INC_TMP/INC_EXP section.
-*   Added STRA/STRR/STRZ CC behaviour (confirmed from WinArcadia source).
-
-### Changes v1.0 -> v1.1:
-*   BUG-ORACLE-01 FIXED: BRNR/BRNA pseudocode was wrong.
-    *    v1.0 said: rn--; if(rn != 0) PC = rel  (incorrectly described BDRR behaviour)
-    *    Correct:   if(rn != 0) PC = rel         (pure test, NO modification to rn)
-    *    Source: 2650 User Manual, confirmed by WinArcadia hardware validation.
-*   BDRR/BDRA and BIRR/BIRA verified correct (those DO modify rn).
-*   Clarified LODZ,R0 / ANDZ,R0 / STRZ,R0 hardware constraints.
-*   Corrected HI/LO operator convention (< = HIGH, > = LOW).
-*   Added loop pattern examples for BRNR, BIRR, BDRR.
-*   Added RAS (hardware stack) notes and PIPBUG interaction.
 
 ## 1. Definitions & Addressing Modes
 
@@ -479,6 +443,59 @@ CRLF  $008A   BSTA,UN $008A   print CR+LF
 User code: `ORG $0C00`, run via `G 0C00`. PIPBUG ROM `$0000-$03FF` (read-only).
 First free RAM: `$0440`. PIPBUG RAM `$0400-$043F` (reserved).
 ZBSR/ZBRR target range `$0000-$007F` is entirely within PIPBUG ROM — unusable under PIPBUG.
+
+## Version History 
+### Changes v1.2 -> v1.3 Updated: 2026-05-16
+*   BUG-ORACLE-03 FIXED: TPSL/TPSU CC outcome was ambiguous; Gemini misread it
+    causing hours of wasted debugging. Clarified with hardware-confirmed truth table:
+    - `TPSL $01` with C=1: `(PSL & $01) = 1`, NOT < 1 → **CC stays EQ** ($00)
+    - `TPSL $01` with C=0: `(PSL & $01) = 0`, IS < 1 → **CC = LT** ($80)
+    - TPSL NEVER produces CC=GT. `RETC,GT` after TPSL is unreachable.
+    - Confirmed by WinArcadia 2650.c `case 181`: `psl &= 0x3F; if((psl&OPERAND)<OPERAND) psl|=0x80`
+    - Correct carry-detect idiom: `TPSL $01 / RETC,EQ` = return if C=1 (carry/no-borrow)
+    - Correct no-carry idiom:    `TPSL $01 / RETC,LT` = return if C=0 (no-carry/borrow)
+*   ADDED: SUBA byte-wrap danger warning (caused BUG-FI-01 in uBASIC2650).
+*   ADDED: CC from SUBI — identical to SUBA, set from result byte sign, NOT from borrow.
+*   ADDED: RETC,LT after SUBI is NOT a reliable borrow check. Use TPSL $01.
+*   ADDED: Unsigned 16-bit comparison idiom using carry.
+*   ADDED: BSTR vs BCTR RAS hygiene warning.
+*   ADDED: DEC_TMP / 16-bit decrement correct idiom.
+*   ADDED: COM bit (PSL bit 1) affects only COMx instructions, NOT SUBA/ADDA.
+
+### Changes v1.1 -> v1.2:
+*   BUG-ORACLE-02 FIXED: CC-after-ADD/ADDI description was wrong.
+    *   v1.1 said: no-carry→GT, carry+zero→EQ, carry+nonzero→LT
+    *   Correct:   CC = sign of result byte (WinArcadia hardware-validated)
+        *   result >= 128 (bit 7 set) → CC = LT  (even with no carry)
+        *   result > 0, < 128         → CC = GT
+        *   result == 0               → CC = EQ   (only occurs when carry)
+    *   Confirmed by WinArcadia 2650.c `add()` function:
+            `if (dest >= 128) psl |= 0x80; // CC = LT`
+            `elif (dest > 0)  psl |= 0x40; // CC = GT`
+    *   CRITICAL CONSEQUENCE: `BCTA,GT` / `RETC,GT` after ADD is NOT a
+        reliable carry-skip for lo-byte values >= $80. GT only fires when
+        result is positive-nonzero (0x01-0x7F) AND no carry occurred.
+        For values $80-$FE: result has bit 7 set → CC=LT even with no carry.
+    *   CORRECT carry-skip idiom:
+            ADDI,Rn imm
+            STRA,Rn addr      ; STRA does NOT clobber CC
+            TPSL $01          ; CC=EQ if carry set, CC=LT if carry clear
+            BCx,LT  skip      ; branch on no-carry (C=0)
+    *   OLD idiom (only safe for lo-byte < $80):
+            ADDI,R0 1 / RETC,GT  -- DO NOT USE for general pointers
+*   Corrected 16-bit increment idiom in INC_IP/INC_TMP/INC_EXP section.
+*   Added STRA/STRR/STRZ CC behaviour (confirmed from WinArcadia source).
+
+### Changes v1.0 -> v1.1:
+*   BUG-ORACLE-01 FIXED: BRNR/BRNA pseudocode was wrong.
+    *    v1.0 said: rn--; if(rn != 0) PC = rel  (incorrectly described BDRR behaviour)
+    *    Correct:   if(rn != 0) PC = rel         (pure test, NO modification to rn)
+    *    Source: 2650 User Manual, confirmed by WinArcadia hardware validation.
+*   BDRR/BDRA and BIRR/BIRA verified correct (those DO modify rn).
+*   Clarified LODZ,R0 / ANDZ,R0 / STRZ,R0 hardware constraints.
+*   Corrected HI/LO operator convention (< = HIGH, > = LOW).
+*   Added loop pattern examples for BRNR, BIRR, BDRR.
+*   Added RAS (hardware stack) notes and PIPBUG interaction.
 
 ---
 
