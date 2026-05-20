@@ -170,6 +170,7 @@ RESET:
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG
         STRA,R0 GOTOFLG
+
         ; clear A-Z variables (52 bytes) using IPH:IPL as scratch pointer
         LODI,R0 <VARS
         STRA,R0 IPH
@@ -184,6 +185,7 @@ CLRV:
         STRA,R0 *IPH
         BSTA,UN INC_IP
         BDRR,R3 CLRV            ; R3--; if R3!=0 branch
+; signon banner
         LODI,R0 <BANNER
         STRA,R0 IPH
         LODI,R0 >BANNER
@@ -205,7 +207,7 @@ REPL:
         LODA,R0 ERRFLG
         COMI,R0 $01
         BCTR,EQ REPL
-        BSTR,UN STMT_EXEC
+        BSTA,UN STMT_EXEC
         BCTR,UN REPL
 
 ; ─── TABLES ───────────────────────────────────────────────────────────────────
@@ -311,25 +313,27 @@ SE_SYNERR:
         EORZ,R0
         BCTA,UN DO_ERROR
 
+; Should probably clear memory
 DO_NEW:
         LODI,R0 <PROG
         STRA,R0 PEH
         LODI,R0 >PROG
         STRA,R0 PEL
-        ; RETC,UN
         ; drop through
 DO_END:
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG
         ; drop through
 ; ─── SIMPLE STATEMENTS ────────────────────────────────────────────────────────
-SE_RET:
+PRTSTR_RET:
 DO_REM:
         RETC,UN
 
 ; ─── DO_PRINT ─────────────────────────────────────────────────────────────────
 ; PRINT [item {, item}]    item = "string" | expr
 ; CHR$ flag: NEGFLG=$01 after PARSE_FACTOR detects CHR$ — print EXPL as char.
+; ─── PRTSTR ───────────────────────────────────────────────────────
+; Print NUL-terminated string at IPH:IPL.
 DO_PRINT:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
@@ -339,7 +343,7 @@ DO_PRINT:
 DP_ITEM:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
-        COMI,R0 DQ
+        COMI,R0 DQ  ; Opening "
         BCTR,EQ DP_STRING
         EORZ,R0 ; Clear R0
         STRA,R0 CHRFLG  ; clear CHR$ flag before parse
@@ -347,7 +351,7 @@ DP_ITEM:
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ DP_NUM
-        BSTA,UN PRTSTR_IP
+       ; BSTA,UN PRTSTR_IP
         BCTR,UN DP_NL  ; [+1] raw text fallback
 DP_NUM:
         LODA,R0 CHRFLG
@@ -363,16 +367,16 @@ DP_CHAR:
 DP_STRING:
         ; consume opening "
         BSTA,UN INC_IP
-DP_SLP:
+PRTSTR:
         LODA,R1 *IPH
-        COMI,R1 NUL
-        BCTR,EQ DP_SDONE
-        COMI,R1 DQ
+        COMI,R1 NUL ; NULL - used outside Print routine 
+        BCTA,EQ PRTSTR_RET
+        COMI,R1 DQ  ; double quotes
         BCTR,EQ DP_SCLS
         LODZ,R1
         BSTA,UN COUT
         BSTA,UN INC_IP
-        BCTR,UN DP_SLP
+        BCTR,UN PRTSTR
 DP_SCLS:
         ; consume closing "
         BSTA,UN INC_IP
@@ -2497,23 +2501,6 @@ RL_EOL:
         LODI,R1 NUL
         STRA,R1 *IPH            ; NUL-terminate buffer
         BCTA,UN CRLF
-        ;RETC,UN
-
-; ─── PRTSTR / PRTSTR_IP ───────────────────────────────────────────────────────
-; Print NUL-terminated string at IPH:IPL.
-; PRTSTR_IP is the same routine, just an alias for clarity at the call site.
-PRTSTR_IP:
-PRTSTR:
-        LODA,R1 *IPH
-        COMI,R1 NUL
-        ;BCTA,EQ PRTSTR_RET
-        RETC,EQ
-        LODZ,R1
-        BSTA,UN COUT
-        BSTR,UN INC_IP
-        BCTR,UN PRTSTR
-PRTSTR_RET:
-       ; RETC,UN
 
 ; ─── WSKIP ────────────────────────────────────────────────────────────────────
 WSKIP:
