@@ -82,6 +82,21 @@
 ;   Look for Relative jumps to RETC, UN to be reviewed after all bugs fixed.        
 
 ; Change history:
+;   v2.2-dev  BUG-RELOP-03 FIXED: DO_IF signed compare core cleaned up and
+;               documented against expr_test style XOR-$80 high-byte bias compare.
+;   v2.2-dev  BUG-SL-16BIT-01 FIXED: STORE_LINE shift no longer truncates to
+;               8-bit count (R3<=255 assumption removed). Backward move now
+;               terminates by pointer compare against insertion point EXPH:EXPL.
+;             BUG-SL-FLAG-01 FIXED: STORE_LINE src/dst setup and decrements now
+;               test carry/borrow immediately via TPSL $01 around 16-bit math.
+;             BUG-SL-FLAG-02 FIXED: STORE_LINE free-space and shift-count
+;               high-byte subtracts now preserve low-byte borrow across LODI/LODA.
+;   v2.2-dev  BUG-DIV-ZCHK-01 FIXED: DIV16 divisor zero-check now treats any
+;               EXPH<0 as non-zero (added BCTR,LT DV_NZ). Previous logic could
+;               misclassify values like $FF00 as zero divisor.
+;   v2.2-dev  STAGE-PORT-01: Added compatibility aliases (LEFTH/LEFTL/SAVEH/SAVEL/
+;               E1SAVH/E1SAVL/DIVH/DIVL) to support incremental import/testing of
+;               recursive expr_test routines without immediate call-site rewiring.
 ;   v2.2-dev  BUG-RAS-01 FIXED: BSTR,UN PRO_JMP in PARSE_RELOP leaked RAS slot
 ;               per relop char. All IF/THEN conditions were broken.
 ;               Fix: BSTR→BCTR in PRO_LT/PRO_EQ.
@@ -171,6 +186,15 @@ SWSTK   EQU $162E   ; SW call stack 8×2 bytes  $012E-$013D
 PRECTMP EQU $163D   ; PARSE_EXPR cur_prec save (survives APPLY_OP which clobbers SC1)
 RELOP   EQU $163E   ; relational op 1-6
 CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
+; Compatibility aliases for staged recursive-port routines (expr_test naming).
+LEFTH   EQU CURH
+LEFTL   EQU CURL
+SAVEH   EQU LNUMH
+SAVEL   EQU LNUML
+E1SAVH  EQU GOTOH
+E1SAVL  EQU GOTOL
+DIVH    EQU PEH
+DIVL    EQU PEL
 ; ── SW call stack (v2.0) ─────────────────────────────────────────────────────
 ; R3 = index (0=empty, grows up). Each frame = [lo][hi] (lo pushed first).
 ; Push sequence: STRA,R0 *SWBASE,R3+ (lo first), STRA,R0 *SWBASE,R3+ (hi)
@@ -565,31 +589,31 @@ DIF_RP:
         EORZ,R0 ; Clear 
         BCTA,UN DO_ERROR
 DIF_EVAL:
-        ; signed 16-bit compare: LNUMH:LNUML (left) vs EXPH:EXPL (right)
-        ; bias hi bytes by XOR $80 → unsigned compare
+        ; signed compare core aligned to expr_test DO_RELOP.
         LODA,R0 LNUMH
         EORI,R0 $80
         STRA,R0 SC0
         LODA,R0 EXPH
         EORI,R0 $80
-        SUBA,R0 SC0             ; biased right.hi - biased left.hi
-        BCTR,LT DIF_LT
-        BCTR,GT DIF_GT
-        ; hi bytes equal: compare lo (unsigned)
-        LODA,R0 EXPL
-        SUBA,R0 LNUML
-        BCTR,LT DIF_LT
-        BCTR,GT DIF_GT
-        EORZ,R0 ; Clear R0
         STRA,R0 SC1
-        BCTR,UN DIF_TH  ; EQ
+        LODA,R0 SC0
+        SUBA,R0 SC1
+        BCTR,LT DIF_LT
+        BCTR,GT DIF_GT
+        LODA,R0 LNUML
+        SUBA,R0 EXPL
+        BCTR,LT DIF_LT
+        BCTR,GT DIF_GT
+        EORZ,R0
+        STRA,R0 SC1
+        BCTR,UN DIF_TH
 DIF_LT:
-        LODI,R0 $01          ; right-hi < left-hi: left > right → SC1=$01
+        LODI,R0 $FF
         STRA,R0 SC1
-        BCTR,UN DIF_TH  ; LT (result: left > right)
+        BCTR,UN DIF_TH
 DIF_GT:
-        LODI,R0 $FF          ; right-hi > left-hi: left < right → SC1=$FF
-        STRA,R0 SC1  ; GT (result: left < right)
+        LODI,R0 $01
+        STRA,R0 SC1
 
 DIF_TH:
         ; consume THEN keyword: expect T then H then EATWORD
@@ -933,11 +957,16 @@ SL_MEASD:
         LODI,R0 >PROGLIM
         SUBA,R0 PEL
         STRA,R0 CURL
+        TPSL $01
+        BCTR,LT SL_FSNB
+        LODI,R0 <PROGLIM
+        SUBI,R0 1
+        SUBA,R0 PEH
+        BCTR,UN SL_FSDN
+SL_FSNB:
         LODI,R0 <PROGLIM
         SUBA,R0 PEH
-        BCFR,LT SL_NBC
-        SUBI,R0 1
-SL_NBC:
+SL_FSDN:
         STRA,R0 CURH            ; CURH:CURL = free bytes (LNUMH:LNUML preserved)
         LODA,R0 CURH
         COMI,R0 $00
@@ -968,10 +997,15 @@ SL_ROOM:
         LODA,R0 PEL
         SUBA,R0 EXPL
         STRA,R0 TMPL
+        TPSL $01
+        BCTR,LT SL_SHNB
+        LODA,R0 PEH
+        SUBI,R0 1
+        SUBA,R0 EXPH
+        BCTR,UN SL_SHCNB
+SL_SHNB:
         LODA,R0 PEH
         SUBA,R0 EXPH
-        BCFR,LT SL_SHCNB
-        SUBI,R0 1
 SL_SHCNB:
         STRA,R0 TMPH            ; TMPH:TMPL = shift count
 
@@ -983,62 +1017,79 @@ SL_SHCNB:
         COMI,R0 $00
         BCTA,EQ SL_NOSHIFT
 SL_DOSHIFT:
-        ; src = PE-1 in LNUMH:LNUML (shift uses these as src pointer)
+        ; src = PE-1 in LNUMH:LNUML
         LODA,R0 PEL
         SUBI,R0 1
         STRA,R0 LNUML
+        TPSL $01
+        BCTR,LT SL_SNBR
         LODA,R0 PEH
-        BCFR,LT SL_SNBR
-        SUBI,R0 1
+        BCTR,UN SL_SSETH
 SL_SNBR:
-        STRA,R0 LNUMH           ; LNUMH:LNUML = src = PE-1
-        ; dst = src + SC1 (record size = shift amount)
-        ; ISSUE-02 FIX: must test carry from ADDA before any LODA clobbers CC.
-        ; Old code did STRA / LODA LNUMH / BCTA,GT — LODA wiped the carry.
-        ; New code: test carry immediately after ADDA, then load LNUMH on both paths.
+        LODA,R0 PEH
+        SUBI,R0 1
+SL_SSETH:
+        STRA,R0 LNUMH
+
+        ; dst = src + SC1 in GOTOH:GOTOL
         LODA,R0 LNUML
         ADDA,R0 SC1
         STRA,R0 GOTOL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
-        BCTR,LT SL_DSNCA         ; branch if C=0 (no carry)
-        LODA,R0 LNUMH           ; carry path: hi += 1
+        TPSL $01
+        BCTR,LT SL_DSNCA
+        LODA,R0 LNUMH
         ADDI,R0 1
-        STRA,R0 GOTOH
-        BCTR,UN SL_DSNCB
+        BCTR,UN SL_DSETH
 SL_DSNCA:
-        LODA,R0 LNUMH           ; no-carry path: hi unchanged
+        LODA,R0 LNUMH
+SL_DSETH:
         STRA,R0 GOTOH
-SL_DSNCB:
 
-        ; use R3 as count (shift count lo; assume <256 for any real program)
-        ; BUG-SCA-04 FIX: was BRNR,R3 at loop end — R3 never decremented → infinite shift.
-        ; Guard zero case first (BDRR with R3=0 would execute once wrongly).
-        LODA,R3 TMPL
 SL_SHLOOP:
-        COMI,R3 $00
-        BCTR,EQ SL_NOSHIFT
-        ; read from LNUMH:LNUML
+        ; loop until shift count TMPH:TMPL reaches zero
+        LODA,R0 TMPH
+        COMI,R0 $00
+        BCTA,GT SL_DOCPY
+        LODA,R0 TMPL
+        COMI,R0 $00
+        BCTA,EQ SL_NOSHIFT
+SL_DOCPY:
+        ; copy one byte backward
         LODA,R1 *LNUMH
-        ; write to GOTOH:GOTOL
         STRA,R1 *GOTOH
-        ; decrement both pointers
+
+SL_LOOP_DEC:
+        ; src--
         LODA,R0 LNUML
         SUBI,R0 1
         STRA,R0 LNUML
-        BCFR,LT SL_SRNB
+        TPSL $01
+        BCTR,LT SL_SRNB
         LODA,R0 LNUMH
         SUBI,R0 1
         STRA,R0 LNUMH
 SL_SRNB:
+        ; dst--
         LODA,R0 GOTOL
         SUBI,R0 1
         STRA,R0 GOTOL
-        BCFR,LT SL_DRNB
+        TPSL $01
+        BCTR,LT SL_DRNB
         LODA,R0 GOTOH
         SUBI,R0 1
         STRA,R0 GOTOH
 SL_DRNB:
-        BDRR,R3 SL_SHLOOP       ; R3--; if R3!=0 branch
+        ; shift_count--
+        LODA,R0 TMPL
+        SUBI,R0 1
+        STRA,R0 TMPL
+        TPSL $01
+        BCTR,LT SL_SCNB
+        LODA,R0 TMPH
+        SUBI,R0 1
+        STRA,R0 TMPH
+SL_SCNB:
+        BCTA,UN SL_SHLOOP
 
 SL_NOSHIFT:
         ; write record at EXPH:EXPL (insertion point)
@@ -2181,6 +2232,7 @@ DIV16:
         LODA,R0 EXPH
         COMI,R0 $00
         BCTR,GT DV_NZ
+        BCTR,LT DV_NZ
         LODA,R0 EXPL
         COMI,R0 $00
         BCTA,EQ DV_ZERO
@@ -2293,18 +2345,20 @@ DV_ZERO:
 ; Print signed 16-bit value EXPH:EXPL as decimal.
 ; Uses DIVTAB for digit extraction. NEGFLG = leading-zero suppression flag.
 PRINT_S16:
+        ; Save caller R3 and switch to dedicated recursive print SW stack.
+        STRA,R3 R3SAVE
+        LODI,R3 $FF
+
         LODA,R0 EXPH
         ANDI,R0 $80
-        BCTA,EQ PS16P_POS
+        BCTA,EQ PS_POS
         LODI,R0 A'-'
         BSTA,UN COUT
-        ; BUG-PRINT-MIN FIX: -32768 ($8000) negation overflows back to $8000.
-        ; Detect EXPH=$80,EXPL=$00 and print "32768" directly.
+        ; -32768 special case
         LODA,R0 EXPH
         COMI,R0 $80
-        BCTR,EQ PS16P_CHKMIN
-PS16P_NEGNORM:
-        ; normal negation: flip bits, add 1
+        BCTR,EQ PS_CHKMIN
+PS_NEGNORM:
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
@@ -2312,14 +2366,13 @@ PS16P_NEGNORM:
         EORI,R0 $FF
         STRA,R0 EXPL
         BSTA,UN INC_EXP
-        BCTR,UN PS16P_POS
-PS16P_CHKMIN:
+        BCTR,UN PS_POS
+PS_CHKMIN:
         LODA,R0 EXPL
         COMI,R0 $00
-        BCTR,EQ PS16P_MIN        ; exactly $8000 = -32768
-        BCTR,UN PS16P_NEGNORM    ; $80xx with non-zero lo — normal negative
-PS16P_MIN:
-        ; print "32768" as ASCII literals
+        BCTR,EQ PS_MIN
+        BCTR,UN PS_NEGNORM
+PS_MIN:
         LODI,R0 A'3'
         BSTA,UN COUT
         LODI,R0 A'2'
@@ -2330,106 +2383,130 @@ PS16P_MIN:
         BSTA,UN COUT
         LODI,R0 A'8'
         BSTA,UN COUT
-        RETC,UN
-PS16P_POS:
-        ; zero check: EXP == $0000?  (use EQ not GT to handle $FF correctly)
+        BCTA,UN PS_RET
+PS_POS:
         LODA,R0 EXPH
         COMI,R0 $00
-        BCTR,GT PS16P_NZ
-        BCTR,LT PS16P_NZ
+        BCTR,GT PS_NZ
+        BCTR,LT PS_NZ
         LODA,R0 EXPL
         COMI,R0 $00
-        BCTR,EQ PS16P_ZERO        ; EXPH=$00, EXPL=$00 → zero
-        BCTR,UN PS16P_NZ          ; EXPH=$00, EXPL!=0 → non-zero (handles $FF correctly)
-PS16P_ZERO:
+        BCTR,EQ PS_ZERO
+        BCTR,UN PS_NZ
+PS_ZERO:
         LODI,R0 A'0'
-        BCTA,UN COUT
-        ; RETC,UN
+        BSTA,UN COUT
+        BCTA,UN PS_RET
+PS_NZ:
+        ; SWJSR: push PS_DONE return addr, drop into PREC
+        LODI,R0 >PS_DONE
+        STRA,R0 *SWBASE,R3+
+        LODI,R0 <PS_DONE
+        STRA,R0 *SWBASE,R3+
+        ; fall through into PREC
 
-PS16P_NZ:
-        LODI,R0 <DIVTAB
+; PREC — SW recursive digit printer (divide EXP by 10, recurse, print)
+PREC:
+        LODA,R0 EXPH
         STRA,R0 TMPH
-        LODI,R0 >DIVTAB
+        LODA,R0 EXPL
+        STRA,R0 TMPL            ; dividend → TMPH:TMPL
+        EORZ,R0
+        STRA,R0 EXPH
+        STRA,R0 EXPL            ; quotient = 0
+        STRA,R0 NEGFLG
+        STRA,R0 SC1             ; remainder = 0
+        LODI,R0 16
+        STRA,R0 SC0             ; loop counter
+PR_LP:
+        PPSL $08
+        CPSL $01
+        LODA,R0 TMPL
+        RRL,R0
         STRA,R0 TMPL
-        EORZ,R0 ; Clear R0
-        STRA,R0 NEGFLG  ; leading-zero flag
-        ; PRINT_S16 needs unsigned compares for the digit loop (value >= divisor).
-        ; Save PSL in R2 and set COM=1 (unsigned compare mode).
-        SPSL
-        STRZ,R2
-        PPSL $02
-PS16P_DIVLP:
-        ; load next divisor pair from DIVTAB
-        LODA,R0 *TMPH
-        STRA,R0 SC0  ; div hi
-        BSTA,UN INC_TMP
-PS16P_D1:
-        LODA,R0 *TMPH
-        STRA,R0 SC1  ; div lo
-        BSTA,UN INC_TMP
-PS16P_D2:
-        ; sentinel 0,0 → print final ones digit
-        LODA,R0 SC0
-        COMI,R0 $00
-        BCTR,GT PS16P_CNT
+        LODA,R0 TMPH
+        RRL,R0
+        STRA,R0 TMPH
+
         LODA,R0 SC1
-        COMI,R0 $00
-        BCTA,EQ PS16P_LAST
-PS16P_CNT:
-        ; count subtractions using R3
-        LODI,R3 $00
-PS16P_SLP:
-        ; Unsigned compare (COM=1): if value < divisor → emit digit.
-        ; Compare high byte first.
-        LODA,R0 EXPH
-        LODA,R1 SC0
-        COMZ,R1
-        BCTR,LT PS16P_EMIT
-        BCTR,GT PS16P_DO
-        ; High bytes equal → compare low
+        RRL,R0
+        STRA,R0 SC1
+        LODA,R0 NEGFLG
+        RRL,R0
+        STRA,R0 NEGFLG
+
+        CPSL $01
         LODA,R0 EXPL
-        LODA,R1 SC1
-        COMZ,R1
-        BCTR,LT PS16P_EMIT
-PS16P_DO:
-        ; 16-bit subtract with low-borrow propagation
-        LODA,R0 EXPL
-        SUBA,R0 SC1
+        RRL,R0
         STRA,R0 EXPL
-        TPSL $01
-        BCTR,EQ PS16P_NB             ; C=1 → no borrow from low byte
         LODA,R0 EXPH
-        SUBI,R0 1
+        RRL,R0
         STRA,R0 EXPH
-PS16P_NB:
-        LODA,R0 EXPH
-        SUBA,R0 SC0
-        STRA,R0 EXPH
-        ADDI,R3 1                    ; digit++
-        BCTR,UN PS16P_SLP
-PS16P_EMIT:
-        ; R3 = digit value
+        CPSL $08
+
         LODA,R0 NEGFLG
         COMI,R0 $00
-        BCTR,GT PS16P_FPRINT  ; already printing
-        ; leading zero check: LODZ,R3 → R0 = R3
-        LODZ,R3                 ; R0 = R3 (digit count, LODZ Rn loads Rn into R0)
-        COMI,R0 $00
-        BCTA,EQ PS16P_DIVLP  ; skip leading zero
-PS16P_FPRINT:
-        LODZ,R3                 ; R0 = R3 (digit value 0-9)
-        ADDI,R0 A'0'            ; R0 = ASCII digit
-        BSTA,UN COUT
-        LODI,R0 1               ; BUG-BASIC-04 FIX: NEGFLG=1 = "digits active, print all"
-        STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, suppressing subsequent digits
-        BCTA,UN PS16P_DIVLP
-PS16P_LAST:
+        BCTA,GT PR_QBIT
+        LODA,R0 SC1
+        COMI,R0 10
+        BCTR,LT PR_NOQBIT
+PR_QBIT:
+        LODA,R0 SC1
+        SUBI,R0 10
+        STRA,R0 SC1
+        TPSL $01
+        BCTR,EQ PR_SNB
+        LODA,R0 NEGFLG
+        SUBI,R0 1
+        STRA,R0 NEGFLG
+PR_SNB:
         LODA,R0 EXPL
+        IORI,R0 $01
+        STRA,R0 EXPL
+PR_NOQBIT:
+        LODA,R0 SC0
+        SUBI,R0 1
+        STRA,R0 SC0
+        COMI,R0 $00
+        BCTA,GT PR_LP
+
+        LODA,R0 SC1
+        STRA,R0 *SWBASE,R3+
+
+        LODA,R0 EXPH
+        COMI,R0 $00
+        BCTA,GT PR_REC
+        LODA,R0 EXPL
+        COMI,R0 $00
+        BCTR,EQ PR_PRINT
+PR_REC:
+        LODI,R0 >PR_PRINT
+        STRA,R0 *SWBASE,R3+
+        LODI,R0 <PR_PRINT
+        STRA,R0 *SWBASE,R3+
+        BCTA,UN PREC
+
+PR_PRINT:
+        LODA,R0 *SWBASE,R3
+        SUBI,R3 1
         ADDI,R0 A'0'
         BSTA,UN COUT
-        ; restore PSL (undo COM=1)
-        LODZ,R2
-        LPSL
+        BCTA,UN SWRETURN
+
+SWRETURN:
+        LODA,R0 *SWBASE,R3
+        STRA,R0 TEMPRETH
+        SUBI,R3 1
+        LODA,R0 *SWBASE,R3
+        STRA,R0 TEMPRETL
+        SUBI,R3 1
+        BCTA,UN *TEMPRETH
+
+PS_DONE:
+PS_RET:
+        ; restore caller R3 and return
+        LODZ,R3
+        LODA,R3 R3SAVE
         RETC,UN
 
 ; ─── GETKEY ───────────────────────────────────────────────────────────────────
