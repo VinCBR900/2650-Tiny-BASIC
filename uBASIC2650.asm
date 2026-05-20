@@ -71,6 +71,22 @@
 ;   Multi-statement lines "LET A=1:PRINT A" may not be implemented.
 ;   Not tested — investigate after relop fix.
 ;
+; ── SIZE REDUCTIONS (deferred) ─────────────────────────────────────
+;   Assembler --no-warn-local-branch reports ~90 BCTA that could be BCTR.
+;      Estimated saving: ~90 bytes.  Apply after all bugs fixed.
+;   Look for Relative jumps to RETC, UN to be reviewed after all bugs fixed.        
+
+; Change history:
+;   v2.2-dev  BUG-RELOP-03 FIXED: DO_IF signed compare core cleaned up and
+;               documented against expr_test style XOR-$80 high-byte bias compare.
+;   v2.2-dev  BUG-SL-16BIT-01 FIXED: STORE_LINE shift no longer truncates to
+;               8-bit count (R3<=255 assumption removed). Backward move now
+;               terminates by pointer compare against insertion point EXPH:EXPL.
+;             BUG-SL-FLAG-01 FIXED: STORE_LINE src/dst setup and decrements now
+;               test carry/borrow immediately via TPSL $01 around 16-bit math.
+;             BUG-SL-FLAG-02 FIXED: STORE_LINE free-space and shift-count
+;               high-byte subtracts now preserve low-byte borrow across LODI/LODA.
+;   v2.2-dev  BUG-DIV-ZCHK-01 FIXED: DIV16 divisor zero-check now treats any
 ; ── CHANGE HISTORY ──────────────────────────────────
 ;   V2.3-dev  Recursive PRINT_S16 = 4268 bytes assembled
 ;   v2.2v  BUG-DIV-ZCHK-01 FIXED: DIV16 divisor zero-check now treats any
@@ -534,31 +550,31 @@ DIF_RP:
         EORZ,R0 ; Clear 
         BCTA,UN DO_ERROR
 DIF_EVAL:
-        ; signed 16-bit compare: LNUMH:LNUML (left) vs EXPH:EXPL (right)
-        ; bias hi bytes by XOR $80 → unsigned compare
+        ; signed compare core aligned to expr_test DO_RELOP.
         LODA,R0 LNUMH
         EORI,R0 $80
         STRA,R0 SC0
         LODA,R0 EXPH
         EORI,R0 $80
-        SUBA,R0 SC0             ; biased right.hi - biased left.hi
-        BCTR,LT DIF_LT
-        BCTR,GT DIF_GT
-        ; hi bytes equal: compare lo (unsigned)
-        LODA,R0 EXPL
-        SUBA,R0 LNUML
-        BCTR,LT DIF_LT
-        BCTR,GT DIF_GT
-        EORZ,R0 ; Clear R0
         STRA,R0 SC1
-        BCTR,UN DIF_TH  ; EQ
+        LODA,R0 SC0
+        SUBA,R0 SC1
+        BCTR,LT DIF_LT
+        BCTR,GT DIF_GT
+        LODA,R0 LNUML
+        SUBA,R0 EXPL
+        BCTR,LT DIF_LT
+        BCTR,GT DIF_GT
+        EORZ,R0
+        STRA,R0 SC1
+        BCTR,UN DIF_TH
 DIF_LT:
-        LODI,R0 $01          ; right-hi < left-hi: left > right → SC1=$01
+        LODI,R0 $FF
         STRA,R0 SC1
-        BCTR,UN DIF_TH  ; LT (result: left > right)
+        BCTR,UN DIF_TH
 DIF_GT:
-        LODI,R0 $FF          ; right-hi > left-hi: left < right → SC1=$FF
-        STRA,R0 SC1  ; GT (result: left < right)
+        LODI,R0 $01
+        STRA,R0 SC1
 
 DIF_TH:
         ; consume THEN keyword: expect T then H then EATWORD
@@ -901,11 +917,16 @@ SL_MEASD:
         LODI,R0 >PROGLIM
         SUBA,R0 PEL
         STRA,R0 CURL
+        TPSL $01
+        BCTR,LT SL_FSNB
+        LODI,R0 <PROGLIM
+        SUBI,R0 1
+        SUBA,R0 PEH
+        BCTR,UN SL_FSDN
+SL_FSNB:
         LODI,R0 <PROGLIM
         SUBA,R0 PEH
-        BCFR,LT SL_NBC
-        SUBI,R0 1
-SL_NBC:
+SL_FSDN:
         STRA,R0 CURH            ; CURH:CURL = free bytes (LNUMH:LNUML preserved)
         LODA,R0 CURH
         COMI,R0 $00
@@ -936,10 +957,15 @@ SL_ROOM:
         LODA,R0 PEL
         SUBA,R0 EXPL
         STRA,R0 TMPL
+        TPSL $01
+        BCTR,LT SL_SHNB
+        LODA,R0 PEH
+        SUBI,R0 1
+        SUBA,R0 EXPH
+        BCTR,UN SL_SHCNB
+SL_SHNB:
         LODA,R0 PEH
         SUBA,R0 EXPH
-        BCFR,LT SL_SHCNB
-        SUBI,R0 1
 SL_SHCNB:
         STRA,R0 TMPH            ; TMPH:TMPL = shift count
 
@@ -951,62 +977,79 @@ SL_SHCNB:
         COMI,R0 $00
         BCTA,EQ SL_NOSHIFT
 SL_DOSHIFT:
-        ; src = PE-1 in LNUMH:LNUML (shift uses these as src pointer)
+        ; src = PE-1 in LNUMH:LNUML
         LODA,R0 PEL
         SUBI,R0 1
         STRA,R0 LNUML
+        TPSL $01
+        BCTR,LT SL_SNBR
         LODA,R0 PEH
-        BCFR,LT SL_SNBR
-        SUBI,R0 1
+        BCTR,UN SL_SSETH
 SL_SNBR:
-        STRA,R0 LNUMH           ; LNUMH:LNUML = src = PE-1
-        ; dst = src + SC1 (record size = shift amount)
-        ; ISSUE-02 FIX: must test carry from ADDA before any LODA clobbers CC.
-        ; Old code did STRA / LODA LNUMH / BCTA,GT — LODA wiped the carry.
-        ; New code: test carry immediately after ADDA, then load LNUMH on both paths.
+        LODA,R0 PEH
+        SUBI,R0 1
+SL_SSETH:
+        STRA,R0 LNUMH
+
+        ; dst = src + SC1 in GOTOH:GOTOL
         LODA,R0 LNUML
         ADDA,R0 SC1
         STRA,R0 GOTOL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
-        BCTR,LT SL_DSNCA         ; branch if C=0 (no carry)
-        LODA,R0 LNUMH           ; carry path: hi += 1
+        TPSL $01
+        BCTR,LT SL_DSNCA
+        LODA,R0 LNUMH
         ADDI,R0 1
-        STRA,R0 GOTOH
-        BCTR,UN SL_DSNCB
+        BCTR,UN SL_DSETH
 SL_DSNCA:
-        LODA,R0 LNUMH           ; no-carry path: hi unchanged
+        LODA,R0 LNUMH
+SL_DSETH:
         STRA,R0 GOTOH
-SL_DSNCB:
 
-        ; use R3 as count (shift count lo; assume <256 for any real program)
-        ; BUG-SCA-04 FIX: was BRNR,R3 at loop end — R3 never decremented → infinite shift.
-        ; Guard zero case first (BDRR with R3=0 would execute once wrongly).
-        LODA,R3 TMPL
 SL_SHLOOP:
-        COMI,R3 $00
-        BCTR,EQ SL_NOSHIFT
-        ; read from LNUMH:LNUML
+        ; loop until shift count TMPH:TMPL reaches zero
+        LODA,R0 TMPH
+        COMI,R0 $00
+        BCTA,GT SL_DOCPY
+        LODA,R0 TMPL
+        COMI,R0 $00
+        BCTA,EQ SL_NOSHIFT
+SL_DOCPY:
+        ; copy one byte backward
         LODA,R1 *LNUMH
-        ; write to GOTOH:GOTOL
         STRA,R1 *GOTOH
-        ; decrement both pointers
+
+SL_LOOP_DEC:
+        ; src--
         LODA,R0 LNUML
         SUBI,R0 1
         STRA,R0 LNUML
-        BCFR,LT SL_SRNB
+        TPSL $01
+        BCTR,LT SL_SRNB
         LODA,R0 LNUMH
         SUBI,R0 1
         STRA,R0 LNUMH
 SL_SRNB:
+        ; dst--
         LODA,R0 GOTOL
         SUBI,R0 1
         STRA,R0 GOTOL
-        BCFR,LT SL_DRNB
+        TPSL $01
+        BCTR,LT SL_DRNB
         LODA,R0 GOTOH
         SUBI,R0 1
         STRA,R0 GOTOH
 SL_DRNB:
-        BDRR,R3 SL_SHLOOP       ; R3--; if R3!=0 branch
+        ; shift_count--
+        LODA,R0 TMPL
+        SUBI,R0 1
+        STRA,R0 TMPL
+        TPSL $01
+        BCTR,LT SL_SCNB
+        LODA,R0 TMPH
+        SUBI,R0 1
+        STRA,R0 TMPH
+SL_SCNB:
+        BCTA,UN SL_SHLOOP
 
 SL_NOSHIFT:
         ; write record at EXPH:EXPL (insertion point)
