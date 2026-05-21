@@ -68,20 +68,34 @@ static int  lineno = 0;
 static int  warn_inline_label = 1;
 static int  warn_local_abs_branch = 1;
 
-static void upcase(char *s){
     /* Upcase the assembler line but preserve content inside single-quoted literals.
      * Handles both 'x' and A'x' (Signetics ASCII) so A'u' stays 0x75 not 0x55. */
-    for(;*s;s++){
-        if(*s=='\''){
-            s++;                        /* skip opening quote */
-            if(*s && *s!='\'') s++;     /* skip the literal char — preserve its case */
-            if(*s=='\'') s++;           /* skip closing quote */
-            s--;                        /* outer loop will s++ */
-        } else {
-            *s=(char)toupper((unsigned char)*s);
+static void upcase(char *s)
+{
+    int quote = 0;   /* 0 = not in quote, otherwise quote char (' or ") */
+
+    for (; *s; s++) {
+
+        if (quote) {
+            /* Inside quoted text */
+            if (*s == quote)
+                quote = 0;
+
+            continue;
         }
+
+        /* Enter quoted text */
+        if (*s == '\'' || *s == '"') {
+            quote = *s;
+            continue;
+        }
+
+        /* Normal assembler text */
+        *s = (char)toupper((unsigned char)*s);
+    
     }
 }
+
 static char *skip_ws(char *s){ while(*s==' '||*s=='\t') s++; return s; }
 
 static void emit(int addr, unsigned char b){
