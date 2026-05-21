@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.8
+ * Version: 1.9
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -12,6 +12,9 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.8 -> v1.9:
+ *   db "string" supported, reggedize previosuly silent errors
  *
  * Changes v1.7 -> v1.8:
  *   Inline label+instruction warning now applies only to explicit
