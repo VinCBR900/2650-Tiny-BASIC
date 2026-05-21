@@ -140,7 +140,12 @@ static int eval_expr(char *s, int *ok){
     } else { *ok=0; return 0; }
     if(neg) val=-val;
     s=skip_ws(s);
-    if(*s=='+'||*s=='-'){ int sub=(*s=='-'); s++; s=skip_ws(s); int ok2; int rhs=eval_expr(s,&ok2); val=sub?val-rhs:val+rhs; }
+    if(*s=='+'||*s=='-'){
+        int sub=(*s=='-'); s++; s=skip_ws(s);
+        int ok2; int rhs=eval_expr(s,&ok2);
+        if(!ok2){ *ok=0; return 0; }
+        val=sub?val-rhs:val+rhs;
+    }
     return val;
 }
 
@@ -234,11 +239,35 @@ static void assemble_line(char *line){
     for(int _i=0;_i<64;_i++) ops[_i][0]=0;
     int nops=split_ops(p,ops,64);
 
-    if(strcmp(mn,"ORG")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok){pc=v; if(pass==1&&*lbl) label_define(lbl,pc);} return; }
-    if(strcmp(mn,"EQU")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok) label_define(lbl,v); return; }
-    if(strcmp(mn,"DS")==0||strcmp(mn,"RES")==0){ int ok,n=eval_expr(ops[0],&ok); if(ok){for(int i=0;i<n;i++){emit(pc,0);pc++;}} return; }
-    if(strcmp(mn,"DB" )==0){ for(int i=0;i<nops;i++){int ok,v=eval_expr(ops[i],&ok); emit(pc,(unsigned char)(v&0xFF));pc++;} return; }
-    if(strcmp(mn,"DW" )==0){ for(int i=0;i<nops;i++){int ok,v=eval_expr(ops[i],&ok); emit(pc,(unsigned char)((v>>8)&0xFF));pc++; emit(pc,(unsigned char)(v&0xFF));pc++;} return; }
+    if(strcmp(mn,"ORG")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok){pc=v; if(pass==1&&*lbl) label_define(lbl,pc);} else if(pass==2){fprintf(stderr,"ERROR line %d: bad ORG expression '%s'\n",lineno,ops[0]); errors++;} return; }
+    if(strcmp(mn,"EQU")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok) label_define(lbl,v); else if(pass==2){fprintf(stderr,"ERROR line %d: bad EQU expression '%s'\n",lineno,ops[0]); errors++;} return; }
+    if(strcmp(mn,"DS")==0||strcmp(mn,"RES")==0){ int ok,n=eval_expr(ops[0],&ok); if(ok){for(int i=0;i<n;i++){emit(pc,0);pc++;}} else if(pass==2){fprintf(stderr,"ERROR line %d: bad %s expression '%s'\n",lineno,mn,ops[0]); errors++;} return; }
+    if(strcmp(mn,"DB" )==0){
+        for(int i=0;i<nops;i++){
+            char *s=skip_ws(ops[i]);
+            if(*s=='"'){
+                s++; /* skip opening quote */
+                while(*s && *s!='"'){
+                    emit(pc,(unsigned char)*s);
+                    pc++;
+                    s++;
+                }
+                if(*s!='"' && pass==2){
+                    fprintf(stderr,"ERROR line %d: unterminated string literal in DB\n",lineno);
+                    errors++;
+                }
+            } else {
+                int ok,v=eval_expr(ops[i],&ok);
+                if(!ok){
+                    if(pass==2){ fprintf(stderr,"ERROR line %d: bad DB expression '%s'\n",lineno,ops[i]); errors++; }
+                    continue;
+                }
+                emit(pc,(unsigned char)(v&0xFF)); pc++;
+            }
+        }
+        return;
+    }
+    if(strcmp(mn,"DW" )==0){ for(int i=0;i<nops;i++){int ok,v=eval_expr(ops[i],&ok); if(!ok){ if(pass==2){fprintf(stderr,"ERROR line %d: bad DW expression '%s'\n",lineno,ops[i]); errors++;} continue; } emit(pc,(unsigned char)((v>>8)&0xFF));pc++; emit(pc,(unsigned char)(v&0xFF));pc++;} return; }
     if(strcmp(mn,"END")==0) return;
     /* 2650 hardware constraints — warn on architecturally invalid encodings */
     if(strcmp(mn,"NOP" )==0){ emit(pc,0xC0);pc++; return; }
