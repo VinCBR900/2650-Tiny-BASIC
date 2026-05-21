@@ -171,7 +171,7 @@ RESET:
         ; Sets up showcase
         LODI,R0 <SHOWCASE_END
         STRA,R0 PEH
-        LODI,R0 <SHOWCASE_END   
+        LODI,R0 >SHOWCASE_END   
         STRA,R0 PEL
         ; Actual start
         BSTA,UN DO_END      ; setup RUNFLAG etc - Change to DO_NEW for no showcase 
@@ -570,7 +570,7 @@ DIF_ANDTEST:
 
 DO_GOTO:
         BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
-        BSTA,UN PARSE_U16                ; [+1]
+        BSTA,UN PARSE_EXPR                ; [+1]
         LODA,R0 ERRFLG
         COMI,R0 $00
         BCTR,EQ DG_OK
@@ -2654,7 +2654,7 @@ ROMEND: ; so we can measure Binary rom size
          ORG PROG
 
          DB $00,$0A,$52,$45,$4D,$20,$75,$42,$41,$53,$49,$43,$20,$2D,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$0D  ; 10 REM uBASIC v13 - SHOWCASE
-         DB $00,$0A,"PRINT ", $22, "-- uBASIC 2650 V2.4 Showcase --",$22, $0D ; 
+         DB $00,20,"PRINT ", $22, "-- uBASIC 2650 V2.4 Showcase --",$22, $0D ; 
          DB $00,$1E,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$50,$52,$49,$4E,$54,$20,$2F,$20,$43,$48,$52,$24,$20,$2D,$2D,$2D,$22,$0D  ; 30 PRINT "--- PRINT / CHR$ ---"
          DB $00,$28,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$36,$35,$29,$3B,$43,$48,$52,$24,$28,$36,$36,$29,$3B,$43,$48,$52,$24,$28,$36,$37,$29,$0D  ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
          DB $00,$32,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$41,$52,$49,$54,$48,$4D,$45,$54,$49,$43,$20,$2D,$2D,$2D,$22,$0D  ; 50 PRINT "--- ARITHMETIC ---"
