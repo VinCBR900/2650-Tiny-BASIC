@@ -30,7 +30,7 @@
 ;
 ; ── RAS DEPTH BUDGET (Silly 8-level hardware stack) ────────────────────────────────
 ;   All BSxx instructions (BSTA/BSTR/BSTA/BSFA/BSFR) consume a RAS slot
-;   PIPBUG COUT/CHIN: depth+2 internally. CRLF: depth+3.
+;   PIPBUG COUT/CHIN: depth+2 internally. 
 ;   Safe max user call depth from REPL: 5 levels.
 ;   Deepest working path: REPL(0)→STMT_EXEC(1)→DO_IF(2)→STMT_EXEC(3)→
 ;     DO_PRINT(4)→PARSE_EXPR(5)→PARSE_FACTOR(6)→PARSE_S16(7) = SP=7. Safe.
@@ -53,8 +53,15 @@
 ;         Likely never due to RAS limitations.
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
-;   v2.6  2026-05-22 - 4083 ROM bytes
-;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic  
+;   v2.6  2026-05-22 - 4027 ROM bytes
+;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic.
+;         ERRFLG refactor: PARSE_U16 now jumps directly to JSYNERR if no digit
+;               found (first-char pre-check added), propagating errors without
+;               ERRFLG polling. Removed redundant ERRFLG checks at: DP_EXPR,
+;               DP_CHAR, DL_EX, DO_INPUT, DO_IF, and PARSE_EXPR internal.
+;               Removed all redundant COMI,R0 $00 after LODA,R0 ERRFLG
+;               (LODA already sets CC). REPL and DELETE_LINE checks preserved
+;
 ;   v2.5  2026-05-22 - 4268 ROM Bytes
 ;         BUG-FL-02 FIXED: FIND_INS FI_CHK lo-byte comparison used signed SUBA.
 ;               Line numbers with  lo byte >= $80 (e.g.  128, 160) the subtraction
@@ -63,12 +70,10 @@
 ;               "undefined line" error. Fix: replaced SUBA,R0 *EXPH / BCTR,GT with
 ;                    PPSL $02 / COMA,R0 *EXPH / CPSL $02 / BCTR,GT
 ;               (unsigned compare mode, same pattern as DR_LP boundary check).
+;
 ;         BUG-CHR-01 FIXED: PARSE_EXPR: PF_CHR_TRY consumed 'C' via INC_IP to peek at the
 ;               next char, then on non-CHR$ fallback branched to PF_VAR which
 ;               called INC_IP again — consuming the char after C (e.g. '>').
-;               For any expression using variable C (e.g. "IF C>4"), PARSE_RELOP
-;               never saw the relop → ERRFLG=1 → JSYNERR at every IF using C.
-;               Fix: fallback BCTA,UN PF_VAR → BCTA,UN PF_LVNCA (skips INC_IP).
 ;
 ;   v2.4  2026-05-19
 ;         SHOWCASE appended including Mandelbrot section. PRTSTR optimised.
@@ -356,17 +361,13 @@ DP_ITEM:                        ; Check for items to print
         BSTA,UN DEC_IP          ; No, back up IP and fall through to expression
 
 DP_EXPR:                        ; Handle numeric expression
-        BSTA,UN PARSE_EXPR      
-        LODA,R0 ERRFLG          
-        BCFA,EQ ERR_SYN         ; Fix: Branch to syntax error if ERRFLG != 0
+        BSTA,UN PARSE_EXPR      ; on error jumps directly to JSYNERR
         BSTA,UN PRINT_S16       ; Print the 16-bit signed integer
         BCTR,UN DP_SEP          
 
 DP_CHAR:                        ; Handle CHR$(expr)
         BSTA,UN EATWORD         ; Consume "HR$" — IP lands on '(' (BUG-DP-01 FIX: was BCTA,UN)
-        BSTA,UN PARSE_EXPR      ; manage parenthasis as an expression 
-        LODA,R0 ERRFLG          
-        BCFA,EQ ERR_SYN         ; If R0 hence ERRFLG != 0 syntax error
+        BSTA,UN PARSE_EXPR      ; parse (expr) — on error jumps directly to JSYNERR
         LODA,R0 EXPL            ; Get parsed character byte
         BSTA,UN COUT            ; Print it
         BCTR,UN DP_SEP          ; now check for anything else to print
@@ -432,12 +433,7 @@ DL_EQ:
 DL_EQC:
         BSTA,UN INC_IP
 DL_EX:
-        BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DL_STORE
-        EORZ,R0 ; Clear 
-        BCTA,UN JSYNERR
+        BSTA,UN PARSE_EXPR               ; [+1] on error jumps directly to JSYNERR
 DL_STORE:
         ; address = VARS + (SC0 - 'A') * 2
         ; BUG-BASIC-14 FIX: restore variable letter from R2 (SC0 was clobbered
@@ -487,11 +483,8 @@ DIN_PR:
         STRA,R0 IPH
         LODI,R0 >IBUF
         STRA,R0 IPL
-        BSTA,UN PARSE_S16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ DL_STORE
-        BCTA,UN JSYNERR
+        BSTA,UN PARSE_S16                ; [+1] on error jumps directly to JSYNERR
+        BCTA,UN DL_STORE
 
 ; ─── DO_IF ────────────────────────────────────────────────────────────────────
 ; IF expr relop expr THEN stmt
@@ -499,11 +492,7 @@ DIN_PR:
 ; After THEN: calls STMT_EXEC at +1, which can call DO_xxx at +1, PARSE_EXPR at +1,
 ;             PARSE_FACTOR at +1 → max total 2+1+1+1+1+1 = depth 7 OK.
 DO_IF:
-        BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DIF_LS
-        BCTA,UN JSYNERR
+        BSTA,UN PARSE_EXPR               ; [+1] on error jumps directly to JSYNERR
 DIF_LS:
         LODA,R0 EXPH
         STRA,R0 LNUMH  ; BUG-T6 FIX: save left in LNUMH:LNUML (TMPH:TMPL clobbered
@@ -1002,9 +991,8 @@ SL_WDONE:
 DELETE_LINE:
         BSTA,UN FIND_LINE                ; [+1]
         LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DL2_FOUND
-        RETC,UN
+        BCTR,EQ DL2_FOUND               ; ERRFLG=0 (EQ) → found
+        RETC,UN                          ; not found → silent return
 DL2_FOUND:
         ; record start in TMPH:TMPL.  CR-format: size = scan from +2 until CR + 3.
         LODA,R0 TMPH
@@ -1217,11 +1205,8 @@ PX_ATOM:
         BCTR,EQ PX_UNEG
         COMI,R0 A'+'
         BCTA,EQ PX_UPOS
-        BSTA,UN PARSE_FACTOR             ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ PX_PUSHV
-        RETC,UN
+        BSTA,UN PARSE_FACTOR             ; [+1] on error jumps directly to JSYNERR
+        BCTA,UN PX_PUSHV                 ; success → push result onto value stack
 
 PX_LPAR:
         ; push '(' sentinel onto OPSTK
@@ -1816,22 +1801,30 @@ PS16_CHK:
 ; (PS16_RET merged into inline RETC,EQ above)
 
 ; ─── PARSE_U16 ────────────────────────────────────────────────────────────────
-; Parse unsigned decimal digits → EXPH:EXPL. ERRFLG=$00 if ≥1 digit.
+; Parse unsigned decimal digits → EXPH:EXPL.
+; Jumps to JSYNERR if no digits found (caller no longer needs ERRFLG check).
 ; RAS-FIX: WSKIP removed entirely from PARSE_U16. All callers must
 ; call WSKIP before invoking PARSE_U16 (PARSE_S16 does; DO_GOTO and
 PARSE_U16:
         EORZ,R0 ; Clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
-PU16_LP:
+        ; Check first char — must be a digit or it is a syntax error.
         ; TRY_STORE_LINE have explicit WSKIP added). This saves 1 RAS slot
         ; from the inner loop, preventing overflow at nested IF + CHR$().
         LODA,R0 *IPH
         COMI,R0 A'0'
-        RETC,LT
+        BCTA,LT JSYNERR          ; < '0' → not a digit → syntax error
+        COMI,R0 A'9'+1
+        BCTA,GT JSYNERR          ; > '9' → not a digit → syntax error
+        ; First digit confirmed — fall into digit loop
+PU16_LP:
+        LODA,R0 *IPH
+        COMI,R0 A'0'
+        RETC,LT                  ; < '0' → end of number (valid exit)
         COMI,R0 A'9'+1
         BCTR,LT PU16_DIG
-        RETC,UN
+        RETC,UN                  ; > '9' → end of number (valid exit)
 PU16_DIG:
         SUBI,R0 A'0'
         STRA,R0 SC0  ; digit value 0-9
@@ -2466,17 +2459,6 @@ DEC_IP:
         LODA,R0 IPH
         SUBI,R0 1
         STRA,R0 IPH
-        RETC,UN
-
-DEC_TMP:
-        LODA,R0 TMPL
-        SUBI,R0 1
-        STRA,R0 TMPL
-        TPSL $01                 ; BUG-DEC-01 FIX: same as DEC_IP — RETC,EQ on no-borrow (C=1)
-        RETC,EQ                  ; C=1 → no borrow → hi unchanged, return
-        LODA,R0 TMPH
-        SUBI,R0 1
-        STRA,R0 TMPH
         RETC,UN
 
 ; ─── Shared Character PRINT routines ─────────────────────────────────────────────────────────────────
