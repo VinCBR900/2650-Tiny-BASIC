@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.5
+; Version: v2.6
 ; Date:    2026-05-22
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
@@ -44,24 +44,26 @@
 ;   SWSTK[0:1] ($162E:$162F) — DO_RUN next-line-pointer save across STMT_EXEC
 ;   LNUMH:LNUML — scratch line number; save area in DO_LIST (BUG-BASIC-12 fix)
 ;   TMPH:TMPL — general 16-bit temp; clobbered by PRINT_S16 (BUG-BASIC-12 fix)
+;   IPH:IPL   - *ptr character is each line to parse
+;   EXPH:EXPL - results from expressions for printing       
 ;
 ; ── KNOWN OPEN BUGS (as of v2.5, 2026-05-22) ────────────────────────────────
 ; BUG-COLON-01 (OPEN — workaround in place):
-;   Multi-statement separator ':' not supported yet e.g. "A=1:GOTO 10".
-;         Requires careful RAS accounting since all BSxx consume a slot.
+;   Multi-statement separator ':' not supported e.g. "A=1:GOTO 10".
+;         Likely never due to RAS limitations.
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
-;   v2.5  2026-05-22
+;   v2.6  2026-05-22 - 4083 ROM bytes
+;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic  
+;   v2.5  2026-05-22 - 4268 ROM Bytes
 ;         BUG-FL-02 FIXED: FIND_INS FI_CHK lo-byte comparison used signed SUBA.
-;               For any line number whose lo byte >= $80 (e.g. lines 128, 160,
-;               185, 255, 391, 450 ...) the subtraction result has bit 7 set,
-;               giving CC=LT regardless of the unsigned ordering. FIND_INS
-;               therefore returned the insertion point too early — GOTO/GOSUB
-;               to those lines always gave "undefined line" error.
-;               Fix: replaced SUBA,R0 *EXPH / BCTR,GT with
+;               Line numbers with  lo byte >= $80 (e.g.  128, 160) the subtraction
+;               result has bit 7 set, so  CC=LT regardless of the unsigned ordering.
+;               FIND_INS returned the insertion point too early — GOTO gave
+;               "undefined line" error. Fix: replaced SUBA,R0 *EXPH / BCTR,GT with
 ;                    PPSL $02 / COMA,R0 *EXPH / CPSL $02 / BCTR,GT
 ;               (unsigned compare mode, same pattern as DR_LP boundary check).
-;         BUG-CHR-01 FIXED: PF_CHR_TRY consumed 'C' via INC_IP to peek at the
+;         BUG-CHR-01 FIXED: PARSE_EXPR: PF_CHR_TRY consumed 'C' via INC_IP to peek at the
 ;               next char, then on non-CHR$ fallback branched to PF_VAR which
 ;               called INC_IP again — consuming the char after C (e.g. '>').
 ;               For any expression using variable C (e.g. "IF C>4"), PARSE_RELOP
@@ -178,8 +180,6 @@ RESET:
         STRA,R0 IPH
         LODI,R0 >VARS
         STRA,R0 IPL
-; BUG-SCA-11 FIX: BDRR semantics are rn--; if(rn!=0) branch — exits when rn
-; hits zero. Load N for exactly N iterations: $34→$33→...→$01→$00→exit = 52.
         LODI,R3 $34             ; 52 iterations: R3 counts $34→$33→...→$01→$00→exit
 CLRV:
         EORZ,R0 ; Clear R0
@@ -298,7 +298,7 @@ SE_NOTKW:
         LODA,R0 SC1
         COMI,R0 A'='
         BCTR,EQ SE_BAREASS       ; SC1 == '=' → bare assignment
-        BCTA,UN JSYNERR          ; not '=' → true syntax error
+        BCTR,UN JSYNERR          ; not '=' → true syntax error
 SE_BAREASS:
         LODA,R0 SC0
         STRZ,R2                  ; save letter in R2 (survives PARSE_EXPR, per DO_LET convention)
@@ -308,6 +308,8 @@ JSYNERR:
         LODI,R0 ERR_SYN
         BCTA,UN DO_ERROR
 
+; ─── DO_NEW setup system VARS ────────────────────────────────────────────
+; ─── DO_END clear system VARS ────────────────────────────────────────────
 ; Should probably clear PROG memory
 DO_NEW:
         LODI,R0 <PROG
@@ -322,84 +324,84 @@ DO_END:
         STRA,R0 RUNFLG
         STRA,R0 GOTOFLG
         ; drop through
-; ─── SIMPLE STATEMENTS ────────────────────────────────────────────────────────
+
+; ─── DO_REM - do nothing ────────────────────────────────────────────────────────
 PRTSTR_RET:
 DO_REM:
         RETC,UN
 
 ; ─── DO_PRINT combined with PRTSTR ────────────────────────────────────────────
-; PRINT [item {, item}]    item = "string" | expr
-; CHR$ flag: NEGFLG=$01 after PARSE_FACTOR detects CHR$ — print EXPL as char.
+; PRINT [item1][;]...[itemx][;]    item = "string" | expr | CHR$(expr) 
+;   Inline check for CHR$
 ; PRTSTR Print NUL-terminated string at IPH:IPL.
-DO_PRINT:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 NUL ; No opening " so just CRLF
-        BCTA,EQ DP_NL
+; ──────────────────────────────────────────────────────────────────────────────
 
-DP_ITEM:
-        BSTA,UN WSKIP                    ; [+1]
+DO_PRINT:
+        BSTA,UN WSKIP           
         LODA,R0 *IPH
-        COMI,R0 DQ  ; Opening "
-        BCTR,EQ DP_STRING
-        EORZ,R0 ; Clear R0
-        STRA,R0 CHRFLG  ; clear CHR$ flag before parse
-        BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DP_NUM
-       ; BSTA,UN PRTSTR_IP
-        BCTR,UN DP_NL  ; [+1] raw text fallback
-DP_NUM:
-        LODA,R0 CHRFLG
-        COMI,R0 $01
-        BCTR,EQ DP_CHAR
-        BSTA,UN PRINT_S16
-        BCTR,UN DP_SEP  ; [+1]
-DP_CHAR:
-        LODA,R0 EXPL
-        BSTA,UN COUT
-        BCTR,UN DP_SEP
+        BCTA,EQ DP_NL           ; Implicit CC: If NUL, just hit the CRLF and exit
+
+DP_ITEM:                        ; Check for items to print
+        BSTA,UN WSKIP           ; Skip spaces
+        LODA,R0 *IPH
+        COMI,R0 DQ              ; Opening double quote?
+        BCTA,EQ DP_STRING       
+        COMI,R0 'C'             ; Might be CHR$
+        BCFR,EQ DP_EXPR         ; Not 'C', must be an expression
+        
+        BSTA,UN INC_IP          ; Check next char
+        LODA,R0 *IPH
+        COMI,R0 'H'             ; Is it actually CHR$?
+        BCTR,EQ DP_CHAR         ; Yes, handle character code
+        BSTA,UN DEC_IP          ; No, back up IP and fall through to expression
+
+DP_EXPR:                        ; Handle numeric expression
+        BSTA,UN PARSE_EXPR      
+        LODA,R0 ERRFLG          
+        BCFA,EQ ERR_SYN         ; Fix: Branch to syntax error if ERRFLG != 0
+        BSTA,UN PRINT_S16       ; Print the 16-bit signed integer
+        BCTR,UN DP_SEP          
+
+DP_CHAR:                        ; Handle CHR$(expr)
+        BSTA,UN EATWORD         ; Consume "HR$" — IP lands on '(' (BUG-DP-01 FIX: was BCTA,UN)
+        BSTA,UN PARSE_EXPR      ; manage parenthasis as an expression 
+        LODA,R0 ERRFLG          
+        BCFA,EQ ERR_SYN         ; If R0 hence ERRFLG != 0 syntax error
+        LODA,R0 EXPL            ; Get parsed character byte
+        BSTA,UN COUT            ; Print it
+        BCTR,UN DP_SEP          ; now check for anything else to print
+
+DP_SEMI:
+        BSTA,UN INC_IP          ; Consume the ';'
+DP_SEMI2:
+        BSTA,UN WSKIP           ; anything else to print?
+        LODA,R0 *IPH            
+        RETC,EQ                 ; LODA sets Zero flag if zero
+        BCTA,UN DP_ITEM         ; 
 
 DP_STRING:
-        ; consume opening "
-        BSTA,UN INC_IP
-PRTSTR:
-        LODA,R1 *IPH
-        COMI,R1 NUL ; NULL - used outside Print routine 
-        BCTA,EQ PRTSTR_RET
-        COMI,R1 DQ  ; double quotes
-        BCTR,EQ DP_SCLS
-        LODZ,R1
-        BSTA,UN COUT
-        BSTA,UN INC_IP
-        BCTR,UN PRTSTR
+        BSTA,UN INC_IP          ; Consume opening double quote
+
+PRTSTR:                         ; Shared entry point for printing standalone strings
+        LODA,R0 *IPH            ; Read directly into R0 (saves LODZ later)
+        BCTA,EQ PRTSTR_RET      ; Direct branch on Zero (saves COMI)
+        COMI,R0 DQ              ; Is it a closing double quote?
+        BCTR,EQ DP_SCLS         ; Yes it is
+        BSTA,UN COUT            ; Output character in R0
+        BSTA,UN INC_IP          
+        BCTR,UN PRTSTR          ; continue until " or NULL
+
 DP_SCLS:
-        ; consume closing "
-        BSTA,UN INC_IP
-DP_SDONE:
+        BSTA,UN INC_IP          ; Consume closing double quote
+
 DP_SEP:
-        BSTA,UN WSKIP                    ; [+1]
+        BSTA,UN WSKIP           ; Wrapping up, check for ;
         LODA,R0 *IPH
-        COMI,R0 $3B              ; ';' = $3B (A';' rejected by WinArcadia assembler)
-        BCTR,EQ DP_SEMI  ; semicolon → no space, continue or end without CRLF
-        COMI,R0 A','
-        BCTR,EQ DP_COMMA
-        ; fall through to DP_NL (NUL, or any non-separator = end of PRINT)
+        COMI,R0 $3B             ; Is it a semicolon (';')?
+        BCTR,EQ DP_SEMI         ; Yes, handle trailing/continuation logic
+                                ; Fall through to DP_NL if no valid separator found
 DP_NL:
-        BCTA,UN CRLF
-        ; RETC,UN
-DP_SEMI:
-        BSTA,UN INC_IP                   ; consume ';'
-DP_SEMI2:
-        BSTA,UN WSKIP                    ; [+1]
-        LODA,R0 *IPH
-        COMI,R0 NUL
-        RETC,EQ                          ; trailing ";" → no CRLF, done
-        BCTA,UN DP_ITEM                  ; more items follow
-DP_COMMA:
-        BSTA,UN INC_IP
-        BCTA,UN DP_ITEM
+        BCTA,UN CRLF            ; Tail call to CRLF and return to interpreter
 
 ; ─── DO_LET / shared store path ───────────────────────────────────────────────
 ; DO_INPUT jumps to DL_STORE with SC0 = variable letter already set.
@@ -508,16 +510,8 @@ DIF_LS:
         LODA,R0 EXPL   ;   by PARSE_EXPR's PX_PUSHV writing <VALSH/$15 to TMPH)
         STRA,R0 LNUML
         BSTA,UN PARSE_RELOP              ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DIF_RP
-        BCTA,UN JSYNERR
 DIF_RP:
         BSTA,UN PARSE_EXPR               ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DIF_EVAL
-        BCTA,UN JSYNERR
 DIF_EVAL:
         ; signed 16-bit compare: LNUMH:LNUML (left) vs EXPH:EXPL (right)
         ; bias hi bytes by XOR $80 → unsigned compare
@@ -588,10 +582,6 @@ DIF_ANDTEST:
 DO_GOTO:
         BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
         BSTA,UN PARSE_U16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ DG_OK
-        BCTA,UN JSYNERR
 DG_OK:
         LODA,R0 EXPH
         STRA,R0 GOTOH
@@ -776,12 +766,7 @@ DR_GOTO:
         LODA,R0 GOTOL
         STRA,R0 LNUML
         BSTA,UN FIND_LINE                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTA,EQ DR_LP
-JERRLINE:
-        LODI,R0 ERR_UND_LINE
-        BCTA,UN DO_ERROR  ; [+1] undefined line — returns to REPL
+        BCTA,UN DR_LP
 DR_STOP:
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG
@@ -790,10 +775,7 @@ DR_RET:
 
 ; ─── TRY_STORE_LINE ───────────────────────────────────────────────────────────
 ; If IP starts with a digit, parse and store/delete the numbered line.
-; Returns ERRFLG=$01 if handled as a numbered line, $00 if immediate.
 TRY_STORE_LINE:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
         LODA,R0 *IPH
         COMI,R0 A'0'
         ; BCTR,LT TSL_RET
@@ -805,20 +787,6 @@ TSL_RET:
 TSL_NUM:
         BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
         BSTA,UN PARSE_U16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ TSL_GOT
-        ;BCTR,UN TSL_RET
-        RETC,UN
-TSL_GOT:
-        ; validate 1..32767
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTR,EQ TSL_RNG
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        RETC,UN  ; >=32768 silently ignore
-TSL_RNG:
         LODA,R0 EXPH
         COMI,R0 $00
         BCTR,GT TSL_NZ
@@ -1123,9 +1091,9 @@ FL_CHK:
         SUBA,R0 LNUMH
         BCTR,EQ FL_CHKLO
 FL_RET_NF:
-        LODI,R0 1
-        STRA,R0 ERRFLG
-        RETC,UN
+JERRLINE:
+        LODI,R0 ERR_UND_LINE
+        BCTA,UN DO_ERROR  ; undefined line — returns to REPL
 FL_CHKLO:
         LODA,R0 TMPL
         ADDI,R0 1
@@ -1236,7 +1204,7 @@ FI_DONE:
 PARSE_EXPR:
         LODI,R0 $FF
         STRA,R0 STKIDX
-        EORZ,R0 ; Clear R0
+        EORZ,R0 ; Clear R0      ; no error is zero
         STRA,R0 ERRFLG
 
 PX_ATOM:
@@ -1279,10 +1247,6 @@ PX_UNEG:
         BSTA,UN INC_IP
 PX_UNN:
         BSTA,UN PARSE_FACTOR             ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ PX_NEG
-        RETC,UN
 PX_NEG:
         LODA,R0 EXPH
         EORI,R0 $FF
@@ -1298,11 +1262,6 @@ PX_UPOS:
         BSTA,UN INC_IP
 PX_UPN:
         BSTA,UN PARSE_FACTOR             ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ PX_PUSHV
-        RETC,UN
-
 PX_PUSHV:
         ; push EXPH:EXPL to value stack at STKIDX+1
         LODA,R0 STKIDX
@@ -1520,8 +1479,6 @@ PX_DN_LN:
         STRA,R0 TMPH
         LODA,R0 *TMPH
         STRA,R0 EXPL
-        EORZ,R0
-        STRA,R0 ERRFLG
         RETC,UN
 
 ; ─── GET_PREC ─────────────────────────────────────────────────────────────────
@@ -1752,10 +1709,7 @@ PF_NUM:
         RETC,UN
 
 PF_LOADVAR:
-        ; load variable value from VARS — but first check for CHR$()
-        ; R0 already has the uppercased first char. If 'C', may be CHR$
-        COMI,R0 A'C'
-        BCTR,EQ PF_CHR_TRY
+        ; load variable value from VARS 
 PF_VAR:
         ; BUG-BASIC-03 FIX: save letter to SC0 BEFORE INC_IP clobbers R0.
         STRA,R0 SC0              ; save variable letter (A-Z)
@@ -1785,88 +1739,11 @@ PF_LVN2:
         STRA,R0 ERRFLG
         RETC,UN
 
-; ─── CHR$(n) detection ────────────────────────────────────────────────────────
-; Entry: R0=A'C', IP at 'C'. Check next chars are H, R, $, (
-; If yes: consume "CHR$(", parse expr, set NEGFLG=$01 (char output flag).
-; If no:  fall through to normal variable load of C.
-;
-; Input : R0=A'C', *IPH=A'C'
-; Output: EXPH:EXPL=char value, NEGFLG=$01, ERRFLG=$00
-; Clobbers: R0, TMPH:TMPL, SC0, SC1
-PF_CHR_TRY:
-        BSTA,UN INC_IP           ; consume 'C'
-PF_CHRT1:
-        ; NB: stored program text is always uppercase (RDLINE uppercases on store)
-        ; so we can compare directly without calling UPCASE here.
-        LODA,R0 *IPH
-        COMI,R0 A'H'
-        BCTR,EQ PF_CHRT2
-        ; Not CHR$ — treat C as variable.
-        ; BUG-CHR-01 FIX: INC_IP already consumed 'C' above; PF_VAR would consume
-        ; another char (the one after C, e.g. '>') causing IP corruption.
-        ; Jump to PF_LVNCA which skips the INC_IP and goes straight to load.
-        LODI,R0 A'C'
-        BCTA,UN PF_LVNCA
-PF_CHRT2:
-        BSTA,UN INC_IP           ; consume 'H'
-PF_CHRT3:
-        LODA,R0 *IPH
-        COMI,R0 A'R'
-        BCTR,EQ PF_CHRT4
-        LODI,R0 A'C'
-        BCTA,UN PF_VAR
-PF_CHRT4:
-        BSTA,UN INC_IP           ; consume 'R'
-PF_CHRT5:
-        LODA,R0 *IPH
-        COMI,R0 A'$'
-        BCTR,EQ PF_CHRT6
-        LODI,R0 A'C'
-        BCTA,UN PF_VAR
-PF_CHRT6:
-        BSTA,UN INC_IP           ; consume '$'
-PF_CHRT7:
-        BSTA,UN WSKIP
-        LODA,R0 *IPH
-        COMI,R0 A'('
-        BCTR,EQ PF_CHRARG
-        LODI,R0 A'C'
-        BCTA,UN PF_VAR
-PF_CHRARG:
-        BSTA,UN INC_IP           ; consume '('
-PF_CHREA:
-        ; BUG-CHR-01 resolved: depth is now 7 (safe). Upgrade to PARSE_EXPR
-        ; so CHR$(I+48), CHR$(A+32) etc. work correctly.
-        ; Depth: DO_PRINT(3)→PARSE_EXPR(4)→PARSE_FACTOR/CHR$(5)→PARSE_EXPR(6)
-        ;        →PARSE_FACTOR(7) — max 7, safe.
-        ; Note: PARSE_FACTOR clears CHRFLG at entry; PF_CHRDN restores it after.
-        BSTA,UN PARSE_EXPR       ; [+1]  evaluate full expression
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ PF_CHROK
-        RETC,UN
-PF_CHROK:
-        ; PARSE_EXPR already consumed ')' via PX_RPAR — do not consume again.
-        ; (Old PARSE_FACTOR path left ')' unconsumed; PARSE_EXPR does not.)
-; PF_CHRDN:
-        LODI,R0 $FF
-        STRA,R0 STKIDX           ; BUG-CHR-02: restore outer PARSE_EXPR stack index.
-        ; Inner PARSE_EXPR (called from PF_CHREA) initialised STKIDX=$FF and
-        ; incremented it to $00 when pushing its result. The outer PARSE_EXPR
-        ; at PX_ATOM has not yet called PX_PUSHV, so it expects STKIDX=$FF.
-        ; Resetting here lets outer PX_PUSHV store result at slot [0]. Correct.
-        LODI,R0 1
-        STRA,R0 CHRFLG           ; signal DO_PRINT to output as char
-        EORZ,R0
-        STRA,R0 ERRFLG
-        RETC,UN
-
-
 ; ─── PARSE_RELOP ──────────────────────────────────────────────────────────────
 ; Scan relational operator(s) at IP, build bitmask in RELOP.
 ;   '<' sets bit 0 (LT=1), '=' sets bit 1 (EQ=2), '>' sets bit 2 (GT=4)
 ;   So: < =1  = =2  > =4  <= =3  <> =5  >= =6
-; Returns ERRFLG=$00 if any relop found, $01 if none.
+; Jumps to JSYNERR if any relop error found
 ; Clobbers: R0, R1 (R1 used as mask accumulator)
 ; Input : IP at first char of relop
 ; Output: RELOP = bitmask, ERRFLG=$00 ok / $01 none
@@ -1887,8 +1764,6 @@ PRO_LP:
         BCTR,EQ PRO_NONE                 ; no relop chars seen → error
         LODZ,R1                          ; R0 = mask (BUG-RELOP-01: removed STRZ,R1 which clobbered R1 with non-relop char)
         STRA,R0 RELOP
-        EORZ,R0
-        STRA,R0 ERRFLG
         RETC,UN
 PRO_LT:
         IORI,R1 1                        ; set LT bit
@@ -1903,9 +1778,7 @@ PRO_JMP:
         BCTR,UN PRO_LP
 
 PRO_NONE:
-        LODI,R0 1
-        STRA,R0 ERRFLG
-        RETC,UN
+        BCTA,UN JSYNERR
 
 PARSE_S16:
         ; RAS-FIX: WSKIP removed. PX_ATOM already called WSKIP before PARSE_FACTOR,
@@ -1928,10 +1801,6 @@ PS16_NN:
         STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, skipping negation
 PS16_UN:
         BSTR,UN PARSE_U16                ; [+1]
-        LODA,R0 ERRFLG
-        COMI,R0 $00
-        BCTR,EQ PS16_CHK
-        RETC,UN
 PS16_CHK:
         LODA,R0 NEGFLG
         COMI,R0 $00
@@ -1954,8 +1823,6 @@ PARSE_U16:
         EORZ,R0 ; Clear R0
         STRA,R0 EXPH
         STRA,R0 EXPL
-        LODI,R0 1               ; BUG-BASIC-06 FIX: ERRFLG=1 = "no digits yet" (failure)
-        STRA,R0 ERRFLG          ; was EORZ,R0 meaning "success" before any digit seen
 PU16_LP:
         ; TRY_STORE_LINE have explicit WSKIP added). This saves 1 RAS slot
         ; from the inner loop, preventing overflow at nested IF + CHR$().
@@ -2015,8 +1882,6 @@ PU16_MNC:
         ADDI,R0 1
         STRA,R0 EXPH
 PU16_DIG_NC:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG  ; success: at least one digit
         BCTA,UN PU16_LP
 
 ; ─── MUL16 ────────────────────────────────────────────────────────────────────
@@ -2485,6 +2350,7 @@ RL_EOL:
         BCTA,UN CRLF
 
 ; ─── WSKIP ────────────────────────────────────────────────────────────────────
+; Skips spaces
 WSKIP:
         LODA,R0 *IPH
         COMI,R0 SP
@@ -2588,12 +2454,26 @@ INC_EXP:
         STRA,R0 EXPH
 INC_EXP_RET:
         RETC,UN
+DEC_IP:
+        LODA,R0 IPL
+        SUBI,R0 1
+        STRA,R0 IPL
+        ; BUG-DEC-01 FIX: SUBI C=1 means no-borrow (hi unchanged), C=0 means borrow (hi needs decrement).
+        ; RETC,LT was wrong — LT fires on result sign, not carry. Use TPSL to isolate carry bit.
+        ; TPSL $01: CC=EQ if C=1 (no borrow), CC=LT if C=0 (borrow). RETC,EQ returns on no-borrow.
+        TPSL $01
+        RETC,EQ                  ; C=1 → no borrow → hi byte unchanged, return
+        LODA,R0 IPH
+        SUBI,R0 1
+        STRA,R0 IPH
+        RETC,UN
 
 DEC_TMP:
         LODA,R0 TMPL
         SUBI,R0 1
         STRA,R0 TMPL
-        RETC,LT                  ; C=1 (no borrow) → hi unchanged, return
+        TPSL $01                 ; BUG-DEC-01 FIX: same as DEC_IP — RETC,EQ on no-borrow (C=1)
+        RETC,EQ                  ; C=1 → no borrow → hi unchanged, return
         LODA,R0 TMPH
         SUBI,R0 1
         STRA,R0 TMPH
@@ -2647,7 +2527,7 @@ DE_NL:
 ; ─── TABLES ───────────────────────────────────────────────────────────────────
 BANNER:
         DB CR, LF
-        DB "uBASIC 2650 V2.5"
+        DB "uBASIC 2650 V2.6"
         DB CR, LF, NUL
 
 ; Keyword table: [c1][c2][hi][lo]  NUL-terminated.
