@@ -1,6 +1,6 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
 ; Version: v2.6
-; Date:    2026-05-22
+; Date:    2026-05-23
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
 ;   Code base $0440.
@@ -30,7 +30,7 @@
 ;
 ; ── RAS DEPTH BUDGET (Silly 8-level hardware stack) ────────────────────────────────
 ;   All BSxx instructions (BSTA/BSTR/BSTA/BSFA/BSFR) consume a RAS slot
-;   PIPBUG COUT/CHIN: depth+2 internally. 
+;   PIPBUG COUT/CHIN: depth+2 internally. CRLF: depth+3.
 ;   Safe max user call depth from REPL: 5 levels.
 ;   Deepest working path: REPL(0)→STMT_EXEC(1)→DO_IF(2)→STMT_EXEC(3)→
 ;     DO_PRINT(4)→PARSE_EXPR(5)→PARSE_FACTOR(6)→PARSE_S16(7) = SP=7. Safe.
@@ -53,16 +53,24 @@
 ;         Likely never due to RAS limitations.
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
-;   v2.6  2026-05-22 - 4027 ROM bytes
+;   v2.6  2026-05-23 - 3960 ROM  interpreter bytes (5838 total inc showcase)
 ;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic.
+;         BUG-DEC-01 FIXED: DEC_IP and DEC_TMP used RETC,LT after SUBI — tested
+;               result sign not carry. On 2650 SUBI sets C=1 for no-borrow (hi
+;               unchanged), C=0 for borrow (hi needs decrement). RETC,LT returned
+;               on borrow (wrong) and fell through on no-borrow (wrong). Fixed with
+;               TPSL $01 / RETC,EQ pattern (C=1 -> CC=EQ -> return on no-borrow).
 ;         ERRFLG refactor: PARSE_U16 now jumps directly to JSYNERR if no digit
 ;               found (first-char pre-check added), propagating errors without
 ;               ERRFLG polling. Removed redundant ERRFLG checks at: DP_EXPR,
 ;               DP_CHAR, DL_EX, DO_INPUT, DO_IF, and PARSE_EXPR internal.
 ;               Removed all redundant COMI,R0 $00 after LODA,R0 ERRFLG
-;               (LODA already sets CC). REPL and DELETE_LINE checks preserved
+;         Optimisation pass — 78 bytes saved in interpreter:
+;               COMI,Rx $00 where preceding LODA/SUBI/etc sets CC
+;               BCTA->BCTR, BCTA,UN PS_RET -> RETC,UN
+;              Deleted dead DEC_TMP routine — no callers (10 bytes).
 ;
-;   v2.5  2026-05-22 - 4268 ROM Bytes
+;   v2.5  2026-05-22 - 5841 ROM Bytes
 ;         BUG-FL-02 FIXED: FIND_INS FI_CHK lo-byte comparison used signed SUBA.
 ;               Line numbers with  lo byte >= $80 (e.g.  128, 160) the subtraction
 ;               result has bit 7 set, so  CC=LT regardless of the unsigned ordering.
@@ -70,10 +78,12 @@
 ;               "undefined line" error. Fix: replaced SUBA,R0 *EXPH / BCTR,GT with
 ;                    PPSL $02 / COMA,R0 *EXPH / CPSL $02 / BCTR,GT
 ;               (unsigned compare mode, same pattern as DR_LP boundary check).
-;
 ;         BUG-CHR-01 FIXED: PARSE_EXPR: PF_CHR_TRY consumed 'C' via INC_IP to peek at the
 ;               next char, then on non-CHR$ fallback branched to PF_VAR which
 ;               called INC_IP again — consuming the char after C (e.g. '>').
+;               For any expression using variable C (e.g. "IF C>4"), PARSE_RELOP
+;               never saw the relop → ERRFLG=1 → JSYNERR at every IF using C.
+;               Fix: fallback BCTA,UN PF_VAR → BCTA,UN PF_LVNCA (skips INC_IP).
 ;
 ;   v2.4  2026-05-19
 ;         SHOWCASE appended including Mandelbrot section. PRTSTR optimised.
@@ -350,7 +360,7 @@ DP_ITEM:                        ; Check for items to print
         BSTA,UN WSKIP           ; Skip spaces
         LODA,R0 *IPH
         COMI,R0 DQ              ; Opening double quote?
-        BCTA,EQ DP_STRING       
+        BCTR,EQ DP_STRING       ; (opt: BCTA->BCTR, within +-63)
         COMI,R0 'C'             ; Might be CHR$
         BCFR,EQ DP_EXPR         ; Not 'C', must be an expression
         
@@ -378,7 +388,7 @@ DP_SEMI2:
         BSTA,UN WSKIP           ; anything else to print?
         LODA,R0 *IPH            
         RETC,EQ                 ; LODA sets Zero flag if zero
-        BCTA,UN DP_ITEM         ; 
+        BCTR,UN DP_ITEM         ; (opt: BCTA->BCTR, within +-63)
 
 DP_STRING:
         BSTA,UN INC_IP          ; Consume opening double quote
@@ -665,7 +675,6 @@ DO_RUN:
         STRA,R0 TMPL
 DR_LP:
         LODA,R0 RUNFLG
-        COMI,R0 $00
         ; BCTA,EQ DR_RET
         RETC,EQ
         ; end of program? unsigned 16-bit: TMPH:TMPL >= PEH:PEL → stop
@@ -674,7 +683,6 @@ DR_LP:
         COMI,R0 $00
         STRA,R0 SC0
         LODA,R0 PEH
-        COMI,R0 $00
         STRA,R0 SC1
         LODA,R0 SC0
         COMA,R0 SC1             ; unsigned TMPH vs PEH
@@ -777,10 +785,8 @@ TSL_NUM:
         BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
         BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 EXPH
-        COMI,R0 $00
         BCTR,GT TSL_NZ
         LODA,R0 EXPL
-        COMI,R0 $00
         ; BCTA,EQ TSL_RET2  ; line 0 invalid
         RETC,EQ
 TSL_NZ:
@@ -842,7 +848,6 @@ SL_MEASD:
 SL_NBC:
         STRA,R0 CURH            ; CURH:CURL = free bytes (LNUMH:LNUML preserved)
         LODA,R0 CURH
-        COMI,R0 $00
         BCTR,GT SL_ROOM
         LODA,R0 CURL
         SUBA,R0 SC1
@@ -880,10 +885,8 @@ SL_SHCNB:
 
         ; if shift count == 0 skip loop
         LODA,R0 TMPH
-        COMI,R0 $00
         BCTR,GT SL_DOSHIFT
         LODA,R0 TMPL
-        COMI,R0 $00
         BCTA,EQ SL_NOSHIFT
 SL_DOSHIFT:
         ; src = PE-1 in LNUMH:LNUML (shift uses these as src pointer)
@@ -918,7 +921,6 @@ SL_DSNCB:
         ; Guard zero case first (BDRR with R3=0 would execute once wrongly).
         LODA,R3 TMPL
 SL_SHLOOP:
-        COMI,R3 $00
         BCTR,EQ SL_NOSHIFT
         ; read from LNUMH:LNUML
         LODA,R1 *LNUMH
@@ -1283,14 +1285,12 @@ PX_PEEKOP:
         BCTA,EQ PX_RPAR  ; A')' → reduce until A'(' sentinel
 
         BSTA,UN GET_PREC                 ; [+1]  R0 = prec(cur op)  ; 0=not an op
-        COMI,R0 $00
         BCTA,EQ PX_RALL  ; end of expression → reduce all
         STRA,R0 PRECTMP                      ; PRECTMP = cur op prec (SC1 is scratch for APPLY_OP)
 
 PX_REDLP:
         ; while STKIDX >= 1 and top-op-prec >= SC1: reduce
         LODA,R0 STKIDX
-        COMI,R0 $00
         BCTR,EQ PX_PUSHOP  ; only 1 value
         ; get top op from OPSTK[STKIDX-1]
         SUBI,R0 1
@@ -1338,7 +1338,6 @@ PX_RPNCA:
         ; reduce until '(' sentinel
 PX_RPLP:
         LODA,R0 STKIDX
-        COMI,R0 $00
         BCTA,EQ PX_RPDONE  ; guard
         SUBI,R0 1
         LODI,R1 >OPSTK
@@ -1424,7 +1423,6 @@ PX_RALL:
         ; reduce all remaining ops
 PX_RALL_LP:
         LODA,R0 STKIDX
-        COMI,R0 $00
         BCTR,EQ PX_DONE
         SUBI,R0 1
         LODI,R1 >OPSTK
@@ -1788,7 +1786,6 @@ PS16_UN:
         BSTR,UN PARSE_U16                ; [+1]
 PS16_CHK:
         LODA,R0 NEGFLG
-        COMI,R0 $00
         RETC,EQ                          ; NEGFLG=0 → no negation needed
         ; negate EXPH:EXPL
         LODA,R0 EXPH
@@ -1942,10 +1939,8 @@ MU_RA:
         STRA,R0 EXPL
 MU_LP:
         LODA,R0 TMPH
-        COMI,R0 $00
         BCTR,GT MU_ADD
         LODA,R0 TMPL
-        COMI,R0 $00
         BCTR,EQ MU_DONE
 MU_ADD:
         LODA,R0 EXPL
@@ -1972,7 +1967,6 @@ MU_TNB:
         BCTR,UN MU_LP
 MU_DONE:
         LODA,R0 NEGFLG
-        COMI,R0 $00
         BCTR,EQ MU_RET
         LODA,R0 EXPH
         EORI,R0 $FF
@@ -1993,11 +1987,9 @@ DIV16:
         EORZ,R0 ; Clear R0
         STRA,R0 ERRFLG
         LODA,R0 EXPH
-        COMI,R0 $00
         BCTR,GT DV_NZ
         BCTR,LT DV_NZ
         LODA,R0 EXPL
-        COMI,R0 $00
         BCTA,EQ JERRDIVZER
 DV_NZ:
         EORZ,R0 ; Clear R0
@@ -2087,7 +2079,6 @@ DV_SNB:
         BCTR,UN DV_LP
 DV_DONE:
         LODA,R0 NEGFLG
-        COMI,R0 $00
         BCTR,EQ DV_RET
         LODA,R0 EXPH
         EORI,R0 $FF
@@ -2131,7 +2122,6 @@ PS_NEGNORM:
         BCTR,UN PS_POS
 PS_CHKMIN:
         LODA,R0 EXPL
-        COMI,R0 $00
         BCTR,EQ PS_MIN
         BCTR,UN PS_NEGNORM
 PS_MIN:
@@ -2145,20 +2135,18 @@ PS_MIN:
         BSTA,UN COUT
         LODI,R0 A'8'
         BSTA,UN COUT
-        BCTA,UN PS_RET
+        RETC,UN                          ; (opt: was BCTA,UN PS_RET)
 PS_POS:
         LODA,R0 EXPH
-        COMI,R0 $00
         BCTR,GT PS_NZ
         BCTR,LT PS_NZ
         LODA,R0 EXPL
-        COMI,R0 $00
         BCTR,EQ PS_ZERO
         BCTR,UN PS_NZ
 PS_ZERO:
         LODI,R0 A'0'
         BSTA,UN COUT
-        BCTA,UN PS_RET
+        RETC,UN                          ; (opt: was BCTA,UN PS_RET)
 PS_NZ:
         ; SWJSR: push PS_DONE return addr, drop into PREC
         LODI,R0 >PS_DONE
@@ -2207,7 +2195,6 @@ PR_LP:
         CPSL $08
 
         LODA,R0 NEGFLG
-        COMI,R0 $00
         BCTR,GT PR_QBIT
         LODA,R0 SC1
         COMI,R0 10
@@ -2229,17 +2216,14 @@ PR_NOQBIT:
         LODA,R0 SC0
         SUBI,R0 1
         STRA,R0 SC0
-        COMI,R0 $00
         BCTA,GT PR_LP
 
         LODA,R0 SC1
         STRA,R0 SWBASE,R3+
 
         LODA,R0 EXPH
-        COMI,R0 $00
         BCTR,GT PR_REC
         LODA,R0 EXPL
-        COMI,R0 $00
         BCTR,EQ PR_PRINT
 PR_REC:
         LODI,R0 >PR_PRINT
