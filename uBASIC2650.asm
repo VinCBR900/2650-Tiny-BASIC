@@ -53,22 +53,20 @@
 ;         Likely never due to RAS limitations.
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
-;   v2.6  2026-05-23 - 3840 interpreter bytes (5838 total inc showcase)
+;   v2.6  2026-05-24 - 3940 interpreter bytes (5838 total inc showcase)
 ;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic.
 ;         Inline PRT_CR/LF instead of PIPBUG CRLF to save 1 RAS slot.
+;         Refactor INC_IP to be generic for INC_EXP and INC_EXP
 ;         BUG-DP-01 FIXED: DP_CHAR used BCTA,UN EATWORD (plain branch) losing RAS.
 ;         BUG-DEC-01 FIXED: DEC_IP/DEC_TMP used RETC,LT (sign) not TPSL/RETC,EQ (carry).
 ;         ERRFLG refactor: PARSE_U16 jumps to JSYNERR on no-digit; removed all
 ;               redundant ERRFLG check blocks and COMI,R0 $00 after LODA ERRFLG.
-;         Optimisation pass (78 bytes): 26x COMI,Rx $00 dead, 2x BCTA->BCTR,
+;         Optimisation pass (78 bytes): 26x dead COMI,Rx $00 removed, 2x BCTA->BCTR,
 ;               2x BCTA,UN PS_RET -> RETC,UN, dead DEC_TMP deleted.
 ;         DLS_LP + DR_LP: removed 3 dead COMI,R0 $00 instructions (4+2=6 bytes).
 ;               These followed LODA (which already sets CC) before an unreachable
 ;               PPSL $02 unsigned compare, and served no purpose.
-;         PRO_LP: removed invalid COMI,R1 $00 (COMI only valid for R0 on 2650).
-;               Replaced with LODZ,R1 which sets CC from R1 and loads into R0,
-;               allowing the immediately following STRA,R0 RELOP to reuse the
-;               value without a separate load (1 instruction, 1 byte saved).
+;         PRO_LP: Replaced COMI,R1 $00 with LODZ,R1 which sets CC 
 ;
 ;   v2.5  2026-05-22
 ;         BUG-FL-02 FIXED: FIND_INS FI_CHK lo-byte comparison used signed SUBA.
@@ -126,29 +124,32 @@ ERR_VAR         EQU '4'
 ; ─── PIPBUG 1 I/O entry points ────────────────────────────────────────────────
 COUT    EQU     $02B4   ; putchar: R0 = char to output
 CHIN    EQU     $0286   ; getchar: blocking: R0 =  key
+RS      EQU     $10
 
 ; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
 ; Code ceiling: ~$15FF (code must not reach $1600 or crash).
+; IP, TMP, EXP must be in this order
 IPH     EQU $1600   ; interpreter pointer hi
 IPL     EQU $1601   ; interpreter pointer lo
-PEH     EQU $1602   ; program end pointer hi
-PEL     EQU $1603   ; program end pointer lo
-RUNFLG  EQU $1604   ; $01=running $00=immediate
-GOTOFLG EQU $1605   ; $01=GOTO/GOSUB pending
-GOTOH   EQU $1606   ; pending target line hi
-GOTOL   EQU $1607   ; pending target line lo
-CURH    EQU $1608   ; current line hi  (error reporting)
-CURL    EQU $1609   ; current line lo
-LNUMH   EQU $160A   ; scratch line number hi
-LNUML   EQU $160B   ; scratch line number lo
-SC0     EQU $160C   ; scratch byte 0
-SC1     EQU $160D   ; scratch byte 1
-ERRFLG  EQU $160E   ; error flag $00=ok $01=error/handled
-NEGFLG  EQU $160F   ; sign / CHR$ flag
-EXPH    EQU $1610   ; expression result hi
-EXPL    EQU $1611   ; expression result lo
-TMPH    EQU $1612   ; temp 16-bit hi
-TMPL    EQU $1613   ; temp 16-bit lo
+TMPH    EQU $1602   ; temp 16-bit hi
+TMPL    EQU $1603   ; temp 16-bit lo
+EXPH    EQU $1604   ; expression result hi
+EXPL    EQU $1605   ; expression result lo
+; Other Vars
+RUNFLG  EQU $1606   ; $01=running $00=immediate
+GOTOFLG EQU $1607   ; $01=GOTO/GOSUB pending
+GOTOH   EQU $1608   ; pending target line hi
+GOTOL   EQU $1609   ; pending target line lo
+CURH    EQU $160A   ; current line hi  (error reporting)
+CURL    EQU $160B   ; current line lo
+LNUMH   EQU $160C   ; scratch line number hi
+LNUML   EQU $160D   ; scratch line number lo
+SC0     EQU $160E   ; scratch byte 0
+SC1     EQU $160F   ; scratch byte 1
+ERRFLG  EQU $1610   ; error flag $00=ok $01=error/handled
+NEGFLG  EQU $1611   ; sign / CHR$ flag
+PEH     EQU $1612   ; program end pointer hi
+PEL     EQU $1613   ; program end pointer lo
 OPSTK   EQU $1614   ; operator stack [8]  $0114-$011B
 VALSH   EQU $161C   ; value stack hi  [8]  $011C-$0123
 VALSL   EQU $1624   ; value stack lo  [8]  $0124-$012B
@@ -180,12 +181,16 @@ PROGLIM EQU $1fff   ; one past end of program store
 
 ; ─── RESET / ENTRY ────────────────────────────────────────────────────────────
 RESET:
+        ; Setup CPU
+        CPSL RS               ; Ensure using primary reg bank  
+        ; Setup Stack - oh, wait...
 
         ; Sets up showcase
         LODI,R0 <SHOWCASE_END
         STRA,R0 PEH
         LODI,R0 >SHOWCASE_END   ; BUG-SC-01 FIX: was < (hi byte), must be > (lo byte)
         STRA,R0 PEL
+
         ; Actual start
         BSTA,UN DO_END      ; setup RUNFLAG etc - Change to DO_NEW for no showcase 
         
@@ -223,6 +228,9 @@ REPL:
         BSTR,UN STMT_EXEC
         BCTR,UN REPL
 
+BANNER:
+        DB CR, LF, "uBASIC 2650 V2.6", CR, LF, NUL
+
 ; ─── STMT_EXEC ────────────────────────────────────────────────────────────────
 ; Decode and dispatch one statement from IP.
 ; RAS depth: 1 from REPL, or 3 from DO_IF (THEN body).
@@ -235,7 +243,6 @@ REPL:
 STMT_EXEC:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
-      ; COMI,R0 NUL
         RETC,EQ                          ; blank line → return
 
         BSTA,UN GETCI_UC
@@ -250,7 +257,6 @@ STMT_EXEC:
         STRA,R0 TMPL
 SE_SCAN:
         LODA,R0 *TMPH                    ; c1
-       ; COMI,R0 NUL
         BCTA,EQ SE_NOTKW                 ; BUG-LET-01 FIX: end of table → check bare assignment
         SUBA,R0 SC0
         BCTR,EQ SE_CHK2
@@ -794,7 +800,6 @@ TSL_NZ:
         STRA,R0 LNUML
         BSTA,UN WSKIP                    ; [+1]  skip space after line number
         LODA,R0 *IPH
-      ;  COMI,R0 NUL
         BCTR,EQ TSL_DEL
         BSTR,UN STORE_LINE               ; [+1]
         BCTR,UN TSL_DONE
@@ -822,7 +827,6 @@ STORE_LINE:
         LODI,R3 0
 SL_MEAS:
         LODA,R0 *TMPH
-       ; COMI,R0 NUL
         BCTR,EQ SL_MEASD
         BSTA,UN INC_TMP
 SL_MNC:
@@ -966,7 +970,6 @@ SL_WN2:
         ; write body bytes until NUL (CR-terminated format — no bodylen byte)
 SL_WBODY:
         LODA,R1 *TMPH
-      ;  COMI,R1 NUL
         BCTR,EQ SL_WDONE
         STRA,R1 *EXPH
         BSTA,UN INC_TMP
@@ -2381,6 +2384,7 @@ EW_ADV:
         BCTR,UN EATWORD
 
 ; ─── SHARED 16-BIT POINTER INCREMENT/DECREMENT SUBROUTINES ───────────────────
+; Regs must be in this order
 ; INC_IP  : IPH:IPL  += 1   (clobbers R0)
 ; INC_TMP : TMPH:TMPL += 1  (clobbers R0)
 ; INC_EXP : EXPH:EXPL += 1  (clobbers R0)
@@ -2391,44 +2395,33 @@ EW_ADV:
 ; Borrow idiom: SUBI sets no-borrow->GT/EQ, borrow->LT.
 ;   BCFA,LT skip  =  skip hi-byte decrement if no borrow (C=1).
 
-INC_IP:
-        LODA,R0 IPL
-        ADDI,R0 1
-        STRA,R0 IPL
-        ;BCTA,GT INC_IP_RET      ; no carry — hi byte unchanged
-        TPSL $01                 ; BUG-SCA-14 FIX: test carry bit directly
-        RETC,LT                  ; return if C=0 (no carry) — result sign unreliable
-        LODA,R0 IPH
-        ADDI,R0 1
-        STRA,R0 IPH
-INC_IP_RET:
-        RETC,UN
-
-INC_TMP:
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 TMPL
-        ;BCTA,GT INC_TMP_RET     ; no carry
-        TPSL $01                 ; BUG-SCA-14 FIX: test carry bit directly
-        RETC,LT                  ; return if C=0 (no carry)
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-INC_TMP_RET:
-        RETC,UN
-
 INC_EXP:
-        LODA,R0 EXPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        ;BCTA,GT INC_EXP_RET     ; no carry
-        TPSL $01                 ; BUG-SCA-14 FIX: test carry bit directly
-        RETC,LT                  ; return if C=0 (no carry)
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-INC_EXP_RET:
-        RETC,UN
+        LODI,R0 4               
+        db $EC     ; consume next 2 bytes with COMA,R0 opcode 
+INC_TMP:
+        LODI,R0 2
+        db $C4     ; consume next 1 bytes with COMI,R0 opcode 
+INC_IP:
+        EORZ,R0            ; 1 bytes
+; Used offsets to 
+INC_ET:
+        PPSL RS             ; switch reg bank
+        STRZ R1             ; get offset in R1    
+        LODA,R0 IPL,R1     ; 3 bytes  (TMPL=base, R1=0→TMP, R1=2→EXP)
+        ADDI,R0 1           ; 2 bytes
+        STRA,R0 IPL,R1     ; 3 bytes
+        TPSL $01            ; 2 bytes
+        BCTR,LT ET_RET      ; 1 byte
+        ;RETC,LT
+        LODA,R0 IPH,R1     ; 3 bytes
+        ADDI,R0 1           ; 2 bytes
+        STRA,R0 IPH,R1     ; 3 bytes
+ET_RET:
+        CPSL RS               ; switch back  
+        RETC,UN             ; 1 byte
+
+; Decrement - only used in 1 place for now
+
 DEC_IP:
         LODA,R0 IPL
         SUBI,R0 1
@@ -2496,11 +2489,6 @@ DE_NL:
         BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
 
 ; ─── TABLES ───────────────────────────────────────────────────────────────────
-BANNER:
-        DB CR, LF
-        DB "uBASIC 2650 V2.6"
-        DB CR, LF, NUL
-
 ; Keyword table: [c1][c2][hi][lo]  NUL-terminated.
 ; hi:lo = address of handler routine. Matched on first two uppercase chars.
 ; SE_SCAN loads hi:lo, stores to TMPH:TMPL, branches via *TMPH (indirect jump).
