@@ -7,7 +7,7 @@
 ;   I/O via PIPBUG ROM entry points (BSTA,UN):
 ;     COUT $02B4  — output char in R0
 ;     CHIN $0286  — blocking input, char returned in R0
-;     CRLF $008A  — emit CR+LF
+;     Note we dont use PIPBUG CRLF as this uses 1 RAS slot
 ;
 ; Assembler: asm2650.c v1.8   Simulator: pipbug_wrap v1.1
 ; Build:
@@ -38,7 +38,7 @@
 ; ── SCRATCH REGISTER ALLOCATION ──────────────────────────────────────────────
 ;   R0       — working register, arithmetic, I/O
 ;   R1       — index register; also PRINT_S16 digit buffer index (P16BUF)
-;   R2       — never written by any routine; long-lived scratch (DO_LET var letter)
+;   R2       — long-lived scratch (DO_LET var letter)
 ;   R3       — loop counter (BDRR/BIRR); SW stack index
 ;   SC0:SC1  — general scratch (clobbered by STMT_EXEC — not inter-statement safe)
 ;   SWSTK[0:1] ($162E:$162F) — DO_RUN next-line-pointer save across STMT_EXEC
@@ -53,24 +53,24 @@
 ;         Likely never due to RAS limitations.
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
-;   v2.6  2026-05-23 - 3960 ROM  interpreter bytes (5838 total inc showcase)
+;   v2.6  2026-05-23 - 3840 interpreter bytes (5838 total inc showcase)
 ;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic.
-;         BUG-DEC-01 FIXED: DEC_IP and DEC_TMP used RETC,LT after SUBI — tested
-;               result sign not carry. On 2650 SUBI sets C=1 for no-borrow (hi
-;               unchanged), C=0 for borrow (hi needs decrement). RETC,LT returned
-;               on borrow (wrong) and fell through on no-borrow (wrong). Fixed with
-;               TPSL $01 / RETC,EQ pattern (C=1 -> CC=EQ -> return on no-borrow).
-;         ERRFLG refactor: PARSE_U16 now jumps directly to JSYNERR if no digit
-;               found (first-char pre-check added), propagating errors without
-;               ERRFLG polling. Removed redundant ERRFLG checks at: DP_EXPR,
-;               DP_CHAR, DL_EX, DO_INPUT, DO_IF, and PARSE_EXPR internal.
-;               Removed all redundant COMI,R0 $00 after LODA,R0 ERRFLG
-;         Optimisation pass — 78 bytes saved in interpreter:
-;               COMI,Rx $00 where preceding LODA/SUBI/etc sets CC
-;               BCTA->BCTR, BCTA,UN PS_RET -> RETC,UN
-;              Deleted dead DEC_TMP routine — no callers (10 bytes).
+;         Inline PRT_CR/LF instead of PIPBUG CRLF to save 1 RAS slot.
+;         BUG-DP-01 FIXED: DP_CHAR used BCTA,UN EATWORD (plain branch) losing RAS.
+;         BUG-DEC-01 FIXED: DEC_IP/DEC_TMP used RETC,LT (sign) not TPSL/RETC,EQ (carry).
+;         ERRFLG refactor: PARSE_U16 jumps to JSYNERR on no-digit; removed all
+;               redundant ERRFLG check blocks and COMI,R0 $00 after LODA ERRFLG.
+;         Optimisation pass (78 bytes): 26x COMI,Rx $00 dead, 2x BCTA->BCTR,
+;               2x BCTA,UN PS_RET -> RETC,UN, dead DEC_TMP deleted.
+;         DLS_LP + DR_LP: removed 3 dead COMI,R0 $00 instructions (4+2=6 bytes).
+;               These followed LODA (which already sets CC) before an unreachable
+;               PPSL $02 unsigned compare, and served no purpose.
+;         PRO_LP: removed invalid COMI,R1 $00 (COMI only valid for R0 on 2650).
+;               Replaced with LODZ,R1 which sets CC from R1 and loads into R0,
+;               allowing the immediately following STRA,R0 RELOP to reuse the
+;               value without a separate load (1 instruction, 1 byte saved).
 ;
-;   v2.5  2026-05-22 - 5841 ROM Bytes
+;   v2.5  2026-05-22
 ;         BUG-FL-02 FIXED: FIND_INS FI_CHK lo-byte comparison used signed SUBA.
 ;               Line numbers with  lo byte >= $80 (e.g.  128, 160) the subtraction
 ;               result has bit 7 set, so  CC=LT regardless of the unsigned ordering.
@@ -126,7 +126,6 @@ ERR_VAR         EQU '4'
 ; ─── PIPBUG 1 I/O entry points ────────────────────────────────────────────────
 COUT    EQU     $02B4   ; putchar: R0 = char to output
 CHIN    EQU     $0286   ; getchar: blocking: R0 =  key
-CRLF    EQU     $008A   ; print CR+LF (no registers used/changed)
 
 ; ─── RAM variables — pinned above code, below PROGLIM ────────────────────────────────────────────────────
 ; Code ceiling: ~$15FF (code must not reach $1600 or crash).
@@ -236,7 +235,7 @@ REPL:
 STMT_EXEC:
         BSTA,UN WSKIP                    ; [+1]
         LODA,R0 *IPH
-        COMI,R0 NUL
+      ; COMI,R0 NUL
         RETC,EQ                          ; blank line → return
 
         BSTA,UN GETCI_UC
@@ -251,7 +250,7 @@ STMT_EXEC:
         STRA,R0 TMPL
 SE_SCAN:
         LODA,R0 *TMPH                    ; c1
-        COMI,R0 NUL
+       ; COMI,R0 NUL
         BCTA,EQ SE_NOTKW                 ; BUG-LET-01 FIX: end of table → check bare assignment
         SUBA,R0 SC0
         BCTR,EQ SE_CHK2
@@ -412,7 +411,9 @@ DP_SEP:
         BCTR,EQ DP_SEMI         ; Yes, handle trailing/continuation logic
                                 ; Fall through to DP_NL if no valid separator found
 DP_NL:
-        BCTA,UN CRLF            ; Tail call to CRLF and return to interpreter
+        ;BCTA,UN CRLF            ; Tail call to CRLF and return to interpreter
+        BSTA,UN PRT_CR
+        BCTA,UN PRT_LF
 
 ; ─── DO_LET / shared store path ───────────────────────────────────────────────
 ; DO_INPUT jumps to DL_STORE with SC0 = variable letter already set.
@@ -561,10 +562,10 @@ DIF_EW:
         ;   SC1=$01 → GT → bit 2 ($04)
         ; ANDZ,R1: R0 &= R1.  If result=0: no match → false.
         LODA,R0 SC1
+        BCTR,EQ DIF_IS_EQ
         COMI,R0 $FF
         BCTR,EQ DIF_IS_LT
-        COMI,R0 $00
-        BCTR,EQ DIF_IS_EQ
+;        COMI,R0 $00
         LODI,R0 4                        ; GT → bit 2
         BCTR,UN DIF_ANDTEST
 DIF_IS_LT:
@@ -604,24 +605,21 @@ DO_LIST:
         STRA,R0 TMPL
 DLS_LP:
         ; unsigned 16-bit: if TMPH:TMPL >= PEH:PEL → done
-        ; Use COMZ via unsigned COM mode for hi byte, carry check for lo byte
         LODA,R0 TMPH
         PPSL $02                ; unsigned compare mode
-        COMI,R0 $00
         STRA,R0 SC0
         LODA,R0 PEH
-        COMI,R0 $00
         STRA,R0 SC1
         LODA,R0 SC0
         COMA,R0 SC1             ; unsigned: TMPH vs PEH
         CPSL $02
         RETC,GT                 ; TMPH > PEH → past end
         BCTR,LT DLS_BODY        ; TMPH < PEH → before end
-        ; TMPH == PEH: check lo byte carry from subtraction
+        ; TMPH == PEH: check lo byte — C=1 (no borrow) means TMPL >= PEL → done
         LODA,R0 TMPL
-        SUBA,R0 PEL             ; TMPL - PEL (signed sub but carry=1 means >=)
-        TPSL $01                ; C=1 → no borrow → TMPL >= PEL → at/past end
-        RETC,EQ                 ; CC=EQ means C=1 → TMPL >= PEL → done
+        SUBA,R0 PEL
+        TPSL $01                ; C=1 → no borrow → TMPL >= PEL
+        RETC,EQ                 ; CC=EQ means C=1 → done
 DLS_BODY:
         ; line number hi:lo
         LODA,R0 *TMPH
@@ -656,7 +654,8 @@ DLS_BLPX:
         BCTR,UN DLS_BLPX
 DLS_NL:
         BSTA,UN INC_TMP          ; skip past CR
-        BSTA,UN CRLF
+        BSTA,UN PRT_CR
+        BSTA,UN PRT_LF
         BCTA,UN DLS_LP
 DLS_RET:
         ; RETC,UN
@@ -680,7 +679,6 @@ DR_LP:
         ; end of program? unsigned 16-bit: TMPH:TMPL >= PEH:PEL → stop
         LODA,R0 TMPH
         PPSL $02
-        COMI,R0 $00
         STRA,R0 SC0
         LODA,R0 PEH
         STRA,R0 SC1
@@ -796,7 +794,7 @@ TSL_NZ:
         STRA,R0 LNUML
         BSTA,UN WSKIP                    ; [+1]  skip space after line number
         LODA,R0 *IPH
-        COMI,R0 NUL
+      ;  COMI,R0 NUL
         BCTR,EQ TSL_DEL
         BSTR,UN STORE_LINE               ; [+1]
         BCTR,UN TSL_DONE
@@ -824,7 +822,7 @@ STORE_LINE:
         LODI,R3 0
 SL_MEAS:
         LODA,R0 *TMPH
-        COMI,R0 NUL
+       ; COMI,R0 NUL
         BCTR,EQ SL_MEASD
         BSTA,UN INC_TMP
 SL_MNC:
@@ -968,7 +966,7 @@ SL_WN2:
         ; write body bytes until NUL (CR-terminated format — no bodylen byte)
 SL_WBODY:
         LODA,R1 *TMPH
-        COMI,R1 NUL
+      ;  COMI,R1 NUL
         BCTR,EQ SL_WDONE
         STRA,R1 *EXPH
         BSTA,UN INC_TMP
@@ -1743,10 +1741,9 @@ PRO_LP:
         COMI,R0 A'>'
         BCTR,EQ PRO_GT
         ; not a relop char — stop
-        COMI,R1 $00
-        BCTR,EQ PRO_NONE                 ; no relop chars seen → error
-        LODZ,R1                          ; R0 = mask (BUG-RELOP-01: removed STRZ,R1 which clobbered R1 with non-relop char)
-        STRA,R0 RELOP
+        LODZ,R1                          ; R0 = mask, CC set from R1 (EQ if no relop seen)
+        BCTR,EQ PRO_NONE                 ; R1==0 → no relop chars seen → error
+        STRA,R0 RELOP                    ; store mask (R0 already holds it from LODZ,R1)
         RETC,UN
 PRO_LT:
         IORI,R1 1                        ; set LT bit
@@ -2134,8 +2131,8 @@ PS_MIN:
         LODI,R0 A'6'
         BSTA,UN COUT
         LODI,R0 A'8'
-        BSTA,UN COUT
-        RETC,UN                          ; (opt: was BCTA,UN PS_RET)
+        BCTA,UN COUT
+        ; RETC,UN                          ; (opt: was BCTA,UN PS_RET)
 PS_POS:
         LODA,R0 EXPH
         BCTR,GT PS_NZ
@@ -2145,8 +2142,8 @@ PS_POS:
         BCTR,UN PS_NZ
 PS_ZERO:
         LODI,R0 A'0'
-        BSTA,UN COUT
-        RETC,UN                          ; (opt: was BCTA,UN PS_RET)
+        BCTA,UN COUT
+        ; RETC,UN                          ; (opt: was BCTA,UN PS_RET)
 PS_NZ:
         ; SWJSR: push PS_DONE return addr, drop into PREC
         LODI,R0 >PS_DONE
@@ -2324,7 +2321,8 @@ RL_BSNB:
 RL_EOL:
         LODI,R1 NUL
         STRA,R1 *IPH            ; NUL-terminate buffer
-        BCTA,UN CRLF
+        BSTA,UN PRT_CR
+        BCTA,UN PRT_LF
 
 ; ─── WSKIP ────────────────────────────────────────────────────────────────────
 ; Skips spaces
@@ -2446,6 +2444,12 @@ DEC_IP:
         RETC,UN
 
 ; ─── Shared Character PRINT routines ─────────────────────────────────────────────────────────────────
+PRT_CR:
+        LODI,R0 CR
+        db $EC     ; consume next 2 bytes with COMA,R0 opcode 
+PRT_LF:
+        LODI,R0 LF
+        db $EC     ; consume next 2 bytes with COMA,R0 opcode 
 PRT_CHEV:
         LODI,R0 '>'
         db $EC     ; consume next 2 bytes with COMA,R0 opcode 
@@ -2487,7 +2491,8 @@ DE_IN:
         STRA,R0 EXPL
         BSTA,UN PRINT_S16                ; [+1]
 DE_NL:
-        BSTA,UN CRLF
+        BSTA,UN PRT_CR
+        BSTA,UN PRT_LF
         BCTA,UN REPL                     ; jump to REPL — clears full hardware RAS
 
 ; ─── TABLES ───────────────────────────────────────────────────────────────────
