@@ -14,9 +14,11 @@ So far, this has been much more difficult than writing the [6502 Tiny BASIC](htt
 - Although it has nice features like auto-increment and decrement, and branch on condition code, these are not size optimized
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
 - 8kbyte memory pages - shouldn't matter here as expect max 4kbyte ROM, 4kbyte RAM
+- From a programmers perspective, the instruction set was designed by an engineer and instructions are dense
+  - e.g. `BCTR,LT addr` **B**ranch, got that - now do we want **C**ontrol for a jump, or **S**ubroutine for a call, and do we want **T**rue or **F**alse, and are we **Relative** short jump or **A**bsolute address, and then do we want **LT**, **GT**,**EQ**,**UN** condition code.  This is all very easy to overlook one character when debugging.
   
 The biggest challange is that, unlike MOS 6502, Claude, Gemini and CODEX dont really know the 2650 CPU architecture, probably because training data is limited.  Available period PDF data sheets and App notes are poorely OCR'ed (Probably scanned in the 1990s) so can't just feed into the AI.
 
 So they all **confidently** write code that is plain wrong.
 
-The original aim was to get a working 2kbyte Tiny BASIC, but at this rate 4kbyte might be achievable. 
+The original aim was to get a working 2kbyte Tiny BASIC, but  we are currently hopeful for 4kbyte. 
