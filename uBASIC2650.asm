@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC for Signetics 2650
-; Version: v2.6
+; Version: v2.7
 ; Date:    2026-05-24
 ;
 ; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
@@ -53,6 +53,22 @@
 ;         Likely never due to RAS limitations.
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
+;   v2.7  2026-05-25
+;         OPT-2: DR_CD removed duplicate LODA,R0 TMPL. -3 bytes.
+;         OPT-3: AO_STORE computed STKIDX-1 once, reused for VALSH/VALSL/STKIDX. -5 bytes.
+;         OPT-4: DLS_LP/DR_LP replaced PPSL $02 block with SUBA,R0 PEH (signed OK
+;               since PEH is always $1A-$1B < $80). -14 bytes.
+;         BUG-NF-01 FIXED: FL_RET_NF was merged with JERRLINE — both jumped to
+;               DO_ERROR, jettisoning the RAS. DELETE_LINE calls FIND_LINE and
+;               needs a normal return when the line doesn't exist. Split the labels:
+;               FL_RET_NF now sets ERRFLG=$01 and RETC,UN; JERRLINE remains the
+;               unconditional DO_ERROR path for DR_GOTO. This was the root cause of
+;               ?1 ERR_UND_LINE on every line entered after NEW. +5 bytes.
+;         BUG-NF-02 FIXED: REPL did not clear ERRFLG before TRY_STORE_LINE. After
+;               storing a numbered line (ERRFLG set to $01 by TSL_DONE), the next
+;               immediate command (e.g. LIST, RUN) found ERRFLG=$01 and was silently
+;               skipped. Fix: EORZ,R0/STRA,R0 ERRFLG at top of REPL. +4 bytes.
+;
 ;   v2.6  2026-05-23 - 3940 interpreter bytes (5838 total inc showcase)
 ;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic.
 ;         Inline PRT_CR/LF instead of PIPBUG CRLF to save 1 RAS slot.
@@ -221,6 +237,8 @@ REPL:
         STRA,R0 IPH
         LODI,R0 >IBUF
         STRA,R0 IPL
+        EORZ,R0             ; BUG-NF-02 FIX: clear ERRFLG before TRY_STORE_LINE;
+        STRA,R0 ERRFLG      ; stale $01 from previous line-store would suppress STMT_EXEC
         BSTA,UN TRY_STORE_LINE
         LODA,R0 ERRFLG
         COMI,R0 $01
@@ -603,21 +621,16 @@ DO_LIST:
         STRA,R0 TMPL
 DLS_LP:
         ; unsigned 16-bit: if TMPH:TMPL >= PEH:PEL → done
+        ; OPT-4: PEH is always $1A-$1B (<$80) so signed SUBA gives same CC as unsigned for hi byte
         LODA,R0 TMPH
-        PPSL $02                ; unsigned compare mode
-        STRA,R0 SC0
-        LODA,R0 PEH
-        STRA,R0 SC1
-        LODA,R0 SC0
-        COMA,R0 SC1             ; unsigned: TMPH vs PEH
-        CPSL $02
-        RETC,GT                 ; TMPH > PEH → past end
-        BCTR,LT DLS_BODY        ; TMPH < PEH → before end
+        SUBA,R0 PEH                      ; signed OK: PEH < $80
+        RETC,GT                          ; TMPH > PEH → past end
+        BCTR,LT DLS_BODY                 ; TMPH < PEH → before end
         ; TMPH == PEH: check lo byte — C=1 (no borrow) means TMPL >= PEL → done
         LODA,R0 TMPL
         SUBA,R0 PEL
-        TPSL $01                ; C=1 → no borrow → TMPL >= PEL
-        RETC,EQ                 ; CC=EQ means C=1 → done
+        TPSL $01                         ; C=1 → no borrow → TMPL >= PEL
+        RETC,EQ                          ; CC=EQ means C=1 → done
 DLS_BODY:
         ; line number hi:lo
         LODA,R0 *TMPH
@@ -672,21 +685,16 @@ DR_LP:
         LODA,R0 RUNFLG
         RETC,EQ
         ; end of program? unsigned 16-bit: TMPH:TMPL >= PEH:PEL → stop
+        ; OPT-4: PEH is always $1A-$1B (<$80) so signed SUBA gives same CC as unsigned for hi byte
         LODA,R0 TMPH
-        PPSL $02
-        STRA,R0 SC0
-        LODA,R0 PEH
-        STRA,R0 SC1
-        LODA,R0 SC0
-        COMA,R0 SC1             ; unsigned TMPH vs PEH
-        CPSL $02
-        BCTA,GT DR_STOP          ; TMPH > PEH → past end
-        BCTR,LT DR_EXEC          ; TMPH < PEH → before end
+        SUBA,R0 PEH                      ; signed OK: PEH < $80
+        BCTA,GT DR_STOP                  ; TMPH > PEH → past end
+        BCTR,LT DR_EXEC                  ; TMPH < PEH → before end
         ; TMPH == PEH: lo byte
         LODA,R0 TMPL
         SUBA,R0 PEL
-        TPSL $01                ; C=1 → no borrow → TMPL >= PEL → at/past end
-        RETC,EQ                 ; done if TMPL >= PEL
+        TPSL $01                         ; C=1 → no borrow → TMPL >= PEL → at/past end
+        RETC,EQ                          ; done if TMPL >= PEL
 DR_EXEC:
         ; save line number for error reporting
         LODA,R0 *TMPH
@@ -726,7 +734,7 @@ DR_CD:
         STRA,R0 SWSTK    ; NLP_H: save hi byte of next-line ptr directly into $012E
         LODA,R0 TMPL
         STRA,R0 SC1
-        LODA,R0 TMPL
+        ; OPT-2: R0 still = TMPL here (STRA does not change R0)
         STRA,R0 SWSTK+1  ; NLP_L: save lo byte directly into $012F
         ; execute line
         LODI,R0 <IBUF
@@ -1059,6 +1067,14 @@ FL_CHK:
         SUBA,R0 LNUMH
         BCTR,EQ FL_CHKLO
 FL_RET_NF:
+        ; BUG-NF-01 FIX: FL_RET_NF must return to caller with ERRFLG=$01 (not found).
+        ; Previously FL_RET_NF fell into JERRLINE which jumped to DO_ERROR, jettisoning
+        ; the RAS. DELETE_LINE calls FIND_LINE and needs a normal return when the line
+        ; doesn't exist (silent no-op). JERRLINE is kept as a separate label for callers
+        ; (DR_GOTO) that always want an error on not-found.
+        LODI,R0 1
+        STRA,R0 ERRFLG
+        RETC,UN
 JERRLINE:
         LODI,R0 ERR_UND_LINE
         BCTA,UN DO_ERROR  ; undefined line — returns to REPL
@@ -1605,8 +1621,13 @@ AO_MOD:
 
 AO_STORE:
         ; write EXPH:EXPL to VALSH/VALSL[STKIDX-1]; STKIDX--
+        ; OPT-3: compute STKIDX-1 once into SC1, reuse for VALSH, VALSL and final STKIDX write
         LODA,R0 STKIDX
         SUBI,R0 1
+        STRA,R0 SC1                      ; SC1 = STKIDX-1
+        STRA,R0 STKIDX                   ; decrement STKIDX now
+        ; write EXPH to VALSH[STKIDX-1]
+        LODA,R0 SC1
         LODI,R1 >VALSH
         ADDZ,R1
         STRA,R0 TMPL
@@ -1617,8 +1638,8 @@ AO_SHN:
         STRA,R0 TMPH
         LODA,R0 EXPH
         STRA,R0 *TMPH
-        LODA,R0 STKIDX
-        SUBI,R0 1
+        ; write EXPL to VALSL[STKIDX-1]
+        LODA,R0 SC1
         LODI,R1 >VALSL
         ADDZ,R1
         STRA,R0 TMPL
@@ -1629,9 +1650,6 @@ AO_SLN:
         STRA,R0 TMPH
         LODA,R0 EXPL
         STRA,R0 *TMPH
-        LODA,R0 STKIDX
-        SUBI,R0 1
-        STRA,R0 STKIDX
         RETC,UN
 
 ; ─── PARSE_FACTOR ─────────────────────────────────────────────────────────────
