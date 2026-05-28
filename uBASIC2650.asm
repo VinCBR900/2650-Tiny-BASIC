@@ -240,9 +240,8 @@ REPL:
         EORZ,R0             ; BUG-NF-02 FIX: clear ERRFLG before TRY_STORE_LINE;
         STRA,R0 ERRFLG      ; stale $01 from previous line-store would suppress STMT_EXEC
         BSTA,UN TRY_STORE_LINE
-        LODA,R0 ERRFLG
-        COMI,R0 $01
-        BCTR,EQ REPL
+        LODA,R0 ERRFLG                   ; OPT-10: LODA sets CC; ERRFLG=0→EQ, 1→GT
+        BCTR,GT REPL             ; branch if ERRFLG=1 (was COMI $01/BCTR,EQ)
         BSTR,UN STMT_EXEC
         BCTR,UN REPL
 
@@ -606,9 +605,8 @@ DO_GOTO:
         STRA,R0 GOTOL
         LODI,R0 1               ; ISSUE-03 FIX: was EORZ/STRA ($00) — must be $01
         STRA,R0 GOTOFLG
-        LODA,R0 RUNFLG
-        COMI,R0 $01
-        RETC,EQ
+        LODA,R0 RUNFLG                   ; OPT-10: RUNFLG=0→EQ, 1→GT
+        RETC,GT                  ; return if running (was COMI $01/RETC,EQ)
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG  ; start run if in immediate mode
         RETC,UN
@@ -743,9 +741,8 @@ DR_CD:
         STRA,R0 IPL
         BSTA,UN STMT_EXEC                ; [+1]
         ; check GOTO/GOSUB/RETURN flag
-        LODA,R0 GOTOFLG
-        COMI,R0 $01
-        BCTR,EQ DR_GOTO
+        LODA,R0 GOTOFLG                  ; OPT-10: GOTOFLG=0→EQ, 1→GT
+        BCTR,GT DR_GOTO          ; branch if GOTO pending (was COMI $01/BCTR,EQ)
         ; advance: restore next-line pointer from SWSTK[0:1] (SC0:SC1 clobbered)
         ; BUG-SCA-12 FIX: was LODA,R0 *SWSTK (indirect). Direct read from $012E.
         LODA,R0 SWSTK
@@ -1200,9 +1197,9 @@ PX_ATOM:
         COMI,R0 A'-'
         BCTR,EQ PX_UNEG
         COMI,R0 A'+'
-        BCTA,EQ PX_UPOS
+        BCTR,EQ PX_UPOS
         BSTA,UN PARSE_FACTOR             ; [+1] on error jumps directly to JSYNERR
-        BCTA,UN PX_PUSHV                 ; success → push result onto value stack
+        BCTR,UN PX_PUSHV                 ; success → push result onto value stack
 
 PX_LPAR:
         ; push '(' sentinel onto OPSTK
@@ -1214,8 +1211,6 @@ PX_LPAR:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <OPSTK
-        BCTR,GT PX_LPNCA
-        ADDI,R0 1
 PX_LPNCA:
         STRA,R0 TMPH
         LODI,R0 A'('
@@ -1226,13 +1221,7 @@ PX_UNEG:
         ; consume '-', parse factor, negate result
         BSTA,UN INC_IP
         BSTA,UN PARSE_FACTOR             ; [+1]
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
+        BSTA,UN NEG_EXP_BODY             ; unconditional negate EXPH:EXPL
         BCTR,UN PX_PUSHV
 
 PX_UPOS:
@@ -1248,8 +1237,6 @@ PX_PUSHV:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSH
-        BCTR,GT PX_VHN
-        ADDI,R0 1
 PX_VHN:
         STRA,R0 TMPH
         LODA,R0 EXPH
@@ -1259,8 +1246,6 @@ PX_VHN:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSL
-        BCTR,GT PX_VLN
-        ADDI,R0 1
 PX_VLN:
         STRA,R0 TMPH
         LODA,R0 EXPL
@@ -1288,8 +1273,6 @@ PX_REDLP:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <OPSTK
-        BCTR,GT PX_TOPNC
-        ADDI,R0 1
 PX_TOPNC:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1312,8 +1295,6 @@ PX_PUSHOP:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <OPSTK
-        BCTR,GT PX_OPN
-        ADDI,R0 1
 PX_OPN:
         STRA,R0 TMPH
         LODA,R0 SC0
@@ -1333,8 +1314,6 @@ PX_RPLP:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <OPSTK
-        BCTR,GT PX_RPNCA2
-        ADDI,R0 1
 PX_RPNCA2:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1353,8 +1332,6 @@ PX_POPSENT:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSH
-        BCTR,GT PX_PS_H1
-        ADDI,R0 1
 PX_PS_H1:
         STRA,R0 TMPH
         LODA,R0 *TMPH                    ; hi byte of value
@@ -1367,8 +1344,6 @@ PX_PS_H1:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSH
-        BCTR,GT PX_PS_H2
-        ADDI,R0 1
 PX_PS_H2:
         STRA,R0 TMPH
         LODA,R0 SC0
@@ -1380,8 +1355,6 @@ PX_PS_H2:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSL
-        BCTR,GT PX_PS_L1
-        ADDI,R0 1
 PX_PS_L1:
         STRA,R0 TMPH
         LODA,R0 *TMPH                    ; lo byte of value
@@ -1394,8 +1367,6 @@ PX_PS_L1:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSL
-        BCTR,GT PX_PS_L2
-        ADDI,R0 1
 PX_PS_L2:
         STRA,R0 TMPH
         LODA,R0 SC0
@@ -1418,8 +1389,6 @@ PX_RALL_LP:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <OPSTK
-        BCTR,GT PX_RANC
-        ADDI,R0 1
 PX_RANC:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1434,8 +1403,6 @@ PX_DONE:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSH
-        BCTR,GT PX_DN_HN
-        ADDI,R0 1
 PX_DN_HN:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1445,8 +1412,6 @@ PX_DN_HN:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSL
-        BCTR,GT PX_DN_LN
-        ADDI,R0 1
 PX_DN_LN:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1491,8 +1456,6 @@ APPLY_OP:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSH
-        BCTR,GT AO_RHN
-        ADDI,R0 1
 AO_RHN:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1502,8 +1465,6 @@ AO_RHN:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSL
-        BCTR,GT AO_RLN
-        ADDI,R0 1
 AO_RLN:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1516,8 +1477,6 @@ AO_RLN:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSH
-        BCTR,GT AO_LHN
-        ADDI,R0 1
 AO_LHN:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1528,8 +1487,6 @@ AO_LHN:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSL
-        BCTR,GT AO_LLN
-        ADDI,R0 1
 AO_LLN:
         STRA,R0 TMPH
         LODA,R0 *TMPH
@@ -1632,8 +1589,6 @@ AO_STORE:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSH
-        BCTR,GT AO_SHN
-        ADDI,R0 1
 AO_SHN:
         STRA,R0 TMPH
         LODA,R0 EXPH
@@ -1644,8 +1599,6 @@ AO_SHN:
         ADDZ,R1
         STRA,R0 TMPL
         LODI,R0 <VALSL
-        BCTR,GT AO_SLN
-        ADDI,R0 1
 AO_SLN:
         STRA,R0 TMPH
         LODA,R0 EXPL
@@ -1770,17 +1723,7 @@ PS16_NEG:
         STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, skipping negation
 PS16_UN:
         BSTR,UN PARSE_U16                ; [+1]
-        LODA,R0 NEGFLG
-        RETC,EQ                          ; NEGFLG=0 → no negation needed
-        ; negate EXPH:EXPL
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-; (PS16_RET merged into inline RETC,EQ above)
+        BCTA,UN NEG_EXP                  ; OPT-15: negate if NEGFLG set (tail-call)
 
 ; ─── PARSE_U16 ────────────────────────────────────────────────────────────────
 ; Parse unsigned decimal digits → EXPH:EXPL.
@@ -1859,60 +1802,68 @@ PU16_MNC:
 PU16_DIG_NC:
         BCTA,UN PU16_LP
 
+; ─── OPT-15: Shared sign-handling subroutines ─────────────────────────────────
+; NEG_EXP: negate EXPH:EXPL if NEGFLG≠0. Clobbers R0.
+; NEG_EXP_BODY: unconditional negate (no NEGFLG check). Clobbers R0.
+NEG_EXP:
+        LODA,R0 NEGFLG
+        RETC,EQ                          ; NEGFLG=0 → nothing to do
+NEG_EXP_BODY:                            ; entry for unconditional negate
+        LODA,R0 EXPH
+        EORI,R0 $FF
+        STRA,R0 EXPH
+        LODA,R0 EXPL
+        EORI,R0 $FF
+        STRA,R0 EXPL
+        BCTA,UN INC_EXP                  ; tail-call: INC_EXP returns to caller
+
+; ABS_TMP: abs(TMPH:TMPL) in place; set NEGFLG=1 if was negative. Clobbers R0.
+; Input:  TMPH:TMPL = signed 16-bit value, NEGFLG already cleared by caller.
+; Output: TMPH:TMPL = |input|, NEGFLG=1 if input was negative (else unchanged).
+ABS_TMP:
+        LODA,R0 TMPH
+        ANDI,R0 $80
+        RETC,EQ                          ; positive → return unchanged
+        LODA,R0 TMPH
+        EORI,R0 $FF
+        STRA,R0 TMPH
+        LODA,R0 TMPL
+        EORI,R0 $FF
+        STRA,R0 TMPL
+        LODA,R0 TMPL
+        ADDI,R0 1
+        STRA,R0 TMPL
+        TPSL $01                         ; carry from lo +1
+        BCTR,LT AT_NC                    ; C=0 → no carry
+        LODA,R0 TMPH
+        ADDI,R0 1
+        STRA,R0 TMPH
+AT_NC:
+        LODI,R0 1
+        STRA,R0 NEGFLG                   ; was negative → NEGFLG=1
+        RETC,UN
+
+; ABS_EXP: abs(EXPH:EXPL) in place; toggle NEGFLG if was negative. Clobbers R0.
+; Input:  EXPH:EXPL = signed 16-bit value.
+; Output: EXPH:EXPL = |input|, NEGFLG XOR 1 if input was negative.
+ABS_EXP:
+        LODA,R0 EXPH
+        ANDI,R0 $80
+        RETC,EQ                          ; positive → return unchanged
+        BSTA,UN NEG_EXP_BODY             ; negate EXPH:EXPL (unconditional)
+        LODA,R0 NEGFLG                   ; toggle sign flag
+        EORI,R0 $01
+        STRA,R0 NEGFLG
+        RETC,UN
+
 ; ─── MUL16 ────────────────────────────────────────────────────────────────────
 ; Signed TMPH:TMPL × EXPH:EXPL → EXPH:EXPL  (16-bit two's complement wrap)
 MUL16:
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG
-        ; abs(left) TMPH:TMPL
-        LODA,R0 TMPH
-        ANDI,R0 $80
-        BCTR,EQ MU_LA
-        LODA,R0 TMPH
-        EORI,R0 $FF
-        STRA,R0 TMPH
-        LODA,R0 TMPL
-        EORI,R0 $FF
-        STRA,R0 TMPL
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 TMPL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
-        BCTR,LT MU_LNC           ; branch if C=0 (no carry)
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-MU_LNC:
-        LODI,R0 1               ; ISSUE-01 FIX (corrected): set NEGFLG=1 on BOTH
-        STRA,R0 NEGFLG          ; carry and no-carry paths — left was negative
+        BSTA,UN ABS_TMP                  ; OPT-15: abs(left), set NEGFLG=1 if neg
 MU_LA:
-        ; abs(right) EXPH:EXPL
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTR,EQ MU_RA
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        LODA,R0 EXPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        ; BUG-SCA-09 FIX: was BCTA,GT MU_RA — this jumped over BOTH the hi-byte
-        ; increment AND the NEGFLG toggle, so for most negative right values (those
-        ; whose +1 does not carry to hi byte, e.g. -3→$FFFD, abs=$0003) NEGFLG was
-        ; never toggled → wrong sign (3*-3=+9 not -9). Fix: introduce MU_RA_NC so
-        ; no-carry path skips only the hi-byte increment, then BOTH paths toggle.
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
-        BCTR,LT MU_RA_NC         ; branch if C=0 (no carry): skip hi increment
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-MU_RA_NC:
-        LODA,R0 NEGFLG          ; toggle sign on BOTH carry and no-carry paths
-        EORI,R0 $01
-        STRA,R0 NEGFLG
+        BSTR,UN ABS_EXP                  ; OPT-15: abs(right), toggle NEGFLG if neg
 MU_RA:
         ; save right in SC0:SC1; result EXP=0
         LODA,R0 EXPH
@@ -1951,16 +1902,7 @@ MU_MNC:
 MU_TNB:
         BCTR,UN MU_LP
 MU_DONE:
-        LODA,R0 NEGFLG
-        BCTR,EQ MU_RET
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-MU_RET:
+        BSTA,UN NEG_EXP                  ; OPT-15: negate result if NEGFLG set
         EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
         STRA,R0 NEGFLG                   ; exit — dual-use with CHR$ flag in DO_PRINT
         RETC,UN
@@ -1979,53 +1921,9 @@ DIV16:
 DV_NZ:
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG
-        ; abs(dividend) TMPH:TMPL
-        LODA,R0 TMPH
-        ANDI,R0 $80
-        BCTR,EQ DV_DA
-        LODA,R0 TMPH
-        EORI,R0 $FF
-        STRA,R0 TMPH
-        LODA,R0 TMPL
-        EORI,R0 $FF
-        STRA,R0 TMPL
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 TMPL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
-        BCTR,LT DV_DNC           ; branch if C=0 (no carry)
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-DV_DNC:
-        LODI,R0 1               ; ISSUE-01 FIX (corrected): set NEGFLG=1 on BOTH
-        STRA,R0 NEGFLG          ; carry and no-carry paths — dividend was negative
+        BSTA,UN ABS_TMP                  ; OPT-15: abs(dividend), set NEGFLG=1 if neg
 DV_DA:
-        ; abs(divisor) EXPH:EXPL
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTR,EQ DV_VA
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        LODA,R0 EXPL
-        ADDI,R0 1
-        STRA,R0 EXPL
-        ; BUG-SCA-09b FIX: same as MUL16 right-operand fix. BCTA,GT DV_VA jumped
-        ; over BOTH hi-byte increment AND NEGFLG toggle for no-carry cases.
-        ; Fix: introduce DV_VA_NC so no-carry skips only the hi-byte increment.
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte +1
-        BCTR,LT DV_VA_NC         ; branch if C=0 (no carry): skip hi increment
-        LODA,R0 EXPH
-        ADDI,R0 1
-        STRA,R0 EXPH
-DV_VA_NC:
-        LODA,R0 NEGFLG          ; toggle sign on BOTH paths
-        EORI,R0 $01
-        STRA,R0 NEGFLG
+        BSTA,UN ABS_EXP                  ; OPT-15: abs(divisor), toggle NEGFLG if neg
 DV_VA:
         LODA,R0 EXPH
         STRA,R0 SC0  ; divisor hi
@@ -2063,16 +1961,7 @@ DV_SNB:
         BSTA,UN INC_EXP
         BCTR,UN DV_LP
 DV_DONE:
-        LODA,R0 NEGFLG
-        BCTR,EQ DV_RET
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
-DV_RET:
+        BSTA,UN NEG_EXP                  ; OPT-15: negate result if NEGFLG set
         EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
         STRA,R0 NEGFLG                   ; exit — dual-use with CHR$ flag in DO_PRINT
         RETC,UN
@@ -2089,21 +1978,14 @@ PRINT_S16:
 
         LODA,R0 EXPH
         ANDI,R0 $80
-        BCTA,EQ PS_POS
+        BCTR,EQ PS_POS
         LODI,R0 A'-'
         BSTA,UN COUT
-        ; -32768 special case
         LODA,R0 EXPH
         COMI,R0 $80
         BCTR,EQ PS_CHKMIN
 PS_NEGNORM:
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BSTA,UN INC_EXP
+        BSTA,UN NEG_EXP_BODY             ; negate EXPH:EXPL then fall into PS_POS
         BCTR,UN PS_POS
 PS_CHKMIN:
         LODA,R0 EXPL
@@ -2451,9 +2333,8 @@ DO_ERROR:
         BSTR,UN PRT_QUEST
         LODA,R0 SC0
         BSTA,UN COUT    ; print error number
-        LODA,R0 SC1
-        COMI,R0 $01
-        BCTR,EQ DE_IN
+        LODA,R0 SC1                      ; OPT-10: SC1=saved RUNFLG, 0→EQ, 1→GT
+        BCTR,GT DE_IN            ; was COMI $01/BCTR,EQ
         BCTR,UN DE_NL
 DE_IN:
         BSTR,UN PRT_SPACE
