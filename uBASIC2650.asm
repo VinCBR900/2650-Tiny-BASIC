@@ -53,7 +53,7 @@
 ;         Likely never due to RAS limitations.
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
-;   v2.7  2026-05-25
+;   v2.7  2026-05-25 - 3636 ROM bytes
 ;         OPT-2: DR_CD removed duplicate LODA,R0 TMPL. -3 bytes.
 ;         OPT-3: AO_STORE computed STKIDX-1 once, reused for VALSH/VALSL/STKIDX. -5 bytes.
 ;         OPT-4: DLS_LP/DR_LP replaced PPSL $02 block with SUBA,R0 PEH (signed OK
