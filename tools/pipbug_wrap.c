@@ -27,7 +27,7 @@
  *
  * PIPBUG 1 intercepts (entry points match Oracle / uBASIC2650 EQUs):
  *   COUT  $02B4  putchar(R0)
- *   CHIN  $0286  R0 = getchar() (blocking)
+ *   CHIN  $0286  R0 = host input byte
  *   CRLF  $008A  putchar('\r'); putchar('\n')
  *
  * Build:
@@ -35,7 +35,8 @@
  *
  * Change history:
  *   v1.2  Added cross-platform interactive terminal mode (-i) with raw
- *         byte input/output and Ctrl-] graceful exit.
+ *         byte input/output and Ctrl-] graceful exit. Browser builds use
+ *         non-blocking FIFO polling so WASM never blocks the event loop.
  *   v1.1  Added configurable program entry address switch (--entry),
  *         configurable CHIN/COUT/CRLF intercept addresses and
  *         explicit help/version command-line switches.
@@ -61,12 +62,16 @@
 
 #if PIPBUG_WRAP_EMSCRIPTEN
 #include <emscripten.h>
-#elif PIPBUG_WRAP_WIN32
+#else
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
+#if PIPBUG_WRAP_WIN32
 #include <conio.h>
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
-#else
+#elif !PIPBUG_WRAP_EMSCRIPTEN
 #include <errno.h>
 #include <termios.h>
 #include <unistd.h>
@@ -355,6 +360,9 @@ static int  trace_mode    = 0;      /* -t trace mode                       */
 static int  interactive_mode = 0;   /* -i raw terminal mode                */
 static int  eof_hit       = 0;
 static int  interactive_exit = 0;
+static int  run_finished = 0;       /* emulator has reached a terminal state */
+static int  final_report_printed = 0;
+static long instruction_count = 0;
 static UWORD chin_addr    = 0x0286; /* --chin                              */
 static UWORD cout_addr    = 0x02B4; /* --cout                              */
 static UWORD crlf_addr    = 0x008A; /* --crlf                              */
@@ -374,9 +382,15 @@ static int terminal_restore_needed = 0;
 #endif
 
 #if PIPBUG_WRAP_EMSCRIPTEN
-EM_ASYNC_JS(int, pipbug_browser_read_byte, (void), {
-    if (typeof Module !== 'undefined' && Module.pipbugReadByte)
-        return await Module.pipbugReadByte();
+EM_JS(int, pipbug_browser_char_available, (void), {
+    if (typeof Module !== 'undefined' && Module.pipbugCharAvailable)
+        return Module.pipbugCharAvailable() ? 1 : 0;
+    return 0;
+});
+
+EM_JS(int, pipbug_browser_getchar_nonblock, (void), {
+    if (typeof Module !== 'undefined' && Module.pipbugGetcharNonblock)
+        return Module.pipbugGetcharNonblock();
     return -1;
 });
 #endif
@@ -498,32 +512,74 @@ static int terminal_enable_interactive(void)
 
 /*
  * Purpose:
- *   Read one raw input byte from the host terminal in interactive mode.
+ *   Report whether a browser/WASM input byte is already queued. Native builds
+ *   return true because their legacy batch and terminal input paths may block.
  * Inputs:
- *   out_byte - destination for the byte read.
+ *   None.
  * Outputs:
- *   Returns 1 when a byte was read, or 0 on EOF/error.
+ *   Returns non-zero when an input byte can be read without waiting.
  */
-static int terminal_read_byte(unsigned char *out_byte)
+int platform_char_available(void)
 {
 #if PIPBUG_WRAP_EMSCRIPTEN
-    int c = pipbug_browser_read_byte();
-    if (c < 0) return 0;
-    *out_byte = (unsigned char)c;
-    return 1;
-#elif PIPBUG_WRAP_WIN32
-    int c = _getch();
-    if (c == EOF) return 0;
-    *out_byte = (unsigned char)c;
-    return 1;
+    return pipbug_browser_char_available();
 #else
-    for (;;) {
-        ssize_t got = read(STDIN_FILENO, out_byte, 1);
-        if (got == 1) return 1;
-        if (got == 0) return 0;
-        if (errno != EINTR) return 0;
+    return 1;
+#endif
+}
+
+/*
+ * Purpose:
+ *   Read one input byte through the platform input abstraction. Browser/WASM
+ *   builds poll a JavaScript FIFO and never block; native builds preserve the
+ *   existing blocking stdin/terminal behavior for batch and interactive use.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Returns the byte value 0-255, or -1 when no byte/EOF is available.
+ */
+int platform_getchar_nonblock(void)
+{
+#if PIPBUG_WRAP_EMSCRIPTEN
+    if (!platform_char_available()) return -1;
+    return pipbug_browser_getchar_nonblock();
+#elif PIPBUG_WRAP_WIN32
+    if (interactive_mode) {
+        int c = _getch();
+        return c == EOF ? -1 : (c & 0xff);
+    }
+    {
+        int c = getchar();
+        return c == EOF ? -1 : (c & 0xff);
+    }
+#else
+    if (interactive_mode) {
+        unsigned char c;
+        for (;;) {
+            ssize_t got = read(STDIN_FILENO, &c, 1);
+            if (got == 1) return c;
+            if (got == 0) return -1;
+            if (errno != EINTR) return -1;
+        }
+    }
+    {
+        int c = getchar();
+        return c == EOF ? -1 : (c & 0xff);
     }
 #endif
+}
+
+/*
+ * Purpose:
+ *   Write one output byte through the platform output abstraction.
+ * Inputs:
+ *   ch - byte to write.
+ * Outputs:
+ *   Writes the byte to stdout.
+ */
+void platform_putchar(char ch)
+{
+    putchar((unsigned char)ch);
 }
 
 /*
@@ -596,7 +652,7 @@ static void pb_ret(void)
  */
 static void pb_cout(void)
 {
-    putchar((unsigned char)r[0]);
+    platform_putchar((char)r[0]);
     fflush(stdout);
     pb_ret();
 }
@@ -607,28 +663,39 @@ static void pb_cout(void)
  * Inputs:
  *   None.
  * Outputs:
- *   Stores the input byte in R0, or requests wrapper exit on EOF/Ctrl-].
+ *   Stores the input byte in R0, requests wrapper exit on EOF/Ctrl-], or
+ *   returns 0 in browser builds when no FIFO input byte is available yet.
  */
-static void pb_chin(void)
+static int pb_chin(void)
 {
-    if (interactive_mode) {
-        unsigned char c;
+    int c;
 
-        if (!terminal_read_byte(&c)) {
-            eof_hit = 1;
-            r[0] = 0;
-        } else if (c == 0x1D) {
-            interactive_exit = 1;
-            r[0] = 0;
-        } else {
-            r[0] = (UBYTE)c;
-        }
+#if PIPBUG_WRAP_EMSCRIPTEN
+    /* Browser/WASM cannot safely block in getchar(): blocking would suspend or
+     * monopolize the single browser thread. Instead JavaScript keyboard events
+     * enqueue bytes and CHIN polls that FIFO. If it is empty, leave IAR at the
+     * CHIN entry point so the browser scheduler can retry on a later frame.
+     */
+    c = platform_getchar_nonblock();
+    if (c < 0) return 0;
+#else
+    c = platform_getchar_nonblock();
+    if (c < 0) {
+        eof_hit = 1;
+        r[0] = 0;
+        pb_ret();
+        return 1;
+    }
+#endif
+
+    if (interactive_mode && c == 0x1D) {
+        interactive_exit = 1;
+        r[0] = 0;
     } else {
-        int c = getchar();
-        if (c == EOF) { eof_hit = 1; r[0] = 0; }
-        else          { r[0] = (UBYTE)c; }
+        r[0] = (UBYTE)c;
     }
     pb_ret();
+    return 1;
 }
 
 /*
@@ -641,8 +708,8 @@ static void pb_chin(void)
  */
 static void pb_crlf(void)
 {
-    putchar('\r');
-    putchar('\n');
+    platform_putchar('\r');
+    platform_putchar('\n');
     fflush(stdout);
     pb_ret();
 }
@@ -750,6 +817,125 @@ static int load_hex(const char *filename)
     return 1;
 }
 
+
+#define PIPBUG_RUN_RUNNING 0
+#define PIPBUG_RUN_WAITING_INPUT 1
+#define PIPBUG_RUN_DONE 2
+
+/*
+ * Purpose:
+ *   Print final run messages exactly once when the emulator reaches a terminal
+ *   state.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Writes any final status/summary to stderr.
+ */
+static void print_final_report(void)
+{
+    if (final_report_printed) return;
+    final_report_printed = 1;
+
+    if (interactive_exit)
+        fprintf(stderr, "\n*** Ctrl-] -- interactive exit ***\n\n");
+    else if (eof_hit)
+        fprintf(stderr, "\n*** EOF on stdin -- halted ***\n\n");
+
+    if (!trace_mode && !step_mode && bp_addr < 0 && !halted &&
+        inst_limit > 0 && instruction_count < inst_limit &&
+        !eof_hit && !interactive_exit) {
+        print_halt_summary(instruction_count);
+    }
+}
+
+/*
+ * Purpose:
+ *   Mark the emulator as finished and emit final status if needed.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Sets run_finished and prints the final report.
+ */
+static void finish_run(void)
+{
+    run_finished = 1;
+    print_final_report();
+}
+
+/*
+ * Purpose:
+ *   Execute a bounded chunk of the wrapper run loop. Browser builds call this
+ *   from requestAnimationFrame() so the WASM module never owns the browser
+ *   thread indefinitely; native builds pass 0 to run until a terminal state.
+ * Inputs:
+ *   instruction_budget - maximum CPU instructions to execute, or 0 for no
+ *                        chunk limit.
+ * Outputs:
+ *   Returns PIPBUG_RUN_RUNNING, PIPBUG_RUN_WAITING_INPUT, or PIPBUG_RUN_DONE.
+ */
+EMSCRIPTEN_KEEPALIVE int pipbug_run_chunk(int instruction_budget)
+{
+    int executed = 0;
+
+    if (run_finished) return PIPBUG_RUN_DONE;
+
+    for (;;) {
+        if (iar == cout_addr) { pb_cout(); continue; }
+        if (iar == chin_addr) {
+            if (!pb_chin()) return PIPBUG_RUN_WAITING_INPUT;
+            if (eof_hit || interactive_exit) {
+                finish_run();
+                return PIPBUG_RUN_DONE;
+            }
+            continue;
+        }
+        if (iar == crlf_addr) { pb_crlf(); continue; }
+
+        if (bp_addr >= 0 && iar == (UWORD)bp_addr) {
+            fprintf(stderr, "\n*** BREAKPOINT $%04X ***\n", bp_addr);
+            print_halt_summary(instruction_count);
+            finish_run();
+            return PIPBUG_RUN_DONE;
+        }
+
+        if (inst_limit > 0 && instruction_count >= inst_limit) {
+            fprintf(stderr, "\n*** Instruction limit (%ld) ***\n", inst_limit);
+            print_halt_summary(instruction_count);
+            finish_run();
+            return PIPBUG_RUN_DONE;
+        }
+
+        if (trace_mode) print_state();
+
+        if (step_mode) {
+            print_state();
+            fprintf(stderr, "[Enter to step, q+Enter to quit] ");
+            char buf[8];
+            if (fgets(buf, sizeof(buf), stdin) == NULL || buf[0]=='q') {
+                finish_run();
+                return PIPBUG_RUN_DONE;
+            }
+        }
+
+        oldcycles = cycles_2650;
+        opcode = memory[iar];
+        one_instruction();
+        cpu_emu();
+        instruction_count++;
+        executed++;
+
+        if (halted) {
+            fprintf(stderr, "\n*** HALT ($40) at $%04X ***\n", iar);
+            print_halt_summary(instruction_count);
+            finish_run();
+            return PIPBUG_RUN_DONE;
+        }
+
+        if (instruction_budget > 0 && executed >= instruction_budget)
+            return PIPBUG_RUN_RUNNING;
+    }
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
 /*
@@ -844,70 +1030,15 @@ int main(int argc, char **argv)
         inst_limit > 0 ? "set" : "unlimited");
 
     /* ── Run loop ── */
-    long count = 0;
-    for (;;) {
-        /* PIPBUG entry-point intercepts (before instruction fetch) */
-        if (iar == cout_addr) { pb_cout(); continue; }
-        if (iar == chin_addr) {
-            pb_chin();
-            if (eof_hit || interactive_exit) break;
-            continue;
-        }
-        if (iar == crlf_addr) { pb_crlf(); continue; }
-
-        /* Breakpoint check */
-        if (bp_addr >= 0 && iar == (UWORD)bp_addr) {
-            fprintf(stderr, "\n*** BREAKPOINT $%04X ***\n", bp_addr);
-            print_halt_summary(count);
-            break;
-        }
-
-        /* Instruction limit */
-        if (inst_limit > 0 && count >= inst_limit) {
-            fprintf(stderr, "\n*** Instruction limit (%ld) ***\n", inst_limit);
-            print_halt_summary(count);
-            break;
-        }
-
-        /* Trace */
-        if (trace_mode) print_state();
-
-        /* Step mode: pause, wait for Enter */
-        if (step_mode) {
-            print_state();
-            fprintf(stderr, "[Enter to step, q+Enter to quit] ");
-            char buf[8];
-            if (fgets(buf, sizeof(buf), stdin) == NULL || buf[0]=='q') break;
-        }
-
-        /* Execute one instruction.
-         * Under -DGAMER, one_instruction() only fetches opcode into `opcode`
-         * and advances nothing. cpu_emu() does the actual decode and IAR advance.
-         * We call both so any future non-GAMER sections still work.          */
-        oldcycles = cycles_2650;
-        opcode = memory[iar];   /* one_instruction() does this but we need it before cpu_emu() */
-        one_instruction();      /* fetches opcode; no-ops all #ifndef GAMER blocks             */
-        cpu_emu();              /* decodes and executes; advances IAR via ONE/TWO/THREE_BYTES  */
-        count++;
-
-        /* HALT check */
-        if (halted) {
-            fprintf(stderr, "\n*** HALT ($40) at $%04X ***\n", iar);
-            print_halt_summary(count);
-            break;
-        }
-    }
-
-    if (interactive_exit)
-        fprintf(stderr, "\n*** Ctrl-] -- interactive exit ***\n\n");
-    else if (eof_hit)
-        fprintf(stderr, "\n*** EOF on stdin -- halted ***\n\n");
-
-    /* Final state on clean exit */
-    if (!trace_mode && !step_mode && bp_addr < 0 && !halted &&
-        inst_limit > 0 && count < inst_limit && !eof_hit && !interactive_exit) {
-        print_halt_summary(count);
-    }
-
+#if PIPBUG_WRAP_EMSCRIPTEN
+    /* In browser builds, main() only initializes state. JavaScript drives
+     * execution with pipbug_run_chunk() from requestAnimationFrame(), allowing
+     * keyboard events to fill the FIFO between chunks.
+     */
     return 0;
+#else
+    while (!run_finished)
+        (void)pipbug_run_chunk(0);
+    return 0;
+#endif
 }

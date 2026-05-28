@@ -13,10 +13,9 @@ EMSCRIPTEN_FLAGS := \
 	-s MODULARIZE=1 \
 	-s EXPORT_NAME=createPipbugWrapModule \
 	-s INVOKE_RUN=0 \
-	-s EXIT_RUNTIME=1 \
+	-s EXIT_RUNTIME=0 \
 	-s FORCE_FILESYSTEM=1 \
-	-s ASYNCIFY=1 \
-	-s EXPORTED_FUNCTIONS='["_main"]' \
+	-s EXPORTED_FUNCTIONS='["_main","_pipbug_run_chunk"]' \
 	-s EXPORTED_RUNTIME_METHODS='["FS","callMain"]'
 
 .PHONY: all clean hex wasm serve

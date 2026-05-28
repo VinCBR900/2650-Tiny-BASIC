@@ -133,7 +133,13 @@
   let running = false;
   let moduleLoader = null;
   let inputQueue = [];
-  let inputWaiters = [];
+  let currentModule = null;
+  let animationFrame = null;
+
+  const CHUNK_INSTRUCTIONS = 20000;
+  const RUN_RUNNING = 0;
+  const RUN_WAITING_INPUT = 1;
+  const RUN_DONE = 2;
 
   function setStatus(message, kind = '') {
     status.textContent = message;
@@ -146,15 +152,20 @@
   }
 
   function enqueueByte(byte) {
-    byte &= 0xff;
-    const waiter = inputWaiters.shift();
-    if (waiter) waiter(byte);
-    else inputQueue.push(byte);
+    inputQueue.push(byte & 0xff);
   }
 
-  async function readByte() {
-    if (inputQueue.length) return inputQueue.shift();
-    return new Promise(resolve => inputWaiters.push(resolve));
+  /* Browser/WASM must not use blocking stdin: a blocking getchar()-style read
+   * either suspends the runtime or monopolizes the single browser thread.
+   * Keyboard events therefore append bytes to this FIFO, and the C emulator
+   * polls it from small requestAnimationFrame()-driven execution chunks.
+   */
+  function charAvailable() {
+    return inputQueue.length > 0;
+  }
+
+  function getCharNonblock() {
+    return inputQueue.length ? inputQueue.shift() : -1;
   }
 
   function keyToByte(event) {
@@ -195,13 +206,47 @@
     return moduleLoader;
   }
 
+  function finishProgram(message, kind = 'ok') {
+    running = false;
+    currentModule = null;
+    if (animationFrame !== null) {
+      cancelAnimationFrame(animationFrame);
+      animationFrame = null;
+    }
+    startButton.disabled = false;
+    stopButton.disabled = true;
+    setStatus(message, kind);
+    terminal.focus();
+  }
+
+  function driveEmulator() {
+    if (!running || !currentModule) return;
+
+    let state;
+    try {
+      state = currentModule._pipbug_run_chunk(CHUNK_INSTRUCTIONS);
+    } catch (error) {
+      append(`\n[Browser runner error] ${error.message}\n`);
+      finishProgram(error.message, 'err');
+      return;
+    }
+
+    if (state === RUN_DONE) {
+      finishProgram('Program exited.', 'ok');
+      return;
+    }
+
+    setStatus(state === RUN_WAITING_INPUT ? 'Waiting for input...' : 'Running...', 'ok');
+    animationFrame = requestAnimationFrame(driveEmulator);
+  }
+
   async function runProgram() {
     if (running) return;
     running = true;
+    currentModule = null;
     startButton.disabled = true;
     stopButton.disabled = false;
     inputQueue = [];
-    inputWaiters = [];
     terminal.textContent = '';
     terminal.focus();
     setStatus('Loading runtime...', '');
@@ -219,7 +264,8 @@
         locateFile: path => path.endsWith('.wasm') ? `assets/${path}` : path,
         print: text => append(`${text}\n`),
         printErr: text => append(`${text}\n`),
-        pipbugReadByte: readByte
+        pipbugCharAvailable: charAvailable,
+        pipbugGetcharNonblock: getCharNonblock
       });
 
       const hexPath = '/uBASIC2650.hex';
@@ -228,16 +274,12 @@
       args.push(hexPath);
       setStatus(`Running: pipbug_wrap ${args.join(' ')}`, 'ok');
       const result = module.callMain(args);
-      if (result && typeof result.then === 'function') await result;
-      setStatus('Program exited.', 'ok');
+      if (typeof result === 'number' && result !== 0) throw new Error(`pipbug_wrap initialization failed with status ${result}`);
+      currentModule = module;
+      animationFrame = requestAnimationFrame(driveEmulator);
     } catch (error) {
       append(`\n[Browser runner error] ${error.message}\n`);
-      setStatus(error.message, 'err');
-    } finally {
-      running = false;
-      startButton.disabled = false;
-      stopButton.disabled = true;
-      inputWaiters.splice(0).forEach(resolve => resolve(0x1d));
+      finishProgram(error.message, 'err');
     }
   }
 
