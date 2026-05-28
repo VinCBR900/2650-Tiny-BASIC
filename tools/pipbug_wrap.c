@@ -47,7 +47,13 @@
 #include <string.h>
 #include <ctype.h>
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(_WIN64) || defined(WIN32)
+#define PIPBUG_WRAP_WIN32 1
+#else
+#define PIPBUG_WRAP_WIN32 0
+#endif
+
+#if PIPBUG_WRAP_WIN32
 #include <conio.h>
 #include <fcntl.h>
 #include <io.h>
@@ -307,8 +313,19 @@ const STRPTR pristring[32] = {0};
    their definition in GAMER mode (no #ifndef GAMER guard on the call sites) */
 static void logindirectbios(void);
 
-/* ── Include the WinArcadia CPU core ─────────────────────────────────────── */
+/* ── Include the WinArcadia CPU core ───────────────────────────────────────
+ *  Keep WinArcadia's own WIN32 sections disabled in this standalone wrapper.
+ *  They include UI/resource headers that are not needed for -DGAMER builds.
+ */
+#ifdef WIN32
+#define PIPBUG_WRAP_RESTORE_WIN32 1
+#undef WIN32
+#endif
 #include "2650.c"
+#ifdef PIPBUG_WRAP_RESTORE_WIN32
+#define WIN32 1
+#undef PIPBUG_WRAP_RESTORE_WIN32
+#endif
 
 /* ── After including 2650.c the EXPORT variables are now in scope ────────── */
 /* psu, psl, r[7], iar, ras[8], memory[32768], memflags[], cycles_2650 etc. */
@@ -330,7 +347,7 @@ static UWORD cout_addr    = 0x02B4; /* --cout                              */
 static UWORD crlf_addr    = 0x008A; /* --crlf                              */
 static UWORD entry_addr   = 0x0440; /* --entry                             */
 
-#ifdef _WIN32
+#if PIPBUG_WRAP_WIN32
 static DWORD saved_input_mode = 0;
 static int saved_stdin_mode = -1;
 static int saved_stdout_mode = -1;
@@ -353,7 +370,7 @@ static void terminal_restore(void)
 {
     if (!terminal_restore_needed) return;
 
-#ifdef _WIN32
+#if PIPBUG_WRAP_WIN32
     if (console_input != INVALID_HANDLE_VALUE)
         SetConsoleMode(console_input, saved_input_mode);
     if (saved_stdin_mode >= 0)
@@ -377,7 +394,7 @@ static void terminal_restore(void)
  */
 static int terminal_enable_interactive(void)
 {
-#ifdef _WIN32
+#if PIPBUG_WRAP_WIN32
     DWORD mode;
 
     if (!_isatty(_fileno(stdin))) {
@@ -462,7 +479,7 @@ static int terminal_enable_interactive(void)
  */
 static int terminal_read_byte(unsigned char *out_byte)
 {
-#ifdef _WIN32
+#if PIPBUG_WRAP_WIN32
     int c = _getch();
     if (c == EOF) return 0;
     *out_byte = (unsigned char)c;
