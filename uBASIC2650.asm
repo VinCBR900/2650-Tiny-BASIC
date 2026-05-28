@@ -53,7 +53,7 @@
 ;         Likely never due to RAS limitations.
 ;
 ;  CHANGE HISTORY 
-;   v2.7  2026-05-28 - 3647 ROM bytes (external CHIN>COUT)
+;   v2.7  2026-05-25
 ;         OPT-2: DR_CD removed duplicate LODA,R0 TMPL. -3 bytes.
 ;         OPT-3: AO_STORE computed STKIDX-1 once, reused for VALSH/VALSL/STKIDX. -5 bytes.
 ;         OPT-4: DLS_LP/DR_LP replaced PPSL $02 block with SUBA,R0 PEH (signed OK
@@ -163,7 +163,7 @@ LNUML   EQU $160D   ; scratch line number lo
 SC0     EQU $160E   ; scratch byte 0
 SC1     EQU $160F   ; scratch byte 1
 ERRFLG  EQU $1610   ; error flag $00=ok $01=error/handled
-NEGFLG  EQU $1611   ; sign / CHR$ flag
+NEGFLG  EQU $1611   ; sign flag
 PEH     EQU $1612   ; program end pointer hi
 PEL     EQU $1613   ; program end pointer lo
 OPSTK   EQU $1614   ; operator stack [8]  $0114-$011B
@@ -197,9 +197,8 @@ PROGLIM EQU $1fff   ; one past end of program store
 
 ;  RESET / ENTRY 
 RESET:
-        ; Setup CPU
-        CPSL RS               ; Ensure using primary reg bank  
-        ; Setup Stack - oh, wait...
+        ; Setup Stack Ptr - oh, wait...
+        CPSL RS + 7               ; Ensure using primary reg bank and tiny SP is zero  
 
         ; Sets up showcase
         LODI,R0 <SHOWCASE_END
@@ -230,6 +229,7 @@ CLRV:
 
 ;  Main Loop 
 REPL:
+        CPSL RS + 7               ; Ensure using primary reg bank and SP is zero  
         BSTA,UN PRT_CHEV    ; print chevron
         BSTA,UN PRT_SPACE
         BSTA,UN RDLINE
@@ -368,8 +368,9 @@ DO_REM:
         RETC,UN
 
 ;  DO_PRINT combined with PRTSTR 
-; PRINT [item1][;]...[itemx][;]    item = "string" | expr | CHR$(expr) 
-;   Inline check for CHR$
+; PRINT [item1][;]...[itemx][;]    
+;   item = "string" | expr | TAB(spaces) | CHR$(expr) 
+;   Inline check for CHR$ and TAB
 ; PRTSTR Print NUL-terminated string at IPH:IPL.
 ; 
 DO_PRINT:
@@ -1621,16 +1622,13 @@ AO_SLN:
         RETC,UN
 
 ;  PARSE_FACTOR 
-; Parse one atom: variable A-Z, signed decimal, PEEK(), CHR$(), USR().
+; Parse one atom: variable A-Z, signed decimal, PEEK(), USR().
 ; Called from PARSE_EXPR at depth N+1. May call PARSE_EXPR for function args
 ; (adds 1 more level). Unary - and + handled by PARSE_EXPR before calling here.
 ; CHR$ result: sets NEGFLG=$01 so DO_PRINT outputs EXPL as a character.
 PARSE_FACTOR:
-        EORZ,R0 ; Clear R0
-        STRA,R0 CHRFLG  ; clear CHR$ flag
         LODA,R0 *IPH
         ; RAS-FIX: inline UPCASE here instead of BSTA UPCASE (+1 slot).
-        ; Saves 1 RAS slot so CHR$(expr) path stays within 7 levels.
         ; Equivalent to: if(r0>='a' && r0<='z') r0-=32
         COMI,R0 A'a'
         BCTR,LT PF_UC_DONE       ; < 'a'  already uppercase or not alpha
@@ -1739,8 +1737,6 @@ PARSE_U16:
         STRA,R0 EXPH
         STRA,R0 EXPL
         ; Check first char  must be a digit or it is a syntax error.
-        ; TRY_STORE_LINE have explicit WSKIP added). This saves 1 RAS slot
-        ; from the inner loop, preventing overflow at nested IF + CHR$().
         LODA,R0 *IPH
         COMI,R0 A'0'
         BCTA,LT JSYNERR          ; < '0'  not a digit  syntax error
@@ -1908,7 +1904,7 @@ MU_TNB:
 MU_DONE:
         BSTA,UN NEG_EXP                  ; OPT-15: negate result if NEGFLG set
         EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
-        STRA,R0 NEGFLG                   ; exit  dual-use with CHR$ flag in DO_PRINT
+        STRA,R0 NEGFLG                   ; exit  
         RETC,UN
 
 ;  DIV16 
@@ -1967,7 +1963,7 @@ DV_SNB:
 DV_DONE:
         BSTA,UN NEG_EXP                  ; OPT-15: negate result if NEGFLG set
         EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
-        STRA,R0 NEGFLG                   ; exit  dual-use with CHR$ flag in DO_PRINT
+        STRA,R0 NEGFLG                   ; exit  
         RETC,UN
 JERRDIVZER:
         LODI,R0 ERR_DIV_ZERO
