@@ -47,13 +47,21 @@
 #include <string.h>
 #include <ctype.h>
 
-#if defined(_WIN32) || defined(_WIN64) || defined(WIN32)
+#if defined(__EMSCRIPTEN__)
+#define PIPBUG_WRAP_EMSCRIPTEN 1
+#else
+#define PIPBUG_WRAP_EMSCRIPTEN 0
+#endif
+
+#if !PIPBUG_WRAP_EMSCRIPTEN && (defined(_WIN32) || defined(_WIN64) || defined(WIN32))
 #define PIPBUG_WRAP_WIN32 1
 #else
 #define PIPBUG_WRAP_WIN32 0
 #endif
 
-#if PIPBUG_WRAP_WIN32
+#if PIPBUG_WRAP_EMSCRIPTEN
+#include <emscripten.h>
+#elif PIPBUG_WRAP_WIN32
 #include <conio.h>
 #include <fcntl.h>
 #include <io.h>
@@ -347,7 +355,9 @@ static UWORD cout_addr    = 0x02B4; /* --cout                              */
 static UWORD crlf_addr    = 0x008A; /* --crlf                              */
 static UWORD entry_addr   = 0x0440; /* --entry                             */
 
-#if PIPBUG_WRAP_WIN32
+#if PIPBUG_WRAP_EMSCRIPTEN
+static int terminal_restore_needed = 0;
+#elif PIPBUG_WRAP_WIN32
 static DWORD saved_input_mode = 0;
 static int saved_stdin_mode = -1;
 static int saved_stdout_mode = -1;
@@ -356,6 +366,14 @@ static HANDLE console_input = INVALID_HANDLE_VALUE;
 #else
 static struct termios saved_termios;
 static int terminal_restore_needed = 0;
+#endif
+
+#if PIPBUG_WRAP_EMSCRIPTEN
+EM_ASYNC_JS(int, pipbug_browser_read_byte, (void), {
+    if (typeof Module !== 'undefined' && Module.pipbugReadByte)
+        return await Module.pipbugReadByte();
+    return -1;
+});
 #endif
 
 /*
@@ -370,7 +388,9 @@ static void terminal_restore(void)
 {
     if (!terminal_restore_needed) return;
 
-#if PIPBUG_WRAP_WIN32
+#if PIPBUG_WRAP_EMSCRIPTEN
+    /* Browser builds do not modify a host terminal. */
+#elif PIPBUG_WRAP_WIN32
     if (console_input != INVALID_HANDLE_VALUE)
         SetConsoleMode(console_input, saved_input_mode);
     if (saved_stdin_mode >= 0)
@@ -394,7 +414,9 @@ static void terminal_restore(void)
  */
 static int terminal_enable_interactive(void)
 {
-#if PIPBUG_WRAP_WIN32
+#if PIPBUG_WRAP_EMSCRIPTEN
+    return 1;
+#elif PIPBUG_WRAP_WIN32
     DWORD mode;
 
     if (!_isatty(_fileno(stdin))) {
@@ -479,7 +501,12 @@ static int terminal_enable_interactive(void)
  */
 static int terminal_read_byte(unsigned char *out_byte)
 {
-#if PIPBUG_WRAP_WIN32
+#if PIPBUG_WRAP_EMSCRIPTEN
+    int c = pipbug_browser_read_byte();
+    if (c < 0) return 0;
+    *out_byte = (unsigned char)c;
+    return 1;
+#elif PIPBUG_WRAP_WIN32
     int c = _getch();
     if (c == EOF) return 0;
     *out_byte = (unsigned char)c;
