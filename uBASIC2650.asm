@@ -92,12 +92,6 @@
 ;               "undefined line" error. Fix: replaced SUBA,R0 *EXPH / BCTR,GT with
 ;                    PPSL $02 / COMA,R0 *EXPH / CPSL $02 / BCTR,GT
 ;               (unsigned compare mode, same pattern as DR_LP boundary check).
-;         BUG-CHR-01 FIXED: PARSE_EXPR: PF_CHR_TRY consumed 'C' via INC_IP to peek at the
-;               next char, then on non-CHR$ fallback branched to PF_VAR which
-;               called INC_IP again  consuming the char after C (e.g. '>').
-;               For any expression using variable C (e.g. "IF C>4"), PARSE_RELOP
-;               never saw the relop  ERRFLG=1  JSYNERR at every IF using C.
-;               Fix: fallback BCTA,UN PF_VAR  BCTA,UN PF_LVNCA (skips INC_IP).
 ;
 ;   v2.4  2026-05-19
 ;         SHOWCASE appended including Mandelbrot section. PRTSTR optimised.
@@ -174,7 +168,7 @@ SWSP    EQU $162D   ; SW call stack pointer ($FF=empty)
 SWSTK   EQU $162E   ; SW call stack 82 bytes  $012E-$013D
 PRECTMP EQU $163D   ; PARSE_EXPR cur_prec save (survives APPLY_OP which clobbers SC1)
 RELOP   EQU $163E   ; relational op 1-6
-CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
+; CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
 ;  SW call stack (v2.0) 
 ; R3 = index (0=empty, grows up). Each frame = [lo][hi] (lo pushed first).
 ; Push sequence: STRA,R0 *SWBASE,R3+ (lo first), STRA,R0 *SWBASE,R3+ (hi)
@@ -614,7 +608,7 @@ DIF_ANDTEST:
 
 DO_GOTO:
         BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
-        BSTA,UN PARSE_U16                ; [+1]
+        BSTA,UN PARSE_EXPR              ; 
         LODA,R0 EXPH
         STRA,R0 GOTOH
         LODA,R0 EXPL
@@ -1625,7 +1619,6 @@ AO_SLN:
 ; Parse one atom: variable A-Z, signed decimal, PEEK(), USR().
 ; Called from PARSE_EXPR at depth N+1. May call PARSE_EXPR for function args
 ; (adds 1 more level). Unary - and + handled by PARSE_EXPR before calling here.
-; CHR$ result: sets NEGFLG=$01 so DO_PRINT outputs EXPL as a character.
 PARSE_FACTOR:
         LODA,R0 *IPH
         ; RAS-FIX: inline UPCASE here instead of BSTA UPCASE (+1 slot).
