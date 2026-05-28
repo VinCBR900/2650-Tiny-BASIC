@@ -1,6 +1,6 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
- * Version: 1.1
- * Date:    2026-04-15
+ * Version: 1.2
+ * Date:    2026-05-28
  *
  * Purpose:
  *   Wraps 2650.c (the WinArcadia CPU core, compiled -DGAMER to strip all UI
@@ -15,6 +15,8 @@
  *   -b 0xADDR       Breakpoint at address (hex); pauses and dumps state
  *   -m 0xADDR LEN   Dump LEN bytes from address at halt
  *   -s              Step mode: pause at every instruction, press Enter to continue
+ *   -i              Interactive terminal mode; raw I/O, Ctrl-] exits
+ *                   and defaults to unlimited instructions
  *   -n N            Instruction limit (default 5000000, 0=unlimited)
  *   --chin 0xADDR   CHIN intercept address (default 0x0286)
  *   --cout 0xADDR   COUT intercept address (default 0x02B4)
@@ -25,13 +27,16 @@
  *
  * PIPBUG 1 intercepts (entry points match Oracle / uBASIC2650 EQUs):
  *   COUT  $02B4  putchar(R0)
- *   CHIN  $0286  R0 = getchar() (blocking)
+ *   CHIN  $0286  R0 = host input byte
  *   CRLF  $008A  putchar('\r'); putchar('\n')
  *
  * Build:
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
+ *   v1.2  Added cross-platform interactive terminal mode (-i) with raw
+ *         byte input/output and Ctrl-] graceful exit. Browser builds use
+ *         non-blocking FIFO polling so WASM never blocks the event loop.
  *   v1.1  Added configurable program entry address switch (--entry),
  *         configurable CHIN/COUT/CRLF intercept addresses and
  *         explicit help/version command-line switches.
@@ -42,6 +47,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+#if defined(__EMSCRIPTEN__)
+#define PIPBUG_WRAP_EMSCRIPTEN 1
+#else
+#define PIPBUG_WRAP_EMSCRIPTEN 0
+#endif
+
+#if !PIPBUG_WRAP_EMSCRIPTEN && (defined(_WIN32) || defined(_WIN64) || defined(WIN32))
+#define PIPBUG_WRAP_WIN32 1
+#else
+#define PIPBUG_WRAP_WIN32 0
+#endif
+
+#if PIPBUG_WRAP_EMSCRIPTEN
+#include <emscripten.h>
+#else
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+
+#if PIPBUG_WRAP_WIN32
+#include <conio.h>
+#include <fcntl.h>
+#include <io.h>
+#include <windows.h>
+#elif !PIPBUG_WRAP_EMSCRIPTEN
+#include <errno.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 /* ── aa.h stubs ─────────────────────────────────────────────────────────── */
 
@@ -288,12 +322,28 @@ TEXT   asciiname_short[259][3 + 1];
 ASCREEN screen[1][1];           /* dummy — BOXWIDTH/BOXHEIGHT unknown */
 const STRPTR pristring[32] = {0};
 
-/* Forward declarations for static functions in 2650.c that are called before
-   their definition in GAMER mode (no #ifndef GAMER guard on the call sites) */
+/* Forward declarations for functions in 2650.c that are called before their
+   definition in GAMER mode (no #ifndef GAMER guard on the call sites). */
 static void logindirectbios(void);
+EXPORT void one_instruction(void);
+EXPORT void do_tape(void);
+EXPORT void pullras(void);
+EXPORT void pushras(void);
+EXPORT void checkinterrupt(void);
 
-/* ── Include the WinArcadia CPU core ─────────────────────────────────────── */
+/* ── Include the WinArcadia CPU core ───────────────────────────────────────
+ *  Keep WinArcadia's own WIN32 sections disabled in this standalone wrapper.
+ *  They include UI/resource headers that are not needed for -DGAMER builds.
+ */
+#ifdef WIN32
+#define PIPBUG_WRAP_RESTORE_WIN32 1
+#undef WIN32
+#endif
 #include "2650.c"
+#ifdef PIPBUG_WRAP_RESTORE_WIN32
+#define WIN32 1
+#undef PIPBUG_WRAP_RESTORE_WIN32
+#endif
 
 /* ── After including 2650.c the EXPORT variables are now in scope ────────── */
 /* psu, psl, r[7], iar, ras[8], memory[32768], memflags[], cycles_2650 etc. */
@@ -304,14 +354,242 @@ static int  bp_addr       = -1;     /* -b breakpoint address (-1 = none)   */
 static int  dump_addr     = -1;     /* -m dump base address                 */
 static int  dump_len      = 0;
 static long inst_limit    = 5000000;
+static int  inst_limit_set = 0;      /* explicit -n was supplied             */
 static int  step_mode     = 0;      /* -s step mode                        */
 static int  trace_mode    = 0;      /* -t trace mode                       */
+static int  interactive_mode = 0;   /* -i raw terminal mode                */
 static int  eof_hit       = 0;
+static int  interactive_exit = 0;
+static int  run_finished = 0;       /* emulator has reached a terminal state */
+static int  final_report_printed = 0;
+static long instruction_count = 0;
 static UWORD chin_addr    = 0x0286; /* --chin                              */
 static UWORD cout_addr    = 0x02B4; /* --cout                              */
 static UWORD crlf_addr    = 0x008A; /* --crlf                              */
 static UWORD entry_addr   = 0x0440; /* --entry                             */
 
+#if PIPBUG_WRAP_EMSCRIPTEN
+static int terminal_restore_needed = 0;
+#elif PIPBUG_WRAP_WIN32
+static DWORD saved_input_mode = 0;
+static int saved_stdin_mode = -1;
+static int saved_stdout_mode = -1;
+static int terminal_restore_needed = 0;
+static HANDLE console_input = INVALID_HANDLE_VALUE;
+#else
+static struct termios saved_termios;
+static int terminal_restore_needed = 0;
+#endif
+
+#if PIPBUG_WRAP_EMSCRIPTEN
+EM_JS(int, pipbug_browser_char_available, (void), {
+    if (typeof Module !== 'undefined' && Module.pipbugCharAvailable)
+        return Module.pipbugCharAvailable() ? 1 : 0;
+    return 0;
+});
+
+EM_JS(int, pipbug_browser_getchar_nonblock, (void), {
+    if (typeof Module !== 'undefined' && Module.pipbugGetcharNonblock)
+        return Module.pipbugGetcharNonblock();
+    return -1;
+});
+#endif
+
+/*
+ * Purpose:
+ *   Restore the host terminal/console state after interactive mode.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   None.
+ */
+static void terminal_restore(void)
+{
+    if (!terminal_restore_needed) return;
+
+#if PIPBUG_WRAP_EMSCRIPTEN
+    /* Browser builds do not modify a host terminal. */
+#elif PIPBUG_WRAP_WIN32
+    if (console_input != INVALID_HANDLE_VALUE)
+        SetConsoleMode(console_input, saved_input_mode);
+    if (saved_stdin_mode >= 0)
+        _setmode(_fileno(stdin), saved_stdin_mode);
+    if (saved_stdout_mode >= 0)
+        _setmode(_fileno(stdout), saved_stdout_mode);
+#else
+    tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+#endif
+
+    terminal_restore_needed = 0;
+}
+
+/*
+ * Purpose:
+ *   Enable raw, byte-oriented host terminal input for interactive mode.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Returns 1 on success, or 0 when interactive mode cannot be enabled.
+ */
+static int terminal_enable_interactive(void)
+{
+#if PIPBUG_WRAP_EMSCRIPTEN
+    return 1;
+#elif PIPBUG_WRAP_WIN32
+    DWORD mode;
+
+    if (!_isatty(_fileno(stdin))) {
+        fprintf(stderr, "Interactive mode requires a console stdin.\n");
+        return 0;
+    }
+
+    console_input = GetStdHandle(STD_INPUT_HANDLE);
+    if (console_input == INVALID_HANDLE_VALUE ||
+        !GetConsoleMode(console_input, &saved_input_mode)) {
+        fprintf(stderr, "Interactive mode could not read console mode.\n");
+        return 0;
+    }
+
+    saved_stdin_mode = _setmode(_fileno(stdin), _O_BINARY);
+    saved_stdout_mode = _setmode(_fileno(stdout), _O_BINARY);
+    terminal_restore_needed = 1;
+
+    mode = saved_input_mode;
+    mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+#ifdef ENABLE_QUICK_EDIT_MODE
+    mode &= ~ENABLE_QUICK_EDIT_MODE;
+#endif
+    mode |= ENABLE_EXTENDED_FLAGS;
+
+    if (!SetConsoleMode(console_input, mode)) {
+        fprintf(stderr, "Interactive mode could not set console mode.\n");
+        terminal_restore();
+        return 0;
+    }
+
+    atexit(terminal_restore);
+    return 1;
+#else
+    struct termios raw;
+
+    if (!isatty(STDIN_FILENO)) {
+        fprintf(stderr, "Interactive mode requires a terminal stdin.\n");
+        return 0;
+    }
+
+    if (tcgetattr(STDIN_FILENO, &saved_termios) != 0) {
+        perror("tcgetattr");
+        return 0;
+    }
+
+    raw = saved_termios;
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+#ifdef IXOFF
+    raw.c_iflag &= ~IXOFF;
+#endif
+#ifdef INLCR
+    raw.c_iflag &= ~INLCR;
+#endif
+#ifdef IGNCR
+    raw.c_iflag &= ~IGNCR;
+#endif
+    raw.c_oflag &= ~OPOST;
+    raw.c_cflag |= CS8;
+    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+        perror("tcsetattr");
+        return 0;
+    }
+
+    terminal_restore_needed = 1;
+    atexit(terminal_restore);
+    return 1;
+#endif
+}
+
+/*
+ * Purpose:
+ *   Report whether a browser/WASM input byte is already queued. Native builds
+ *   return true because their legacy batch and terminal input paths may block.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Returns non-zero when an input byte can be read without waiting.
+ */
+int platform_char_available(void)
+{
+#if PIPBUG_WRAP_EMSCRIPTEN
+    return pipbug_browser_char_available();
+#else
+    return 1;
+#endif
+}
+
+/*
+ * Purpose:
+ *   Read one input byte through the platform input abstraction. Browser/WASM
+ *   builds poll a JavaScript FIFO and never block; native builds preserve the
+ *   existing blocking stdin/terminal behavior for batch and interactive use.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Returns the byte value 0-255, or -1 when no byte/EOF is available.
+ */
+int platform_getchar_nonblock(void)
+{
+#if PIPBUG_WRAP_EMSCRIPTEN
+    if (!platform_char_available()) return -1;
+    return pipbug_browser_getchar_nonblock();
+#elif PIPBUG_WRAP_WIN32
+    if (interactive_mode) {
+        int c = _getch();
+        return c == EOF ? -1 : (c & 0xff);
+    }
+    {
+        int c = getchar();
+        return c == EOF ? -1 : (c & 0xff);
+    }
+#else
+    if (interactive_mode) {
+        unsigned char c;
+        for (;;) {
+            ssize_t got = read(STDIN_FILENO, &c, 1);
+            if (got == 1) return c;
+            if (got == 0) return -1;
+            if (errno != EINTR) return -1;
+        }
+    }
+    {
+        int c = getchar();
+        return c == EOF ? -1 : (c & 0xff);
+    }
+#endif
+}
+
+/*
+ * Purpose:
+ *   Write one output byte through the platform output abstraction.
+ * Inputs:
+ *   ch - byte to write.
+ * Outputs:
+ *   Writes the byte to stdout.
+ */
+void platform_putchar(char ch)
+{
+    putchar((unsigned char)ch);
+}
+
+/*
+ * Purpose:
+ *   Print command-line usage information.
+ * Inputs:
+ *   prog - program name to display in the usage banner.
+ * Outputs:
+ *   None.
+ */
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
@@ -319,6 +597,8 @@ static void print_usage(const char *prog)
         "Options:\n"
         "  -t              Trace every instruction to stderr\n"
         "  -s              Step mode: pause each instruction\n"
+        "  -i              Interactive terminal mode; raw I/O, Ctrl-] exits\n"
+        "                  and defaults to unlimited instructions\n"
         "  -b 0xADDR       Breakpoint at address (hex)\n"
         "  -m 0xADDR LEN   Dump LEN bytes from address at halt\n"
         "  -n LIMIT        Instruction limit (default 5000000, 0=unlimited)\n"
@@ -331,9 +611,17 @@ static void print_usage(const char *prog)
         prog);
 }
 
+/*
+ * Purpose:
+ *   Print the wrapper version.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   None.
+ */
 static void print_version(void)
 {
-    fprintf(stderr, "pipbug_wrap v1.1\n");
+    fprintf(stderr, "pipbug_wrap v1.2\n");
 }
 
 /* ── Minimal PIPBUG stubs ─────────────────────────────────────────────────
@@ -341,36 +629,101 @@ static void print_version(void)
  *  points before each instruction fetch and handle them ourselves.
  *  After handling, we pop the RAS and continue (mimicking RETC,UN).
  */
+/*
+ * Purpose:
+ *   Return from an intercepted PIPBUG entry point by popping the RAS.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Updates IAR through pullras().
+ */
 static void pb_ret(void)
 {
     pullras();  /* pops iar from RAS, matching BSTA that called us */
 }
 
+/*
+ * Purpose:
+ *   Handle the PIPBUG COUT intercept by writing R0 to host stdout.
+ * Inputs:
+ *   R0 contains the byte to output.
+ * Outputs:
+ *   Writes one byte to stdout and returns from the intercepted call.
+ */
 static void pb_cout(void)
 {
-    putchar((unsigned char)r[0]);
+    platform_putchar((char)r[0]);
     fflush(stdout);
     pb_ret();
 }
 
-static void pb_chin(void)
+/*
+ * Purpose:
+ *   Handle the PIPBUG CHIN intercept by reading one host input byte.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Stores the input byte in R0, requests wrapper exit on EOF/Ctrl-], or
+ *   returns 0 in browser builds when no FIFO input byte is available yet.
+ */
+static int pb_chin(void)
 {
-    int c = getchar();
-    if (c == EOF) { eof_hit = 1; r[0] = 0; }
-    else          { r[0] = (UBYTE)c; }
+    int c;
+
+#if PIPBUG_WRAP_EMSCRIPTEN
+    /* Browser/WASM cannot safely block in getchar(): blocking would suspend or
+     * monopolize the single browser thread. Instead JavaScript keyboard events
+     * enqueue bytes and CHIN polls that FIFO. If it is empty, leave IAR at the
+     * CHIN entry point so the browser scheduler can retry on a later frame.
+     */
+    c = platform_getchar_nonblock();
+    if (c < 0) return 0;
+#else
+    c = platform_getchar_nonblock();
+    if (c < 0) {
+        eof_hit = 1;
+        r[0] = 0;
+        pb_ret();
+        return 1;
+    }
+#endif
+
+    if (interactive_mode && c == 0x1D) {
+        interactive_exit = 1;
+        r[0] = 0;
+    } else {
+        r[0] = (UBYTE)c;
+    }
     pb_ret();
+    return 1;
 }
 
+/*
+ * Purpose:
+ *   Handle the PIPBUG CRLF intercept by writing CR and LF to host stdout.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Writes CR/LF to stdout and returns from the intercepted call.
+ */
 static void pb_crlf(void)
 {
-    putchar('\r');
-    putchar('\n');
+    platform_putchar('\r');
+    platform_putchar('\n');
     fflush(stdout);
     pb_ret();
 }
 
 /* ── Trace / debug helpers ───────────────────────────────────────────────── */
 
+/*
+ * Purpose:
+ *   Convert the current 2650 condition-code bits into a printable name.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Returns a static string for the current condition code.
+ */
 static const char *cc_name(void)
 {
     switch (psl & PSL_CC) {
@@ -381,6 +734,14 @@ static const char *cc_name(void)
     }
 }
 
+/*
+ * Purpose:
+ *   Print the current CPU state for tracing or step mode.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Writes the formatted CPU state to stderr.
+ */
 static void print_state(void)
 {
     fprintf(stderr,
@@ -392,6 +753,14 @@ static void print_state(void)
         psu, (int)(psu & PSU_SP));
 }
 
+/*
+ * Purpose:
+ *   Print a halt/break summary and optional memory dump.
+ * Inputs:
+ *   count - number of emulated instructions executed.
+ * Outputs:
+ *   Writes the summary to stderr.
+ */
 static void print_halt_summary(long count)
 {
     fprintf(stderr, "\nHalted after %ld instructions\n", count);
@@ -411,6 +780,14 @@ static void print_halt_summary(long count)
 
 /* ── Intel HEX loader ────────────────────────────────────────────────────── */
 
+/*
+ * Purpose:
+ *   Load an Intel HEX file into emulated 2650 memory.
+ * Inputs:
+ *   filename - path to the Intel HEX file to load.
+ * Outputs:
+ *   Returns 1 when data records were loaded, otherwise 0.
+ */
 static int load_hex(const char *filename)
 {
     FILE *f = fopen(filename, "r");
@@ -440,8 +817,136 @@ static int load_hex(const char *filename)
     return 1;
 }
 
+
+#define PIPBUG_RUN_RUNNING 0
+#define PIPBUG_RUN_WAITING_INPUT 1
+#define PIPBUG_RUN_DONE 2
+
+/*
+ * Purpose:
+ *   Print final run messages exactly once when the emulator reaches a terminal
+ *   state.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Writes any final status/summary to stderr.
+ */
+static void print_final_report(void)
+{
+    if (final_report_printed) return;
+    final_report_printed = 1;
+
+    if (interactive_exit)
+        fprintf(stderr, "\n*** Ctrl-] -- interactive exit ***\n\n");
+    else if (eof_hit)
+        fprintf(stderr, "\n*** EOF on stdin -- halted ***\n\n");
+
+    if (!trace_mode && !step_mode && bp_addr < 0 && !halted &&
+        inst_limit > 0 && instruction_count < inst_limit &&
+        !eof_hit && !interactive_exit) {
+        print_halt_summary(instruction_count);
+    }
+}
+
+/*
+ * Purpose:
+ *   Mark the emulator as finished and emit final status if needed.
+ * Inputs:
+ *   None.
+ * Outputs:
+ *   Sets run_finished and prints the final report.
+ */
+static void finish_run(void)
+{
+    run_finished = 1;
+    print_final_report();
+}
+
+/*
+ * Purpose:
+ *   Execute a bounded chunk of the wrapper run loop. Browser builds call this
+ *   from requestAnimationFrame() so the WASM module never owns the browser
+ *   thread indefinitely; native builds pass 0 to run until a terminal state.
+ * Inputs:
+ *   instruction_budget - maximum CPU instructions to execute, or 0 for no
+ *                        chunk limit.
+ * Outputs:
+ *   Returns PIPBUG_RUN_RUNNING, PIPBUG_RUN_WAITING_INPUT, or PIPBUG_RUN_DONE.
+ */
+EMSCRIPTEN_KEEPALIVE int pipbug_run_chunk(int instruction_budget)
+{
+    int executed = 0;
+
+    if (run_finished) return PIPBUG_RUN_DONE;
+
+    for (;;) {
+        if (iar == cout_addr) { pb_cout(); continue; }
+        if (iar == chin_addr) {
+            if (!pb_chin()) return PIPBUG_RUN_WAITING_INPUT;
+            if (eof_hit || interactive_exit) {
+                finish_run();
+                return PIPBUG_RUN_DONE;
+            }
+            continue;
+        }
+        if (iar == crlf_addr) { pb_crlf(); continue; }
+
+        if (bp_addr >= 0 && iar == (UWORD)bp_addr) {
+            fprintf(stderr, "\n*** BREAKPOINT $%04X ***\n", bp_addr);
+            print_halt_summary(instruction_count);
+            finish_run();
+            return PIPBUG_RUN_DONE;
+        }
+
+        if (inst_limit > 0 && instruction_count >= inst_limit) {
+            fprintf(stderr, "\n*** Instruction limit (%ld) ***\n", inst_limit);
+            print_halt_summary(instruction_count);
+            finish_run();
+            return PIPBUG_RUN_DONE;
+        }
+
+        if (trace_mode) print_state();
+
+        if (step_mode) {
+            print_state();
+            fprintf(stderr, "[Enter to step, q+Enter to quit] ");
+            char buf[8];
+            if (fgets(buf, sizeof(buf), stdin) == NULL || buf[0]=='q') {
+                finish_run();
+                return PIPBUG_RUN_DONE;
+            }
+        }
+
+        oldcycles = cycles_2650;
+        opcode = memory[iar];
+        one_instruction();
+        cpu_emu();
+        instruction_count++;
+        executed++;
+
+        if (halted) {
+            fprintf(stderr, "\n*** HALT ($40) at $%04X ***\n", iar);
+            print_halt_summary(instruction_count);
+            finish_run();
+            return PIPBUG_RUN_DONE;
+        }
+
+        if (instruction_budget > 0 && executed >= instruction_budget)
+            return PIPBUG_RUN_RUNNING;
+    }
+}
+
 /* ── Main ────────────────────────────────────────────────────────────────── */
 
+/*
+ * Purpose:
+ *   Parse options, load the target HEX file, and run the PIPBUG wrapper loop.
+ * Inputs:
+ *   argc - command-line argument count.
+ *   argv - command-line argument vector.
+ * Outputs:
+ *   Returns process exit status 0 on success, non-zero on setup failure.
+ */
 int main(int argc, char **argv)
 {
     const char *hexfile = NULL;
@@ -452,6 +957,8 @@ int main(int argc, char **argv)
             trace_mode = 1;
         } else if (!strcmp(argv[i], "-s")) {
             step_mode = 1;
+        } else if (!strcmp(argv[i], "-i")) {
+            interactive_mode = 1;
         } else if (!strcmp(argv[i], "-b") && i+1 < argc) {
             bp_addr = (int)strtol(argv[++i], NULL, 16);
         } else if (!strcmp(argv[i], "-m") && i+2 < argc) {
@@ -459,6 +966,7 @@ int main(int argc, char **argv)
             dump_len  = (int)strtol(argv[++i], NULL, 10);
         } else if (!strcmp(argv[i], "-n") && i+1 < argc) {
             inst_limit = atol(argv[++i]);
+            inst_limit_set = 1;
         } else if (!strcmp(argv[i], "--chin") && i+1 < argc) {
             chin_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
         } else if (!strcmp(argv[i], "--cout") && i+1 < argc) {
@@ -485,6 +993,14 @@ int main(int argc, char **argv)
         print_usage(argv[0]);
         return 1;
     }
+    if (interactive_mode && step_mode) {
+        fprintf(stderr, "Options -i and -s cannot be used together.\n");
+        return 1;
+    }
+    if (interactive_mode && !inst_limit_set)
+        inst_limit = 0;
+    if (interactive_mode && !terminal_enable_interactive())
+        return 1;
 
     /* ── Initialise CPU state ── */
     memset(memory,   0, sizeof(memory));
@@ -508,68 +1024,21 @@ int main(int argc, char **argv)
     iar = entry_addr;
     print_version();
     fprintf(stderr,
-        "Config mode: COUT=$%04X  CHIN=$%04X  CRLF=$%04X  entry=$%04X\n",
-        cout_addr, chin_addr, crlf_addr, entry_addr);
+        "Config mode: COUT=$%04X  CHIN=$%04X  CRLF=$%04X  entry=$%04X%s  limit=%s\n",
+        cout_addr, chin_addr, crlf_addr, entry_addr,
+        interactive_mode ? "  interactive=on" : "",
+        inst_limit > 0 ? "set" : "unlimited");
 
     /* ── Run loop ── */
-    long count = 0;
-    for (;;) {
-        /* PIPBUG entry-point intercepts (before instruction fetch) */
-        if (iar == cout_addr) { pb_cout(); continue; }
-        if (iar == chin_addr) { pb_chin(); if (eof_hit) break; continue; }
-        if (iar == crlf_addr) { pb_crlf(); continue; }
-
-        /* Breakpoint check */
-        if (bp_addr >= 0 && iar == (UWORD)bp_addr) {
-            fprintf(stderr, "\n*** BREAKPOINT $%04X ***\n", bp_addr);
-            print_halt_summary(count);
-            break;
-        }
-
-        /* Instruction limit */
-        if (inst_limit > 0 && count >= inst_limit) {
-            fprintf(stderr, "\n*** Instruction limit (%ld) ***\n", inst_limit);
-            print_halt_summary(count);
-            break;
-        }
-
-        /* Trace */
-        if (trace_mode) print_state();
-
-        /* Step mode: pause, wait for Enter */
-        if (step_mode) {
-            print_state();
-            fprintf(stderr, "[Enter to step, q+Enter to quit] ");
-            char buf[8];
-            if (fgets(buf, sizeof(buf), stdin) == NULL || buf[0]=='q') break;
-        }
-
-        /* Execute one instruction.
-         * Under -DGAMER, one_instruction() only fetches opcode into `opcode`
-         * and advances nothing. cpu_emu() does the actual decode and IAR advance.
-         * We call both so any future non-GAMER sections still work.          */
-        oldcycles = cycles_2650;
-        opcode = memory[iar];   /* one_instruction() does this but we need it before cpu_emu() */
-        one_instruction();      /* fetches opcode; no-ops all #ifndef GAMER blocks             */
-        cpu_emu();              /* decodes and executes; advances IAR via ONE/TWO/THREE_BYTES  */
-        count++;
-
-        /* HALT check */
-        if (halted) {
-            fprintf(stderr, "\n*** HALT ($40) at $%04X ***\n", iar);
-            print_halt_summary(count);
-            break;
-        }
-    }
-
-    if (eof_hit)
-        fprintf(stderr, "\n*** EOF on stdin -- halted ***\n\n");
-
-    /* Final state on clean exit */
-    if (!trace_mode && !step_mode && bp_addr < 0 && !halted &&
-        inst_limit > 0 && count < inst_limit && !eof_hit) {
-        print_halt_summary(count);
-    }
-
+#if PIPBUG_WRAP_EMSCRIPTEN
+    /* In browser builds, main() only initializes state. JavaScript drives
+     * execution with pipbug_run_chunk() from requestAnimationFrame(), allowing
+     * keyboard events to fill the FIFO between chunks.
+     */
     return 0;
+#else
+    while (!run_finished)
+        (void)pipbug_run_chunk(0);
+    return 0;
+#endif
 }
