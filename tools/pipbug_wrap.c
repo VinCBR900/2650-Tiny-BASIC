@@ -317,9 +317,14 @@ TEXT   asciiname_short[259][3 + 1];
 ASCREEN screen[1][1];           /* dummy — BOXWIDTH/BOXHEIGHT unknown */
 const STRPTR pristring[32] = {0};
 
-/* Forward declarations for static functions in 2650.c that are called before
-   their definition in GAMER mode (no #ifndef GAMER guard on the call sites) */
+/* Forward declarations for functions in 2650.c that are called before their
+   definition in GAMER mode (no #ifndef GAMER guard on the call sites). */
 static void logindirectbios(void);
+EXPORT void one_instruction(void);
+EXPORT void do_tape(void);
+EXPORT void pullras(void);
+EXPORT void pushras(void);
+EXPORT void checkinterrupt(void);
 
 /* ── Include the WinArcadia CPU core ───────────────────────────────────────
  *  Keep WinArcadia's own WIN32 sections disabled in this standalone wrapper.
