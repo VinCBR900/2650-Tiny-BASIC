@@ -80,6 +80,7 @@ A tokeniser saves RAM (shorter stored programs) and speeds execution (no re-pars
 ## Credits & Similar Projects
 
 - **jim11662418** nice modern 2650 SBC - [https://github.com/jim11662418/Signetics_2650_Single_Board_Computer](https://github.com/jim11662418/Signetics_2650_Single_Board_Computer)
+- **2650 Restoration Project** for keeping this alive [https://ztpe.nl/2650/](https://ztpe.nl/2650/)
 - **[Claude AI](https://claude.ai)** for making it possible for a non-expert to ship something that had been on the back burner since 1989.
 
 ---
