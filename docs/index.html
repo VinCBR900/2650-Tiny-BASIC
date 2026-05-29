@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>uBASIC 2650 Browser Runner</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111827;
+      --panel: #1f2937;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #60a5fa;
+      --danger: #f87171;
+      --ok: #34d399;
+      --border: #374151;
+    }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 1.5rem;
+    }
+    h1 { margin: 0 0 .25rem; }
+    p { color: var(--muted); }
+    .controls, .help {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: .75rem;
+      padding: 1rem;
+      margin: 1rem 0;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: .75rem;
+      align-items: end;
+    }
+    label { display: block; font-weight: 600; margin-bottom: .35rem; }
+    select, input, button {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: .5rem;
+      padding: .65rem .75rem;
+      background: #0b1220;
+      color: var(--text);
+      font: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: #1d4ed8;
+      border-color: #2563eb;
+      font-weight: 700;
+    }
+    button.secondary { background: #374151; border-color: #4b5563; }
+    button.stop { background: #991b1b; border-color: #b91c1c; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    #terminal {
+      min-height: 28rem;
+      white-space: pre-wrap;
+      overflow: auto;
+      background: #020617;
+      color: #d1fae5;
+      border: 1px solid var(--border);
+      border-radius: .75rem;
+      padding: 1rem;
+      font: 15px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      outline: none;
+    }
+    #terminal:focus { border-color: var(--accent); box-shadow: 0 0 0 2px #2563eb55; }
+    .status { color: var(--muted); margin-top: .5rem; }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--danger); }
+    code { color: #bfdbfe; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>uBASIC 2650</h1>
+  <p>Run the pre-assembled Tiny BASIC interpreter in your browser. Click Start, then type in the terminal. Use <code>Ctrl-]</code> or Stop to exit.</p>
+
+  <section class="controls">
+    <div class="row">
+      <div>
+        <label for="program">Program</label>
+        <select id="program">
+          <option value="assets/uBASIC2650.hex" selected>uBASIC2650.hex</option>
+        </select>
+      </div>
+      <div>
+        <label for="args">Command-line options</label>
+        <input id="args" value="-i" spellcheck="false" aria-describedby="args-help">
+      </div>
+      <div>
+        <button id="start">Start BASIC</button>
+      </div>
+      <div>
+        <button id="stop" class="stop" disabled>Stop (Ctrl-])</button>
+      </div>
+      <div>
+        <button id="clear" class="secondary">Clear Output</button>
+      </div>
+    </div>
+    <p id="args-help">The selected HEX file is appended automatically. Interactive browser runs normally use <code>-i</code>; add advanced options such as <code>--entry 0x0440</code> if needed.</p>
+    <div id="status" class="status">Ready.</div>
+  </section>
+
+  <pre id="terminal" tabindex="0" aria-label="uBASIC terminal output"></pre>
+
+  <section class="help">
+    <strong>GitHub Pages note:</strong>
+    This page is intended to be served from the repository's <code>/docs</code> folder. If running locally, use <code>make -C docs serve</code> rather than opening the file directly.
+  </section>
+</main>
+
+<script>
+(() => {
+  const terminal = document.getElementById('terminal');
+  const status = document.getElementById('status');
+  const startButton = document.getElementById('start');
+  const stopButton = document.getElementById('stop');
+  const clearButton = document.getElementById('clear');
+  const argsInput = document.getElementById('args');
+  const programSelect = document.getElementById('program');
+
+  let running = false;
+  let moduleLoader = null;
+  let inputQueue = [];
+  let currentModule = null;
+  let animationFrame = null;
+
+  const CHUNK_INSTRUCTIONS = 20000;
+  const RUN_RUNNING = 0;
+  const RUN_WAITING_INPUT = 1;
+  const RUN_DONE = 2;
+
+  function setStatus(message, kind = '') {
+    status.textContent = message;
+    status.className = `status ${kind}`.trim();
+  }
+
+  function append(text) {
+    terminal.textContent += text;
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  let lastOutputWasCR = false;
+
+  function appendChar(ch) {
+    ch &= 0xff;
+    if (ch === 0x0d) {
+      terminal.textContent += '\n';
+      lastOutputWasCR = true;
+    } else if (ch === 0x0a) {
+      if (!lastOutputWasCR) terminal.textContent += '\n';
+      lastOutputWasCR = false;
+    } else {
+      terminal.textContent += String.fromCharCode(ch);
+      lastOutputWasCR = false;
+    }
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
+  function enqueueByte(byte) {
+    inputQueue.push(byte & 0xff);
+  }
+
+  /* Browser/WASM must not use blocking stdin: a blocking getchar()-style read
+   * either suspends the runtime or monopolizes the single browser thread.
+   * Keyboard events therefore append bytes to this FIFO, and the C emulator
+   * polls it from small requestAnimationFrame()-driven execution chunks.
+   */
+  function charAvailable() {
+    return inputQueue.length > 0;
+  }
+
+  function getCharNonblock() {
+    return inputQueue.length ? inputQueue.shift() : -1;
+  }
+
+  function keyToByte(event) {
+    if (event.ctrlKey && event.key === ']') return 0x1d;
+    if (event.key === 'Enter') return 0x0d;
+    if (event.key === 'Backspace') return 0x08;
+    if (event.key === 'Tab') return 0x09;
+    if (event.key === 'Escape') return 0x1b;
+    if (event.ctrlKey && event.key.length === 1) {
+      const code = event.key.toUpperCase().charCodeAt(0);
+      if (code >= 64 && code <= 95) return code - 64;
+    }
+    if (!event.ctrlKey && !event.metaKey && event.key.length === 1)
+      return event.key.charCodeAt(0) & 0xff;
+    return null;
+  }
+
+  function parseArgs(text) {
+    const args = [];
+    const re = /"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)'|(\S+)/g;
+    let match;
+    while ((match = re.exec(text)) !== null) {
+      args.push((match[1] ?? match[2] ?? match[3]).replace(/\\(["'\\])/g, '$1'));
+    }
+    return args;
+  }
+
+  function loadRuntimeScript() {
+    if (window.createPipbugWrapModule) return Promise.resolve();
+    if (moduleLoader) return moduleLoader;
+    moduleLoader = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'assets/pipbug_wrap.js';
+      script.onload = resolve;
+      script.onerror = () => reject(new Error('Could not load assets/pipbug_wrap.js. Build with `make -C docs` and serve the docs folder.'));
+      document.head.appendChild(script);
+    });
+    return moduleLoader;
+  }
+
+  function finishProgram(message, kind = 'ok') {
+    running = false;
+    currentModule = null;
+    if (animationFrame !== null) {
+      cancelAnimationFrame(animationFrame);
+      animationFrame = null;
+    }
+    startButton.disabled = false;
+    stopButton.disabled = true;
+    setStatus(message, kind);
+    terminal.focus();
+  }
+
+  function driveEmulator() {
+    if (!running || !currentModule) return;
+
+    let state;
+    try {
+      state = currentModule._pipbug_run_chunk(CHUNK_INSTRUCTIONS);
+    } catch (error) {
+      append(`\n[Browser runner error] ${error.message}\n`);
+      finishProgram(error.message, 'err');
+      return;
+    }
+
+    if (state === RUN_DONE) {
+      finishProgram('Program exited.', 'ok');
+      return;
+    }
+
+    setStatus(state === RUN_WAITING_INPUT ? 'Waiting for input...' : 'Running...', 'ok');
+    animationFrame = requestAnimationFrame(driveEmulator);
+  }
+
+  async function runProgram() {
+    if (running) return;
+    running = true;
+    currentModule = null;
+    startButton.disabled = true;
+    stopButton.disabled = false;
+    inputQueue = [];
+    lastOutputWasCR = false;
+    terminal.textContent = '';
+    terminal.focus();
+    setStatus('Loading runtime...', '');
+
+    try {
+      await loadRuntimeScript();
+      const programUrl = programSelect.value;
+      const hexText = await fetch(programUrl).then(response => {
+        if (!response.ok) throw new Error(`Could not fetch ${programUrl}: ${response.status}`);
+        return response.text();
+      });
+
+      const module = await window.createPipbugWrapModule({
+        noInitialRun: true,
+        locateFile: path => path.endsWith('.wasm') ? `assets/${path}` : path,
+        print: text => append(`${text}\n`),
+        printErr: text => append(`${text}\n`),
+        pipbugCharAvailable: charAvailable,
+        pipbugGetcharNonblock: getCharNonblock,
+        pipbugPutchar: appendChar
+      });
+
+      const hexPath = '/uBASIC2650.hex';
+      module.FS.writeFile(hexPath, hexText);
+      const args = parseArgs(argsInput.value);
+      args.push(hexPath);
+      setStatus(`Running: pipbug_wrap ${args.join(' ')}`, 'ok');
+      const result = module.callMain(args);
+      if (typeof result === 'number' && result !== 0) throw new Error(`pipbug_wrap initialization failed with status ${result}`);
+      currentModule = module;
+      animationFrame = requestAnimationFrame(driveEmulator);
+    } catch (error) {
+      append(`\n[Browser runner error] ${error.message}\n`);
+      finishProgram(error.message, 'err');
+    }
+  }
+
+  terminal.addEventListener('keydown', event => {
+    if (!running) return;
+    const byte = keyToByte(event);
+    if (byte === null) return;
+    event.preventDefault();
+    enqueueByte(byte);
+  });
+
+  startButton.addEventListener('click', runProgram);
+  stopButton.addEventListener('click', () => enqueueByte(0x1d));
+  clearButton.addEventListener('click', () => { terminal.textContent = ''; terminal.focus(); });
+})();
+</script>
+</body>
+</html>
