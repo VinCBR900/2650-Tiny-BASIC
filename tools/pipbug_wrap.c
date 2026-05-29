@@ -71,6 +71,9 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#ifndef ENABLE_EXTENDED_FLAGS
+#define ENABLE_EXTENDED_FLAGS 0x0080
+#endif
 #elif !PIPBUG_WRAP_EMSCRIPTEN
 #include <errno.h>
 #include <termios.h>
@@ -393,6 +396,14 @@ EM_JS(int, pipbug_browser_getchar_nonblock, (void), {
         return Module.pipbugGetcharNonblock();
     return -1;
 });
+
+EM_JS(int, pipbug_browser_putchar, (int ch), {
+    if (typeof Module !== 'undefined' && Module.pipbugPutchar) {
+        Module.pipbugPutchar(ch & 0xff);
+        return 1;
+    }
+    return 0;
+});
 #endif
 
 /*
@@ -571,14 +582,19 @@ int platform_getchar_nonblock(void)
 
 /*
  * Purpose:
- *   Write one output byte through the platform output abstraction.
+ *   Write one output byte through the platform output abstraction. Emscripten
+ *   uses an optional JS hook to avoid stdout line buffering and display
+ *   terminal output character-by-character.
  * Inputs:
  *   ch - byte to write.
  * Outputs:
- *   Writes the byte to stdout.
+ *   Writes the byte to stdout or the browser terminal callback.
  */
 void platform_putchar(char ch)
 {
+#if PIPBUG_WRAP_EMSCRIPTEN
+    if (pipbug_browser_putchar((unsigned char)ch)) return;
+#endif
     putchar((unsigned char)ch);
 }
 
@@ -687,6 +703,12 @@ static int pb_chin(void)
         return 1;
     }
 #endif
+
+    /* PIPBUG and Tiny BASIC expect CR (0x0D) to terminate input lines.
+     * Mapping LF to CR keeps standard text-file batch input and browser Enter
+     * keys compatible without changing existing CR-terminated input.
+     */
+    if (c == '\n') c = '\r';
 
     if (interactive_mode && c == 0x1D) {
         interactive_exit = 1;

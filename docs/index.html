@@ -151,6 +151,23 @@
     terminal.scrollTop = terminal.scrollHeight;
   }
 
+  let lastOutputWasCR = false;
+
+  function appendChar(ch) {
+    ch &= 0xff;
+    if (ch === 0x0d) {
+      terminal.textContent += '\n';
+      lastOutputWasCR = true;
+    } else if (ch === 0x0a) {
+      if (!lastOutputWasCR) terminal.textContent += '\n';
+      lastOutputWasCR = false;
+    } else {
+      terminal.textContent += String.fromCharCode(ch);
+      lastOutputWasCR = false;
+    }
+    terminal.scrollTop = terminal.scrollHeight;
+  }
+
   function enqueueByte(byte) {
     inputQueue.push(byte & 0xff);
   }
@@ -247,6 +264,7 @@
     startButton.disabled = true;
     stopButton.disabled = false;
     inputQueue = [];
+    lastOutputWasCR = false;
     terminal.textContent = '';
     terminal.focus();
     setStatus('Loading runtime...', '');
@@ -265,7 +283,8 @@
         print: text => append(`${text}\n`),
         printErr: text => append(`${text}\n`),
         pipbugCharAvailable: charAvailable,
-        pipbugGetcharNonblock: getCharNonblock
+        pipbugGetcharNonblock: getCharNonblock,
+        pipbugPutchar: appendChar
       });
 
       const hexPath = '/uBASIC2650.hex';
