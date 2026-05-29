@@ -63,8 +63,11 @@
     button.stop { background: #991b1b; border-color: #b91c1c; }
     button:disabled { opacity: .55; cursor: not-allowed; }
     #terminal {
-      min-height: 28rem;
-      white-space: pre-wrap;
+      box-sizing: content-box;
+      width: 80ch;
+      max-width: calc(100% - 2rem);
+      height: calc(25 * 1.35em);
+      white-space: pre;
       overflow: auto;
       background: #020617;
       color: #d1fae5;
@@ -112,7 +115,7 @@
     <div id="status" class="status">Ready.</div>
   </section>
 
-  <pre id="terminal" tabindex="0" aria-label="uBASIC terminal output"></pre>
+  <pre id="terminal" tabindex="0" aria-label="uBASIC 80 by 25 terminal output"></pre>
 
   <section class="help">
     <strong>GitHub Pages note:</strong>
