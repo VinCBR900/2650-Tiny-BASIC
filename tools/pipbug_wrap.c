@@ -1051,6 +1051,8 @@ int main(int argc, char **argv)
         interactive_mode ? "  interactive=on" : "",
         inst_limit > 0 ? "set" : "unlimited");
 
+    if(interactive_mode) fprintf(stderr,"\n*** Press Ctrl-] to exit Interactive Mode ***\n");
+   
     /* ── Run loop ── */
 #if PIPBUG_WRAP_EMSCRIPTEN
     /* In browser builds, main() only initializes state. JavaScript drives
