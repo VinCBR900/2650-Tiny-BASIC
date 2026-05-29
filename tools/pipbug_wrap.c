@@ -1,5 +1,5 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
- * Version: 1.2
+ * Version: 2.0
  * Date:    2026-05-28
  *
  * Purpose:
@@ -34,7 +34,7 @@
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
- *   v1.2  Added cross-platform interactive terminal mode (-i) with raw
+ *   v2.0  Added cross-platform interactive terminal mode (-i) with raw
  *         byte input/output and Ctrl-] graceful exit. Browser builds use
  *         non-blocking FIFO polling so WASM never blocks the event loop.
  *   v1.1  Added configurable program entry address switch (--entry),
@@ -637,7 +637,7 @@ static void print_usage(const char *prog)
  */
 static void print_version(void)
 {
-    fprintf(stderr, "pipbug_wrap v1.2\n");
+    fprintf(stderr, "pipbug_wrap v2.0\n");
 }
 
 /* ── Minimal PIPBUG stubs ─────────────────────────────────────────────────
