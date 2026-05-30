@@ -326,14 +326,9 @@ DO_END:
         LODI,R0 $FF
         STRA,R0 SWSP
         EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG
         STRA,R0 GOTOFLG
-        ; drop through
-
-;  DO_REM - do nothing 
-PRTSTR_RET:
-DO_REM:
-        RETC,UN
+        ;STRA,R0 RUNFLG
+        BCTA,UN CLR_RUNFLG      ; tail call
 
 ;  DO_PRINT combined with PRTSTR 
 ; PRINT [item1][;]...[itemx][;]    
@@ -471,6 +466,9 @@ DL_NC:
         BSTA,UN INC_TMP
         LODA,R0 EXPL
         STRA,R0 *TMPH  ; store lo
+;  DO_REM - do nothing 
+PRTSTR_RET:
+DO_REM:
         RETC,UN
 
 ;  DO_INPUT 
@@ -578,9 +576,12 @@ DIF_ANDTEST:
         RETC,EQ ; DIF_FALSE                ; zero  no bit match  condition false
         BCTA,UN STMT_EXEC                ; [+1]  execute THEN body
 
+; Do_GOTO allows computed gotos - no worse for RAS than
+; if expr then print expr
+; if expr then goto expr
 DO_GOTO:
         BSTA,UN WSKIP
-        BSTA,UN PARSE_U16                ; [+1]
+        BSTA,UN PARSE_EXPR                 ; [+1]
         LODA,R0 EXPH
         STRA,R0 GOTOH
         LODA,R0 EXPL
@@ -589,10 +590,10 @@ DO_GOTO:
         STRA,R0 GOTOFLG
         LODA,R0 RUNFLG                   ; OPT-10: RUNFLG=0EQ, 1GT
         RETC,GT                  ; return if running (was COMI $01/RETC,EQ)
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG  ; start run if in immediate mode
-        RETC,UN
-
+        ;EORZ,R0 ; Clear R0
+        ;STRA,R0 RUNFLG  ; start run if in immediate mode
+        ;RETC,UN
+        BCTA,UN CLR_RUNFLG
 
 DO_LIST:
         LODI,R0 <PROG
@@ -697,8 +698,11 @@ DR_CPY:
         BCTR,UN DR_CPY
 DR_CD:
         BSTA,UN INC_TMP          ; skip past CR in store
-        LODI,R1 NUL
-        STRA,R1 *IPH  ; NUL-terminate IBUF
+        ;LODI,R1 NUL
+        ;STRA,R1 *IPH  ; NUL-terminate IBUF
+        EORZ,R0
+        STRA,R0 *IPH  ; NUL-terminate IBUF
+        
         ; SC0:SC1. SC0 and SC1 are scratch bytes clobbered by STMT_EXEC (used
         ; by PRINT_S16, STORE_LINE, parser, etc.).  SWSTK is the GOSUB return
         ; SWSP=$FF (empty) and GOSUB is not yet implemented.
@@ -737,6 +741,8 @@ DR_GOTO:
         BSTA,UN FIND_LINE                ; [+1]
         BCTA,UN DR_LP
 DR_STOP:
+        ; drop through
+CLR_RUNFLG:
         EORZ,R0 ; Clear R0
         STRA,R0 RUNFLG
         RETC,UN
@@ -930,9 +936,10 @@ SL_NOSHIFT:
 SL_WBODY:
         LODA,R1 *TMPH
         BCTR,EQ SL_WDONE
-        STRA,R1 *EXPH
-        BSTA,UN INC_TMP
-        BSTA,UN INC_EXP
+        ;STRA,R1 *EXPH
+        ;BSTA,UN INC_TMP
+        ;BSTA,UN INC_EXP
+        BSTA,UN TMP2EXP
         BCTR,UN SL_WBODY
 SL_WDONE:
         LODI,R0 CR
@@ -997,12 +1004,13 @@ DL2_LP:
         SUBA,R0 PEL
         TPSL $01                         ; C=1  TMPL >= PEL  done
         BCTR,EQ DL2_DONE
-        BCTR,UN DL2_MOV
+        ;BCTR,UN DL2_MOV
 DL2_MOV:
-        LODA,R1 *TMPH
-        STRA,R1 *EXPH
-        BSTA,UN INC_TMP
-        BSTA,UN INC_EXP
+        ;LODA,R1 *TMPH
+        ;STRA,R1 *EXPH
+        ;BSTA,UN INC_TMP
+        ;BSTA,UN INC_EXP
+        BSTR,UN TMP2EXP
         BCTR,UN DL2_LP
 DL2_DONE:
         ; PE -= SC0
@@ -1014,6 +1022,14 @@ DL2_DONE:
         LODA,R0 PEH
         SUBI,R0 1
         STRA,R0 PEH
+        RETC,UN
+
+; Copy Single byte *EXP++ = *TMP++; 
+TMP2EXP:
+        LODA,R1 *TMPH
+        STRA,R1 *EXPH
+        BSTA,UN INC_TMP
+        BSTA,UN INC_EXP
         RETC,UN
 
 ;  FIND_LINE 
@@ -1757,54 +1773,54 @@ PU16_MNC:
 PU16_DIG_NC:
         BCTA,UN PU16_LP
 
-;  OPT-15: Shared sign-handling subroutines 
-; NEG_EXP: negate EXPH:EXPL if NEGFLG=0. Clobbers R0.
-; NEG_EXP_BODY: unconditional negate (no NEGFLG check). Clobbers R0.
+; NEG_EXP: negate EXPH:EXPL if NEGFLG=0. Clobbers R0, R1.
+; NEG_EXP_BODY: unconditional negate. Clobbers R0, R1.
 NEG_EXP:
         LODA,R0 NEGFLG
         RETC,EQ                          ; NEGFLG=0  nothing to do
 NEG_EXP_BODY:                            ; entry for unconditional negate
-        LODA,R0 EXPH
-        EORI,R0 $FF
-        STRA,R0 EXPH
-        LODA,R0 EXPL
-        EORI,R0 $FF
-        STRA,R0 EXPL
-        BCTA,UN INC_EXP                  ; tail-call: INC_EXP returns to caller
+        LODI,R1 4                        ; R1 = 4 (Offset for EXPH/EXPL from IP)
+        BCTR,UN NEG_SHARED
 
-; ABS_TMP: abs(TMPH:TMPL) in place; set NEGFLG=1 if was negative. Clobbers R0.
+; ABS_TMP: abs(TMPH:TMPL) in place; set NEGFLG=1 if was negative. 
 ; Input:  TMPH:TMPL = signed 16-bit value, NEGFLG already cleared by caller.
-; Output: TMPH:TMPL = |input|, NEGFLG=1 if input was negative (else unchanged).
-; ABS_TMP — absolute value of TMPH:TMPL; set NEGFLG=1 if input was negative.
-; In:  TMPH:TMPL = signed 16-bit; NEGFLG cleared by caller.
-; Out: TMPH:TMPL = |value|; NEGFLG=1 if was negative, else unchanged.
-; Clobbers: R0.
+; Output: TMPH:TMPL = |input|, NEGFLG=1 if input was negative.
+; Clobbers: R0, R1.
 ABS_TMP:
         LODA,R0 TMPH
         ANDI,R0 $80
         RETC,EQ                          ; positive → return, NEGFLG unchanged
-        LODA,R0 TMPH
-        EORI,R0 $FF
-        STRA,R0 TMPH
-        LODA,R0 TMPL
-        EORI,R0 $FF
-        STRA,R0 TMPL
         LODI,R0 1
-        STRA,R0 NEGFLG                   ; set flag BEFORE tail-call (saves RAS slot)
-        BCTA,UN INC_TMP                  ; tail-call: +1 completes two's complement
+        STRA,R0 NEGFLG                   ; set flag BEFORE tail-call
+        LODI,R1 2                        ; R1 = 2 (Offset for TMPH/TMPL from IP)
+        ; Fall through to NEG_SHARED
+
+; --- Shared Negation Core ---
+; In: R1 = offset (4 for EXP, 2 for TMP)
+; Out: 1's complement applied. Jumps to INC_ET for 2's complement.
+NEG_SHARED:
+        LODA,R0 IPH,R1                   ; Accesses IPH+4 (EXPH) or IPH+2 (TMPH)
+        EORI,R0 $FF
+        STRA,R0 IPH,R1
+        LODA,R0 IPL,R1                   ; Accesses IPL+4 (EXPL) or IPL+2 (TMPL)
+        EORI,R0 $FF
+        STRA,R0 IPL,R1
+        LODZ R1                          ; R0 <- R1 (1 byte move! Puts offset in R0 for INC_ET)
+        BCTA,UN INC_ET                   ; Tail-call to your existing bank-switching INC routine
 
 ; ABS_EXP — absolute value of EXPH:EXPL; toggle NEGFLG if input was negative.
 ; In:  EXPH:EXPL = signed 16-bit.
 ; Out: EXPH:EXPL = |value|; NEGFLG toggled if was negative, else unchanged.
-; Clobbers: R0.
+; Clobbers: R0, R1.
 ABS_EXP:
         LODA,R0 EXPH
         ANDI,R0 $80
         RETC,EQ                          ; positive → return, NEGFLG unchanged
         LODA,R0 NEGFLG
         EORI,R0 $01
-        STRA,R0 NEGFLG                   ; toggle flag BEFORE tail-call (saves RAS slot)
-        BCTA,UN NEG_EXP_BODY             ; tail-call: negate EXPH:EXPL + INC_EXP
+        STRA,R0 NEGFLG                   ; toggle flag BEFORE tail-call
+        LODI,R1 4                        ; R1 = 4 (Offset for EXPH/EXPL from IP)
+        BCTR,UN NEG_SHARED
 
 ;  MUL16 
 ; Signed TMPH:TMPL  EXPH:EXPL  EXPH:EXPL  (16-bit two's complement wrap)
@@ -2136,8 +2152,10 @@ RL_BSNB:
         BSTA,UN COUT
         BCTA,UN RL_LP
 RL_EOL:
-        LODI,R1 NUL
-        STRA,R1 *IPH            ; NUL-terminate buffer
+        ;LODI,R1 NUL
+        ;STRA,R1 *IPH            ; NUL-terminate buffer
+        EORZ,R0
+        STRA,R0 *IPH            ; NUL-terminate buffer
         BSTA,UN PRT_CR
         BCTA,UN PRT_LF
 
@@ -2273,8 +2291,9 @@ DO_ERROR:
         STRA,R0 SC0                      ; save error code
         LODA,R0 RUNFLG
         STRA,R0 SC1  ; save run state
-        EORZ,R0 ; Clear R0
-        STRA,R0 RUNFLG  ; clear run
+        ;EORZ,R0 ; Clear R0
+        ;STRA,R0 RUNFLG  ; clear run
+        BSTA,UN CLR_RUNFLG ; clear run
         LODI,R0 $FF
         STRA,R0 SWSP  ; clear GOSUB stack
         BSTR,UN PRT_QUEST
