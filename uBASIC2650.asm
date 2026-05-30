@@ -1,121 +1,95 @@
-; uBASIC2650.asm    Tiny BASIC for Signetics 2650
+; uBASIC2650.asm  —  Tiny BASIC interpreter for Signetics 2650
 ; Version: v2.7
-; Date:    2026-05-24
+; Date:    2026-05-30
 ;
-; Target: PIPBUG 1 monitor (1kB ROM $0000-$03FF, 64B RAM $0400-$043F)
-;   Code base $0440.
-;   I/O via PIPBUG ROM entry points (BSTA,UN):
-;     COUT $02B4   output char in R0
-;     CHIN $0286   blocking input, char returned in R0
-;     Note we dont use PIPBUG CRLF as this uses 1 RAS slot
+; Target : PIPBUG 1 monitor (ROM $0000-$03FF, RAM $0400-$043F)
+;          Code base $0440.  Single 8192-byte address page (bit15-13 always 0).
+;          I/O via PIPBUG ROM stubs: COUT=$02B4 (R0=char), CHIN=$0286 (R0←key).
+;          CRLF inlined (2 bytes) — avoids consuming a RAS slot vs PIPBUG CRLF.
 ;
-; Assembler: asm2650.c v1.8   Simulator: pipbug_wrap v1.1
+; Assembler: asm2650.c v1.8+   Simulator: pipbug_wrap v1.1
 ; Build:
 ;   gcc -Wall -O2 -o asm2650 asm2650.c
 ;   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
 ;   ./asm2650 uBASIC2650.asm uBASIC2650.hex
 ;   ./pipbug_wrap uBASIC2650.hex
 ;
-;  CC SEMANTICS (2650 ALU) 
-;   ADD: result>=128LT  result>0,<128GT  result=0EQ
-;   SUB: result>=128LT  result>0,<128GT  result=0EQ
-;   Carry bit (PSL bit 0) set independently: C=1 means carry/no-borrow.
-;   CORRECT carry skip: TPSL $01 then RETC,LT / BCTA,LT = branch if C=0.
-;   UNSIGNED compare: PPSL $02 / COMA or SUBA / CPSL $02 (sets CC unsigned).
-;   WRONG: BCTA,GT after SUBA when values may span $7F/$80 boundary.
+; ── CC SEMANTICS (2650 ALU) ──────────────────────────────────────────────────
+;   ADD/SUB: result≥128→LT  result>0,<128→GT  result=0→EQ
+;   Carry bit (PSL bit 0): C=1 = carry / no-borrow (independent of CC).
+;   Carry test: TPSL $01  →  CC=EQ if C=1 (carry), CC=LT if C=0 (no carry).
+;   Carry skip: RETC,LT / BCTA,LT = branch if C=0 (no carry).
+;   Unsigned compare: PPSL $02 / COMA or SUBA / CPSL $02.
+;   Binary flag (0 or 1): after LODA CC=EQ(0) or GT(1); use BCTR,GT not COMI $01.
+;   Single page: all addresses $0000-$1FFF; hi-byte carry in stack indexing impossible.
 ;
-;  HI/LO OPERATOR CONVENTION 
-;   <ADDR = HIGH byte (bits 15:8)   e.g. <$1A34 = $1A
-;   >ADDR = LOW  byte (bits  7:0)   e.g. >$1A34 = $34
+; ── HI/LO OPERATOR CONVENTION ────────────────────────────────────────────────
+;   <ADDR = HIGH byte (bits 15:8)   e.g. <$1634 = $16
+;   >ADDR = LOW  byte (bits  7:0)   e.g. >$1634 = $34
 ;
-;  RAS DEPTH BUDGET (Silly 8-level hardware stack) 
-;   All BSxx instructions (BSTA/BSTR/BSTA/BSFA/BSFR) consume a RAS slot
-;   PIPBUG COUT/CHIN used 1 interal sub for delay. 
-;   Safe max user call depth from REPL: 5 levels.
-;   Deepest working path: REPL(0)STMT_EXEC(1)DO_IF(2)STMT_EXEC(3)
-;     DO_PRINT(4)PARSE_EXPR(5)PARSE_FACTOR(6)PARSE_S16(7) 
+; ── RAS DEPTH BUDGET (8-level hardware stack) ────────────────────────────────
+;   Every BSxx (BSTA/BSTR/BSFA/BSFR) consumes one slot regardless of condition.
+;   BCTA/BCTR/BCFA/BCFR are plain branches — no RAS cost.
+;   COUT/CHIN use 1 internal sub: add 1 to caller depth.
+;   Deepest path: DR_LP(1)→STMT_EXEC(2)→DO_IF(2)→PARSE_EXPR(3)
+;     →PARSE_FACTOR(4)→PARSE_S16(5)→PARSE_U16(6)→[inline] SP=6. Safe.
+;   With THEN body: DR_LP(1)→SE(2)→DO_IF(2)→SE(3)→DO_PRINT(3)
+;     →PARSE_EXPR(4)→APPLY_OP(5)→MUL16(6)→ABS_TMP(6,tail) SP=6. Safe.
 ;
-;  SCRATCH REGISTER ALLOCATION 
-;   R0        working register, arithmetic, I/O
-;   R1        index register; also PRINT_S16 digit buffer index (P16BUF)
-;   R2        long-lived scratch (DO_LET var letter)
-;   R3        loop counter (BDRR/BIRR); SW stack index
-;   SC0:SC1   general scratch (clobbered by STMT_EXEC  not inter-statement safe)
-;   SWSTK[0:1] ($162E:$162F)  DO_RUN next-line-pointer save across STMT_EXEC
-;   LNUMH:LNUML  scratch line number; save area in DO_LIST (BUG-BASIC-12 fix)
-;   TMPH:TMPL  general 16-bit temp; clobbered by PRINT_S16 (BUG-BASIC-12 fix)
-;   IPH:IPL   - *ptr character is each line to parse
-;   EXPH:EXPL - results from expressions for printing       
+; ── SCRATCH REGISTER CONVENTIONS ─────────────────────────────────────────────
+;   R0  working register, arithmetic, I/O.
+;   R1  index register (LODA/STRA BASE,R1); also PRINT_S16 digit buffer index.
+;       Clobbered by INC_ET (INC_TMP/INC_EXP shared body). Callers verified safe.
+;   R2  long-lived variable letter (DO_LET/DO_INPUT, preserved across PARSE_EXPR).
+;       Never written by any subroutine except DO_LET and SE_BAREASS.
+;   R3  loop counter (BDRR/BIRR); STORE_LINE shift count.
 ;
-;  KNOWN OPEN BUGS (as of v2.5, 2026-05-22) 
-; BUG-COLON-01 (OPEN  workaround in place):
-;   Multi-statement separator ':' not supported e.g. "A=1:GOTO 10".
-;         Likely never due to RAS limitations.
+; ── KNOWN OPEN ITEMS ─────────────────────────────────────────────────────────
+;   COLON-01: ':' multi-statement separator not supported ("A=1:GOTO 10").
+;             Unlikely to be implemented — would consume a RAS slot per statement.
+;   OPT-1:    INC_ET PPSL/CPSL RS removal causes LIST/RUN failure; cause unknown.
+;   OPT-16:   MUL16/DIV16 use naive loop (O(N)). Bit-serial with RRL/RRR rotate
+;             instructions would give O(16) at roughly the same code size.
+;             Worthwhile for real-hardware performance; deferred.
 ;
-;  CHANGE HISTORY 
-;   v2.7  2026-05-25
-;         OPT-2: DR_CD removed duplicate LODA,R0 TMPL. -3 bytes.
-;         OPT-3: AO_STORE computed STKIDX-1 once, reused for VALSH/VALSL/STKIDX. -5 bytes.
-;         OPT-4: DLS_LP/DR_LP replaced PPSL $02 block with SUBA,R0 PEH (signed OK
-;               since PEH is always $1A-$1B < $80). -14 bytes.
-;         BUG-NF-01 FIXED: FL_RET_NF was merged with JERRLINE  both jumped to
-;               DO_ERROR, jettisoning the RAS. DELETE_LINE calls FIND_LINE and
-;               needs a normal return when the line doesn't exist. Split the labels:
-;               FL_RET_NF now sets ERRFLG=$01 and RETC,UN; JERRLINE remains the
-;               unconditional DO_ERROR path for DR_GOTO. This was the root cause of
-;               ?1 ERR_UND_LINE on every line entered after NEW. +5 bytes.
-;         BUG-NF-02 FIXED: REPL did not clear ERRFLG before TRY_STORE_LINE. After
-;               storing a numbered line (ERRFLG set to $01 by TSL_DONE), the next
-;               immediate command (e.g. LIST, RUN) found ERRFLG=$01 and was silently
-;               skipped. Fix: EORZ,R0/STRA,R0 ERRFLG at top of REPL. +4 bytes.
+; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
+;   v2.7  2026-05-30  Interpreter: 3507 bytes. Free gap to PROG: 1252 bytes.
+;         TAB(n) added to DO_PRINT (print n spaces).
+;         PF_LOADVAR refactored.
+;         OPT-5a: removed dead carry checks from all 19 stack-index patterns
+;               (BCTR,GT/ADDI dead code — hi byte always $16, max index 7,
+;               lo+7 < 256, carry impossible in single-page addressing). -76B.
+;         OPT-10: LODA binary-flag / COMI,R0 $01 / BCT → LODA / BCTR,GT.
+;               Applied to ERRFLG, RUNFLG, GOTOFLG, SC1(saved RUNFLG). -8B.
+;         OPT-15: Shared sign-handling subroutines NEG_EXP / NEG_EXP_BODY /
+;               ABS_TMP / ABS_EXP replacing inline code in MUL16, DIV16,
+;               PARSE_S16, PRINT_S16, PX_UNEG. ~190 bytes saved.
+;         OPT-15b: ABS_TMP tail-calls INC_TMP (saves RAS slot + 11 bytes).
+;               ABS_EXP tail-calls NEG_EXP_BODY (saves RAS slot).
+;               Both set/toggle NEGFLG before tail-call.
+;         Code cleanup: removed stale BUG-xxx history comments; added
+;               subroutine headers (description, In, Out, Clobbers).
 ;
-;   v2.6  2026-05-23 - 3940 interpreter bytes (5838 total inc showcase)
-;         Inline CHR$ into DO_PRINT to save ROM & RAS, delete PARSE_EXPR's CHR$ logic.
-;         Inline PRT_CR/LF instead of PIPBUG CRLF to save 1 RAS slot.
-;         Refactor INC_IP to be generic for INC_EXP and INC_EXP
-;         BUG-DP-01 FIXED: DP_CHAR used BCTA,UN EATWORD (plain branch) losing RAS.
-;         BUG-DEC-01 FIXED: DEC_IP/DEC_TMP used RETC,LT (sign) not TPSL/RETC,EQ (carry).
-;         ERRFLG refactor: PARSE_U16 jumps to JSYNERR on no-digit; removed all
-;               redundant ERRFLG check blocks and COMI,R0 $00 after LODA ERRFLG.
-;         Optimisation pass (78 bytes): 26x dead COMI,Rx $00 removed, 2x BCTA->BCTR,
-;               2x BCTA,UN PS_RET -> RETC,UN, dead DEC_TMP deleted.
-;         DLS_LP + DR_LP: removed 3 dead COMI,R0 $00 instructions (4+2=6 bytes).
-;               These followed LODA (which already sets CC) before an unreachable
-;               PPSL $02 unsigned compare, and served no purpose.
-;         PRO_LP: Replaced COMI,R1 $00 with LODZ,R1 which sets CC 
+;   v2.6  2026-05-23
+;         CHR$() inlined into DO_PRINT; INC_ET shared INC_EXP/INC_TMP body.
+;         BUG-DP-01: BCTA,UN EATWORD → BSTA (plain branch lost return address).
+;         BUG-DEC-01: DEC_IP RETC,LT → TPSL $01 / RETC,EQ (sign vs carry).
+;         ERRFLG refactor: PARSE_U16 → JSYNERR on no-digit; removed ERRFLG
+;               polls at callers. REPL clears ERRFLG each iteration.
+;         BUG-NF-01: FL_RET_NF split from JERRLINE; DELETE_LINE now gets
+;               normal return when line not found (was crashing to DO_ERROR).
+;         BUG-NF-02: REPL clears ERRFLG before TRY_STORE_LINE each iteration.
+;         OPT-2..4: duplicate LODA, AO_STORE STKIDX reuse, PPSL→SUBA. -22B.
+;         OPT-5a, OPT-10 applied (see v2.7 above for detail).
 ;
 ;   v2.5  2026-05-22
-;         BUG-FL-02 FIXED: FIND_INS FI_CHK lo-byte comparison used signed SUBA.
-;               Line numbers with  lo byte >= $80 (e.g.  128, 160) the subtraction
-;               result has bit 7 set, so  CC=LT regardless of the unsigned ordering.
-;               FIND_INS returned the insertion point too early  GOTO gave
-;               "undefined line" error. Fix: replaced SUBA,R0 *EXPH / BCTR,GT with
-;                    PPSL $02 / COMA,R0 *EXPH / CPSL $02 / BCTR,GT
-;               (unsigned compare mode, same pattern as DR_LP boundary check).
+;         BUG-FL-02: FI_CHK unsigned lo-byte compare (PPSL $02 / COMA).
+;         BUG-CHR-01: PF_CHR_TRY double INC_IP → jump to PF_LVNCA.
 ;
-;   v2.4  2026-05-19
-;         SHOWCASE appended including Mandelbrot section. PRTSTR optimised.
+;   v2.4  2026-05-19  Showcase + Mandelbrot appended.
 ;
-;   v2.3  2026-05-xx
-;         Recursive PRINT_S16. Code = 4268 bytes assembled.
-;         BUG-FL-01 partial fix: FL_CHKLO RETC,LT  BCTR,LT (was skipping
-;               STRA,R0 EXPH on the no-carry path; LODA *EXPH then read wrong
-;               page). Superseded by BUG-FL-02 fix.
-;
-;   v2.2v BUG-DIV-ZCHK-01 FIXED: DIV16 divisor zero-check now treats any
-;               EXPH<0 as non-zero (added BCTR,LT DV_NZ). Previous logic could
-;               misclassify values like $FF00 as zero divisor.
-;
-;   v2.2  BUG-RAS-01 FIXED: BSTR,UN PRO_JMP in PARSE_RELOP leaked one RAS slot
-;               per relop character read. All IF/THEN conditions were broken for
-;               multi-char relops (>=, <=, <>). Fix: BSTRBCTR in PRO_LT/PRO_EQ.
-;         BUG-MAND-01 FIXED: SC1 conflict between PARSE_EXPR current-precedence
-;               and APPLY_OP left.lo operand. Expressions like U*U/16+V*V/16
-;               gave wrong results. Fix: dedicated PRECTMP scratch ($163D).
-;         BUG-FI-01 FIXED: FI_CHK comparison (stored - target) wrapped when
-;               stored.hi > $7F giving false GT (treated as insertion point).
-;               Fix: reversed subtraction to (target - stored) in FIND_INS.
-
+;   v2.3  BUG-FL-01 partial: FL_CHKLO RETC,LT→BCTR,LT. BUG-RAS-01,
+;         BUG-MAND-01, BUG-FI-01, BUG-DIV-ZCHK-01 fixed.
 ;  ASCII 
 CR      EQU     $0D
 LF      EQU     $0A
@@ -168,7 +142,7 @@ SWSP    EQU $162D   ; SW call stack pointer ($FF=empty)
 SWSTK   EQU $162E   ; SW call stack 82 bytes  $012E-$013D
 PRECTMP EQU $163D   ; PARSE_EXPR cur_prec save (survives APPLY_OP which clobbers SC1)
 RELOP   EQU $163E   ; relational op 1-6
-; CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
+CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
 ;  SW call stack (v2.0) 
 ; R3 = index (0=empty, grows up). Each frame = [lo][hi] (lo pushed first).
 ; Push sequence: STRA,R0 *SWBASE,R3+ (lo first), STRA,R0 *SWBASE,R3+ (hi)
@@ -462,7 +436,7 @@ JERRVAR:
         BCTA,UN DO_ERROR
 DL_VAROK:
         STRA,R0 SC0                      ; save variable letter in SC0 (immediate use)
-        STRZ,R2                          ; BUG-BASIC-14 FIX: also save in R2 (STRZ stores R0Rn).
+        STRZ,R2
         ; SC0 is general scratch clobbered by PARSE_EXPR (operator-stack ops
         ; write SC0 repeatedly). R2 is never written by any routine and
         ; survives the full PARSE_EXPR call below.
@@ -478,8 +452,6 @@ DL_EX:
         BSTA,UN PARSE_EXPR               ; [+1] on error jumps directly to JSYNERR
 DL_STORE:
         ; address = VARS + (SC0 - 'A') * 2
-        ; BUG-BASIC-14 FIX: restore variable letter from R2 (SC0 was clobbered
-        ; by PARSE_EXPR). R2 is caller-saved across PARSE_EXPR (never written
         ; by any routine). DO_INPUT jumps here with letter already in SC0 and R2.
         LODZ,R2                          ; R0 = variable letter (preserved in R2 across PARSE_EXPR)
         STRA,R0 SC0                      ; resync SC0 for any code reading it below
@@ -607,8 +579,8 @@ DIF_ANDTEST:
         BCTA,UN STMT_EXEC                ; [+1]  execute THEN body
 
 DO_GOTO:
-        BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
-        BSTA,UN PARSE_EXPR              ; 
+        BSTA,UN WSKIP
+        BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 EXPH
         STRA,R0 GOTOH
         LODA,R0 EXPL
@@ -648,7 +620,6 @@ DLS_BODY:
         STRA,R0 EXPL
         BSTA,UN INC_TMP
 
-        ; BUG-BASIC-12 FIX: PRINT_S16 clobbers TMPH:TMPL (loads DIVTAB ptr).
         ; Save TMPH:TMPL in LNUMH:LNUML and restore after the call.
         LODA,R0 TMPH
         STRA,R0 LNUMH
@@ -728,14 +699,11 @@ DR_CD:
         BSTA,UN INC_TMP          ; skip past CR in store
         LODI,R1 NUL
         STRA,R1 *IPH  ; NUL-terminate IBUF
-        ; BUG-BASIC-13 FIX: Save next-line pointer in SWSTK[0:1] instead of
         ; SC0:SC1. SC0 and SC1 are scratch bytes clobbered by STMT_EXEC (used
         ; by PRINT_S16, STORE_LINE, parser, etc.).  SWSTK is the GOSUB return
-        ; stack, indexed from the top; [0:1] at $012E:$012F are unused while
         ; SWSP=$FF (empty) and GOSUB is not yet implemented.
         LODA,R0 TMPH
         STRA,R0 SC0      ; SC0:SC1 still set (DO_GOSUB reads them for return addr)
-        ; BUG-SCA-12 FIX: was STRA,R0 *SWSTK  indirect addressing writes to the
         ; address stored AT SWSTK ($012E:$012F), not into SWSTK itself. After CLRV
         ; SWSTK contains $0000, so the next-line pointer hi byte was written into
         ; PIPBUG ROM at $0000. Fix: direct STRA,R0 SWSTK stores into $012E.
@@ -754,7 +722,6 @@ DR_CD:
         LODA,R0 GOTOFLG                  ; OPT-10: GOTOFLG=0EQ, 1GT
         BCTR,GT DR_GOTO          ; branch if GOTO pending (was COMI $01/BCTR,EQ)
         ; advance: restore next-line pointer from SWSTK[0:1] (SC0:SC1 clobbered)
-        ; BUG-SCA-12 FIX: was LODA,R0 *SWSTK (indirect). Direct read from $012E.
         LODA,R0 SWSTK
         STRA,R0 TMPH
         LODA,R0 SWSTK+1
@@ -784,7 +751,7 @@ TRY_STORE_LINE:
         BCTR,LT TSL_NUM
         RETC,UN
 TSL_NUM:
-        BSTA,UN WSKIP                    ; [+1] RAS-FIX: PARSE_U16 no longer calls WSKIP
+        BSTA,UN WSKIP
         BSTA,UN PARSE_U16                ; [+1]
         LODA,R0 EXPH
         BCTR,GT TSL_NZ
@@ -803,7 +770,7 @@ TSL_NZ:
 TSL_DEL:
         BSTA,UN DELETE_LINE              ; [+1]
 TSL_DONE:
-        LODI,R0 1               ; BUG-BASIC-09 FIX: $01 = "line stored, skip exec"
+        LODI,R0 1
         STRA,R0 ERRFLG
         RETC,UN
 
@@ -897,12 +864,11 @@ SL_SNBR:
         STRA,R0 LNUMH           ; LNUMH:LNUML = src = PE-1
         ; dst = src + SC1 (record size = shift amount)
         ; ISSUE-02 FIX: must test carry from ADDA before any LODA clobbers CC.
-        ; Old code did STRA / LODA LNUMH / BCTA,GT  LODA wiped the carry.
         ; New code: test carry immediately after ADDA, then load LNUMH on both paths.
         LODA,R0 LNUML
         ADDA,R0 SC1
         STRA,R0 GOTOL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        TPSL $01
         BCTR,LT SL_DSNCA         ; branch if C=0 (no carry)
         LODA,R0 LNUMH           ; carry path: hi += 1
         ADDI,R0 1
@@ -914,7 +880,6 @@ SL_DSNCA:
 SL_DSNCB:
 
         ; use R3 as count (shift count lo; assume <256 for any real program)
-        ; BUG-SCA-04 FIX: was BRNR,R3 at loop end  R3 never decremented  infinite shift.
         ; Guard zero case first (BDRR with R3=0 would execute once wrongly).
         LODA,R3 TMPL
 SL_SHLOOP:
@@ -1522,7 +1487,7 @@ AO_ADD:
         LODA,R0 SC1
         ADDA,R0 EXPL
         STRA,R0 EXPL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        TPSL $01
         BCTR,LT AO_ADDNC         ; branch if C=0 (no carry)
         LODA,R0 NEGFLG
         ADDI,R0 1
@@ -1619,6 +1584,7 @@ AO_SLN:
 ; Parse one atom: variable A-Z, signed decimal, PEEK(), USR().
 ; Called from PARSE_EXPR at depth N+1. May call PARSE_EXPR for function args
 ; (adds 1 more level). Unary - and + handled by PARSE_EXPR before calling here.
+; CHR$ result: sets NEGFLG=$01 so DO_PRINT outputs EXPL as a character.
 PARSE_FACTOR:
         LODA,R0 *IPH
         ; RAS-FIX: inline UPCASE here instead of BSTA UPCASE (+1 slot).
@@ -1668,7 +1634,7 @@ PF_LOADVAR:
 ; Output: RELOP = bitmask, ERRFLG=$00 ok / $01 none
 PARSE_RELOP:
         BSTA,UN WSKIP                    ; [+1] skip leading space
-        EORZ,R0                          ; BUG-RELOP-01 FIX: EORZ,R1 does R0^=R1 not R1=0.
+        EORZ,R0
         STRZ,R1                          ; R1 = 0 (mask accumulator)
 PRO_LP:
         LODA,R0 *IPH
@@ -1699,12 +1665,10 @@ PRO_NONE:
         BCTA,UN JSYNERR
 
 PARSE_S16:
-        ; RAS-FIX: WSKIP removed. PX_ATOM already called WSKIP before PARSE_FACTOR,
         ; and PARSE_S16 is only called from PARSE_FACTOR(PF_NUM) or DO_INPUT.
         ; DO_INPUT calls PARSE_S16 after RDLINE which starts a fresh buffer  no
         ; leading spaces possible. Saves 1 RAS slot on the hot path:
         ;   REPLSTMT_EXECDO_PRINTPARSE_EXPRPARSE_FACTORPARSE_S16PARSE_U16
-        ; was 6 deep; with WSKIP removed from PARSE_S16, deepest is now
         ;   ...PARSE_S16PARSE_U16INC_IP = 6 (SP=6, safe).
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG
@@ -1714,8 +1678,8 @@ PARSE_S16:
         BCTR,UN PS16_UN
 PS16_NEG:
         BSTA,UN INC_IP
-        LODI,R0 1               ; BUG-BASIC-05 FIX: NEGFLG=1 = "negate result"
-        STRA,R0 NEGFLG          ; was EORZ,R0 which cleared flag, skipping negation
+        LODI,R0 1
+        STRA,R0 NEGFLG
 PS16_UN:
         BSTR,UN PARSE_U16                ; [+1]
         BCTA,UN NEG_EXP                  ; OPT-15: negate if NEGFLG set (tail-call)
@@ -1757,9 +1721,7 @@ PU16_DIG:
         ADDI,R0 1
         STRA,R0 IPH
 PU16_DNC:
-        ; BUG-SCA-10 FIX: EXP = EXP*10.  Was LODI,R3 10 / BRNR,R3  BRNR never
         ; decrements R3, so loop ran forever for any input with 2+ digits.
-        ; BUG-SCA-11 FIX: BDRR semantics are rn--; if(rn!=0) branch. Load N for
         ; exactly N iterations. Need 10 additions so load 10: 109...10exit.
         LODA,R0 EXPH
         STRA,R0 TMPH
@@ -1773,7 +1735,7 @@ PU16_M10:
         LODA,R0 EXPL
         ADDA,R0 TMPL
         STRA,R0 EXPL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        TPSL $01
         BCTR,LT PU16_MNC         ; branch if C=0 (no carry)
         LODA,R0 EXPH
         ADDI,R0 1
@@ -1787,7 +1749,7 @@ PU16_MNC:
         LODA,R0 EXPL
         ADDA,R0 SC0
         STRA,R0 EXPL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        TPSL $01
         BCTR,LT PU16_DIG_NC      ; branch if C=0 (no carry)
         LODA,R0 EXPH
         ADDI,R0 1
@@ -1813,48 +1775,43 @@ NEG_EXP_BODY:                            ; entry for unconditional negate
 ; ABS_TMP: abs(TMPH:TMPL) in place; set NEGFLG=1 if was negative. Clobbers R0.
 ; Input:  TMPH:TMPL = signed 16-bit value, NEGFLG already cleared by caller.
 ; Output: TMPH:TMPL = |input|, NEGFLG=1 if input was negative (else unchanged).
+; ABS_TMP — absolute value of TMPH:TMPL; set NEGFLG=1 if input was negative.
+; In:  TMPH:TMPL = signed 16-bit; NEGFLG cleared by caller.
+; Out: TMPH:TMPL = |value|; NEGFLG=1 if was negative, else unchanged.
+; Clobbers: R0.
 ABS_TMP:
         LODA,R0 TMPH
         ANDI,R0 $80
-        RETC,EQ                          ; positive  return unchanged
+        RETC,EQ                          ; positive → return, NEGFLG unchanged
         LODA,R0 TMPH
         EORI,R0 $FF
         STRA,R0 TMPH
         LODA,R0 TMPL
         EORI,R0 $FF
         STRA,R0 TMPL
-        LODA,R0 TMPL
-        ADDI,R0 1
-        STRA,R0 TMPL
-        TPSL $01                         ; carry from lo +1
-        BCTR,LT AT_NC                    ; C=0  no carry
-        LODA,R0 TMPH
-        ADDI,R0 1
-        STRA,R0 TMPH
-AT_NC:
         LODI,R0 1
-        STRA,R0 NEGFLG                   ; was negative  NEGFLG=1
-        RETC,UN
+        STRA,R0 NEGFLG                   ; set flag BEFORE tail-call (saves RAS slot)
+        BCTA,UN INC_TMP                  ; tail-call: +1 completes two's complement
 
-; ABS_EXP: abs(EXPH:EXPL) in place; toggle NEGFLG if was negative. Clobbers R0.
-; Input:  EXPH:EXPL = signed 16-bit value.
-; Output: EXPH:EXPL = |input|, NEGFLG XOR 1 if input was negative.
+; ABS_EXP — absolute value of EXPH:EXPL; toggle NEGFLG if input was negative.
+; In:  EXPH:EXPL = signed 16-bit.
+; Out: EXPH:EXPL = |value|; NEGFLG toggled if was negative, else unchanged.
+; Clobbers: R0.
 ABS_EXP:
         LODA,R0 EXPH
         ANDI,R0 $80
-        RETC,EQ                          ; positive  return unchanged
-        BSTA,UN NEG_EXP_BODY             ; negate EXPH:EXPL (unconditional)
-        LODA,R0 NEGFLG                   ; toggle sign flag
+        RETC,EQ                          ; positive → return, NEGFLG unchanged
+        LODA,R0 NEGFLG
         EORI,R0 $01
-        STRA,R0 NEGFLG
-        RETC,UN
+        STRA,R0 NEGFLG                   ; toggle flag BEFORE tail-call (saves RAS slot)
+        BCTA,UN NEG_EXP_BODY             ; tail-call: negate EXPH:EXPL + INC_EXP
 
 ;  MUL16 
 ; Signed TMPH:TMPL  EXPH:EXPL  EXPH:EXPL  (16-bit two's complement wrap)
 MUL16:
         EORZ,R0 ; Clear R0
         STRA,R0 NEGFLG
-        BSTA,UN ABS_TMP                  ; OPT-15: abs(left), set NEGFLG=1 if neg
+        BSTR,UN ABS_TMP                  ; OPT-15: abs(left), set NEGFLG=1 if neg
 MU_LA:
         BSTR,UN ABS_EXP                  ; OPT-15: abs(right), toggle NEGFLG if neg
 MU_RA:
@@ -1875,7 +1832,7 @@ MU_ADD:
         LODA,R0 EXPL
         ADDA,R0 SC1
         STRA,R0 EXPL
-        TPSL $01                 ; BUG-SCA-14 FIX: carry from lo-byte add
+        TPSL $01
         BCTR,LT MU_MNC           ; branch if C=0 (no carry)
         LODA,R0 EXPH
         ADDI,R0 1
@@ -1896,7 +1853,7 @@ MU_TNB:
         BCTR,UN MU_LP
 MU_DONE:
         BSTA,UN NEG_EXP                  ; OPT-15: negate result if NEGFLG set
-        EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
+        EORZ,R0
         STRA,R0 NEGFLG                   ; exit  
         RETC,UN
 
@@ -1955,7 +1912,7 @@ DV_SNB:
         BCTR,UN DV_LP
 DV_DONE:
         BSTA,UN NEG_EXP                  ; OPT-15: negate result if NEGFLG set
-        EORZ,R0                          ; ISSUE-01 RE-FIX pt2: clear NEGFLG on
+        EORZ,R0
         STRA,R0 NEGFLG                   ; exit  
         RETC,UN
 JERRDIVZER:
@@ -2123,7 +2080,7 @@ RDLINE:
         STRA,R0 IPL
 RL_LP:
         BSTA,UN CHIN          ; [+1] blocking  R0 = char
-        COMI,R0 NUL             ; BUG-ASM-08 FIX: NUL = EOF from sim stdin.
+        COMI,R0 NUL
         BCTA,EQ RL_EOL          ;   Treat as end-of-line so we don't flood IBUF
         ;                       ;   (and overwrite VARS) after stdin is exhausted.
         STRZ,R1                 ; R1 = char (R0 still has char for CR/BS checks)
@@ -2132,12 +2089,10 @@ RL_LP:
         COMI,R1 LF
         BCTA,EQ RL_EOL
         ; ISSUE-06 FIX: removed redundant second COMI,R1 NUL / BCTA,EQ RL_EOL here.
-        ; BUG-ASM-08 fix (first NUL check immediately afterCHIN above) already
         ; catches EOF before we reach this point  second check was dead code.
         COMI,R1 BS
         BCTR,EQ RL_BS
         ; buffer full?  IP >= IBUF+63
-        ; BUG-BASIC-17 FIX: was SUBA (absolute read) not SUBI (immediate compare).
         ; SUBA,R0 <IBUF reads mem[$0016] (now at $1600+) (PIPBUG ROM), not the constant $15.
         ; All four pointer comparisons here must use SUBI.
         LODA,R0 IPH
@@ -2199,7 +2154,6 @@ WS_ADV:
 
 ;  GETCI_UC 
 ; Read *IPH uppercase into R0, advance IP.
-; BUG-ASM-04 FIX: INC_IP clobbers R0 (returns new IPL). Save char in R1
 ; across the INC_IP call using STRZ,R1 / LODZ,R1 sandwich.
 ; Clobbers: R1 (caller must not rely on R1 across GETCI_UC call)
 GETCI_UC:
