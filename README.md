@@ -36,8 +36,9 @@ Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing
 
 So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
 
-- 8 level hardware stack. Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
-  - Option is to use SW stack but that consumes a register and adds 10-20 bytes of overhead each call, so best be worth it...  
+- 8 level hardware Return Address Stack (RAS). Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
+  - One of the tricks for reduced size (soemtimes called _Code Golf_) is for anything used twice or more, use a subroutine.  Thats Not possibel here due to the RAS, so we have lots of duplicate inline code.
+  - I'm experimenting with SW stack, but that has about a dozen bytes overhead for each call, so bets be worth it.  Interesting the return address does not have to be the immediate next instruction...   
 - Although it has nice features like auto-increment and decrement, heavy indirection and return on condition code, these are not size optimized
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
 - From a programmers perspective, the instruction set was clearly designed by an engineer and instructions are dense
