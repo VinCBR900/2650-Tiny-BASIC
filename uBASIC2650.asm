@@ -1,5 +1,5 @@
 ; uBASIC2650.asm  —  Tiny BASIC interpreter for Signetics 2650
-; Version: v2.7
+; Version: v2.8
 ; Date:    2026-05-30
 ;
 ; Target : PIPBUG 1 monitor (ROM $0000-$03FF, RAM $0400-$043F)
@@ -49,26 +49,24 @@
 ;             Unlikely to be implemented — would consume a RAS slot per statement.
 ;   OPT-1:    INC_ET PPSL/CPSL RS removal causes LIST/RUN failure; cause unknown.
 ;   OPT-16:   MUL16/DIV16 use naive loop (O(N)). Bit-serial with RRL/RRR rotate
-;             instructions would give O(16) at roughly the same code size.
+;             instructions provides O(16) at approx same code size.
 ;             Worthwhile for real-hardware performance; deferred.
+;   BUG-LE:   Modifying existing BASIC lines unreliable,  corrupts program store
+;   BUG-UM:   Unary Minus issue; PRINT -10*5 fine, PRINT 5*-10 fine
+;             PRINT -(10*5) errors 
 ;
 ; ── CHANGE HISTORY ───────────────────────────────────────────────────────────
-;   v2.7  2026-05-30  Interpreter: 3507 bytes. Free gap to PROG: 1252 bytes.
-;         TAB(n) added to DO_PRINT (print n spaces).
-;         PF_LOADVAR refactored.
-;         OPT-5a: removed dead carry checks from all 19 stack-index patterns
-;               (BCTR,GT/ADDI dead code — hi byte always $16, max index 7,
-;               lo+7 < 256, carry impossible in single-page addressing). -76B.
-;         OPT-10: LODA binary-flag / COMI,R0 $01 / BCT → LODA / BCTR,GT.
-;               Applied to ERRFLG, RUNFLG, GOTOFLG, SC1(saved RUNFLG). -8B.
+;   V2.8  2026-05-30 - 3576 ROM bytes
+;         General code refactor for size. PF_LOADVAR & DO_LIST refactored.
+;         Computed GOTO
+;   v2.7  2026-05-29  
+;         TAB(spaces) added to DO_PRINT (print n spaces).
 ;         OPT-15: Shared sign-handling subroutines NEG_EXP / NEG_EXP_BODY /
 ;               ABS_TMP / ABS_EXP replacing inline code in MUL16, DIV16,
 ;               PARSE_S16, PRINT_S16, PX_UNEG. ~190 bytes saved.
 ;         OPT-15b: ABS_TMP tail-calls INC_TMP (saves RAS slot + 11 bytes).
 ;               ABS_EXP tail-calls NEG_EXP_BODY (saves RAS slot).
 ;               Both set/toggle NEGFLG before tail-call.
-;         Code cleanup: removed stale BUG-xxx history comments; added
-;               subroutine headers (description, In, Out, Clobbers).
 ;
 ;   v2.6  2026-05-23
 ;         CHR$() inlined into DO_PRINT; INC_ET shared INC_EXP/INC_TMP body.
@@ -80,16 +78,19 @@
 ;               normal return when line not found (was crashing to DO_ERROR).
 ;         BUG-NF-02: REPL clears ERRFLG before TRY_STORE_LINE each iteration.
 ;         OPT-2..4: duplicate LODA, AO_STORE STKIDX reuse, PPSL→SUBA. -22B.
-;         OPT-5a, OPT-10 applied (see v2.7 above for detail).
+;         OPT-5a: removed dead carry checks from all 19 stack-index patterns
+;               (BCTR,GT/ADDI dead code — hi byte always <$80, max index 7,
+;               lo+7 < 256, carry impossible in single-page addressing). -76B.
+;         OPT-10: LODA binary-flag / COMI,R0 $01 / BCT → LODA / BCTR,GT.
+;               Applied to ERRFLG, RUNFLG, GOTOFLG, SC1(saved RUNFLG). -8B.
 ;
 ;   v2.5  2026-05-22
 ;         BUG-FL-02: FI_CHK unsigned lo-byte compare (PPSL $02 / COMA).
 ;         BUG-CHR-01: PF_CHR_TRY double INC_IP → jump to PF_LVNCA.
-;
 ;   v2.4  2026-05-19  Showcase + Mandelbrot appended.
-;
 ;   v2.3  BUG-FL-01 partial: FL_CHKLO RETC,LT→BCTR,LT. BUG-RAS-01,
 ;         BUG-MAND-01, BUG-FI-01, BUG-DIV-ZCHK-01 fixed.
+
 ;  ASCII 
 CR      EQU     $0D
 LF      EQU     $0A
@@ -119,6 +120,7 @@ TMPH    EQU $1602   ; temp 16-bit hi
 TMPL    EQU $1603   ; temp 16-bit lo
 EXPH    EQU $1604   ; expression result hi
 EXPL    EQU $1605   ; expression result lo
+
 ; Other Vars
 RUNFLG  EQU $1606   ; $01=running $00=immediate
 GOTOFLG EQU $1607   ; $01=GOTO/GOSUB pending
@@ -142,7 +144,7 @@ SWSP    EQU $162D   ; SW call stack pointer ($FF=empty)
 SWSTK   EQU $162E   ; SW call stack 82 bytes  $012E-$013D
 PRECTMP EQU $163D   ; PARSE_EXPR cur_prec save (survives APPLY_OP which clobbers SC1)
 RELOP   EQU $163E   ; relational op 1-6
-CHRFLG  EQU $163F   ; CHR$() output flag ($01=print EXPL as char)
+
 ;  SW call stack (v2.0) 
 ; R3 = index (0=empty, grows up). Each frame = [lo][hi] (lo pushed first).
 ; Push sequence: STRA,R0 *SWBASE,R3+ (lo first), STRA,R0 *SWBASE,R3+ (hi)
@@ -214,7 +216,7 @@ REPL:
         BCTR,UN REPL
 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V2.7", CR, LF, NUL
+        DB CR, LF, "uBASIC 2650 V2.8", CR, LF, NUL
 
 ;  STMT_EXEC 
 ; Decode and dispatch one statement from IP.
@@ -344,7 +346,7 @@ DO_PRINT:
 DP_ITEM:
     BSTA,UN WSKIP
     LODA,R0 *IPH
-    COMI,R0 DQ
+    COMI,R0 DQ          ; Is it opening "
     BCTA,EQ DP_STRING   ; Keep absolute: DP_STRING is at the bottom
     COMI,R0 'C'
     BCFR,EQ DP_TAB     ; If not 'C', safely jump forward to DP_TAB
@@ -383,7 +385,7 @@ DP_TAB:
 TAB_LOOP:
     BSTA,UN PRT_SPACE
     BDRR,R1 TAB_LOOP
-                ; Fall through directly into DP_SEP!
+                ; Fall through directly into DP_SEP
 DP_SEP:
     BSTA,UN WSKIP
     LODA,R0 *IPH
@@ -405,9 +407,9 @@ DP_STRING:
     BSTA,UN INC_IP
 PRTSTR:
     LODA,R0 *IPH
-    BCTR,EQ DP_SEP     
-    COMI,R0 DQ
-    BCTR,EQ DP_SCLS
+    RETC,EQ             ; Hard Bail if NUL before "
+    COMI,R0 DQ         ; Closing " still part of print
+    BCTR,EQ DP_SCLS     ; test
     BSTA,UN COUT
     BSTA,UN INC_IP
     BCTR,UN PRTSTR
@@ -466,6 +468,8 @@ DL_NC:
         BSTA,UN INC_TMP
         LODA,R0 EXPL
         STRA,R0 *TMPH  ; store lo
+        ; drop through
+; ============================================        
 ;  DO_REM - do nothing 
 PRTSTR_RET:
 DO_REM:
@@ -595,59 +599,49 @@ DO_GOTO:
         ;RETC,UN
         BCTA,UN CLR_RUNFLG
 
+; DO_LIST: Lists program lines from PROG to PEH:PEL
 DO_LIST:
         LODI,R0 <PROG
-        STRA,R0 TMPH
+        STRA,R0 IPH                      ; Use IPH instead of TMPH
         LODI,R0 >PROG
-        STRA,R0 TMPL
+        STRA,R0 IPL                      ; Use IPL instead of TMPL
 DLS_LP:
-        ; unsigned 16-bit: if TMPH:TMPL >= PEH:PEL  done
-        ; OPT-4: PEH is always $1A-$1B (<$80) so signed SUBA gives same CC as unsigned for hi byte
-        LODA,R0 TMPH
+        ; unsigned 16-bit: if IPH:IPL >= PEH:PEL  done
+        LODA,R0 IPH
         SUBA,R0 PEH                      ; signed OK: PEH < $80
-        RETC,GT                          ; TMPH > PEH  past end
-        BCTR,LT DLS_BODY                 ; TMPH < PEH  before end
-        ; TMPH == PEH: check lo byte  C=1 (no borrow) means TMPL >= PEL  done
-        LODA,R0 TMPL
+        RETC,GT                          ; IPH > PEH  past end
+        BCTR,LT DLS_BODY                 ; IPH < PEH  before end
+        LODA,R0 IPL
         SUBA,R0 PEL
-        TPSL $01                         ; C=1  no borrow  TMPL >= PEL
+        TPSL $01                         ; C=1 (no borrow) means IPL >= PEL
         RETC,EQ                          ; CC=EQ means C=1  done
 DLS_BODY:
-        ; line number hi:lo
-        LODA,R0 *TMPH
+        ; Fetch line number hi:lo directly into EXPH:EXPL using IPH
+        LODA,R0 *IPH
         STRA,R0 EXPH
-        BSTA,UN INC_TMP
-        LODA,R0 *TMPH
+        BSTA,UN INC_IP  ; advance
+        LODA,R0 *IPH
         STRA,R0 EXPL
-        BSTA,UN INC_TMP
+        BSTA,UN INC_IP  ; advance to string data
 
-        ; Save TMPH:TMPL in LNUMH:LNUML and restore after the call.
-        LODA,R0 TMPH
-        STRA,R0 LNUMH
-        LODA,R0 TMPL
-        STRA,R0 LNUML
-        BSTA,UN PRINT_S16                ; [+1]
-        LODA,R0 LNUMH
-        STRA,R0 TMPH
-        LODA,R0 LNUML
-        STRA,R0 TMPL
-        LODI,R0 SP
-        BSTA,UN COUT
-
+        BSTA,UN PRINT_S16               ; Print Line Number
+        BSTA,UN PRT_SPACE               ; Print Space delimiter
+ 
+        ; IPH:IPL is already pointing at the string data so
         ; print body bytes until CR (CR-terminated format)
 DLS_BLPX:
-        LODA,R0 *TMPH
-        COMI,R0 CR
+        LODA,R0 *IPH
+        COMI,R0 CR      ; end of line
         BCTR,EQ DLS_NL
         BSTA,UN COUT
-        BSTA,UN INC_TMP
-        BCTR,UN DLS_BLPX
+        BSTA,UN INC_IP
+        BCTR,UN DLS_BLPX  
+
 DLS_NL:
-        BSTA,UN INC_TMP          ; skip past CR
+        BSTA,UN INC_IP                   ; skip past CR 
         BSTA,UN PRT_CR
         BSTA,UN PRT_LF
         BCTA,UN DLS_LP
-        ; RETC,UN
 
 ;  DO_RUN 
 ; Executes stored lines sequentially, honouring GOTOFLG for GOTO/GOSUB/RETURN.
@@ -1937,6 +1931,7 @@ JERRDIVZER:
 
 ;  PRINT_S16 
 ; Recursive Print signed 16-bit value EXPH:EXPL as decimal.
+; clobbers TMP
 PRINT_S16:
         ; Save caller R3 and switch to dedicated recursive print SW stack.
         STRA,R3 R3SAVE
