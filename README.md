@@ -37,12 +37,12 @@ Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing
 So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
 
 - 8 level hardware Return Address Stack (RAS). Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
-  - One of the tricks for reduced size (soemtimes called _Code Golf_) is for anything used twice or more, use a subroutine.  Thats Not possibel here due to the RAS, so we have lots of duplicate inline code.
-  - I'm experimenting with SW stack, but that has about a dozen bytes overhead for each call, so bets be worth it.  Interesting the return address does not have to be the immediate next instruction...   
+  - One of the tricks for reduced size (sometimes called _Code Golf_) is for anything used twice or more, use a subroutine.  That's Not possible here due to the small RAS, so we have lots of duplicate inline code.
+  - I'm experimenting with SW stack, but that has about a dozen bytes overhead for each call, so best be worth it.  Interestingly the return address does not have to be the immediate next instruction...   
 - Although it has nice features like auto-increment and decrement, heavy indirection and return on condition code, these are not size optimized
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
 - From a programmers perspective, the instruction set was clearly designed by an engineer and instructions are dense
-  - e.g. `BCTR,LT addr` **B**ranch, got that - now do we want **C**ontrol for a jump, or **S**ubroutine for a call, and do we want **T**rue or **F**alse, and are we **Relative** short jump or **A**bsolute address, and then do we want **LT**, **GT**,**EQ**,**UN** condition code.  This is all very easy to overlook one character and make a typo which is hard to spot.
+  - e.g. `BCTR,LT addr` **B**ranch, got that - now do we want **C**ontrol for a jump, or **S**ubroutine for a call, and do we want **T**rue or **F**alse, and are we **Relative** short jump or **A**bsolute address, and then do we want **LT**, **GT**,**EQ**,**UN** condition code, and finally do we want _addr_ or _*addr_.  This makes it very easy to overlook one character and make a typo that is hard to spot.
   
 The biggest challange is that, unlike MOS 6502, Claude, Gemini and CODEX dont really know the 2650 CPU architecture, probably because training data is limited.  Available period PDF data sheets and App notes are poorely OCR'ed (Probably scanned in the 1990s) so can't just feed into the AI.
 
@@ -82,6 +82,7 @@ A tokeniser saves RAM (shorter stored programs) and speeds execution (no re-pars
 
 - **jim11662418** nice modern 2650 SBC - [https://github.com/jim11662418/Signetics_2650_Single_Board_Computer](https://github.com/jim11662418/Signetics_2650_Single_Board_Computer)
 - **2650 Restoration Project** for keeping this alive [https://ztpe.nl/2650/](https://ztpe.nl/2650/)
+- **Frank's Electron Tube Homepage** and 2650 archive [https://frank.pocnet.net/instruments/FP_DIY/phunsy/phunsy.html](https://frank.pocnet.net/instruments/FP_DIY/phunsy/phunsy.html)
 - **[Claude AI](https://claude.ai)** for making it possible for a non-expert to ship something that had been on the back burner since 1989.
 
 ---
