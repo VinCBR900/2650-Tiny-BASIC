@@ -1,8 +1,9 @@
 # 2650-Tiny-BASIC - Intended for 2732 EPROM
 
-Signetics 2650 Tiny BASIC **WORK IN PROGRESS**, core functionality present
+Signetics 2650 Tiny BASIC - core functionality present
 
-A minimal integer BASIC for Signetics 2650. No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 2 character keyword matching. This costs RAM and speed but keeps the interpreter very small. Will fit into a 2732 EPROM (4096 bytes).
+This minimal integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below.  
+No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 2 character keyword matching. This costs RAM and speed but keeps the interpreter small. Will fit into a 2732 EPROM (4096 bytes).
 
 If you just want a proper BASIC for your Signetics 2650 system then the vintage [MicroWorld BASIC interpreter](https://binnie.id.au/MicroByte/BASIC%20Manual.pdf) is significantly more capable with floating point and string support. It is scattered around on the internet but I found a version at [https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main](https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main).
 
@@ -26,9 +27,9 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 | ?3 OM | Out of memory |
 | ?4 UK | Bad variable assignment |
 
-**Note Multi-statement lines** with `:` separator: **Not Supported** (yet) (e.g. `10 A=1 : B=2 : PRINT A+B`)
+**Note Multi-statement lines** with `:` separator(e.g. `10 A=1 : B=2 : PRINT A+B`) **Not Supported** Unikley to be be due to Stack limitations as below. 
 
-You can play with this online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
+You can play with this Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
 
 Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `CTRL-]` aborts running program. 
 
@@ -37,7 +38,7 @@ Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing
 So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
 
 - 8 level hardware Return Address Stack (RAS). Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
-  - One of the tricks for reduced size (sometimes called _Code Golf_) is for anything used twice or more, use a subroutine.  That's Not possible here due to the small RAS, so we have lots of duplicate inline code.
+  - One of the tricks for reduced size (sometimes called _Code Golf_) is for any code used twice or more, make it a subroutine.  That's Not possible here due to the small RAS, so we have lots of duplicate inline code.
   - I'm experimenting with SW stack, but that has about a dozen bytes overhead for each call, so best be worth it.  Interestingly the return address does not have to be the immediate next instruction...   
 - Although it has nice features like auto-increment and decrement, heavy indirection and return on condition code, these are not size optimized
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
@@ -61,20 +62,40 @@ The Tiny BASIC assembly sources include a pre-loaded **feature showcase program*
 
 ---
 
-### Things to watch out for
+# The Signetics 2650 History
 
-- **ROM size.** uBASIC has less than a dozen bytes free, so pretty full. Always check after a change. Claude will help you find space savings if you're over budget.
-- **Fall-through chains.** Several functions share a single `RETC,UN` by falling through into the next function. These are clearly marked in the source. Inserting code between them without understanding the fall-through will break things — tell Claude to watch out for them.
-- **Arithmetic Gotchas** Signetics 2650 is intrinisically signed so the compares can be odd to understand
-- **HW Stack limitations.** The Achilees heel of this device is the 8 level HW stack.  Stack overflows causes seemingly random errors, so you always have to keep an eye on it.
+The Signetics 2650 was an 8-bit microprocessor designed in 1972 and released in 1975. Unlike many early CPUs that evolved from calculator chips, the 2650 was heavily influenced by minicomputer designs such as the IBM 1130, giving it an unusually sophisticated architecture for its era.
+
+### Key Architectural Features
+
+-   Seven general-purpose registers arranged as two switchable banks
+-   Powerful register-to-register instructions
+-   Built-in 8-level hardware return-address stack
+-   Fully static design allowing single-step operation
+-   15-bit address space organised into four 8 KB pages - this was consideredenough for anyone in 1972/3
+
+These features allowed small systems to be built with little more than a CPU, ROM and clock - no RAM.
+
+### Strengths and Weaknesses
+
+The architecture was highly efficient for hand-written assembly language and embedded control applications. However, design decisions that made sense in 1972 became limitations by the late 1970s:
+
+-   Fixed 8-level hardware stack
+-   Paged memory model
+-   No conventional stack pointer
+-   Less suitable for high-level language compilers
+
+Meanwhile newer processors such as the MOS 6502, Zilog Z80 and Motorola 6809 offered larger address spaces and RAM-based stacks, stealing the crown
+
+### Prologue
+
+Although it never achieved the commercial success of its rivals, the 2650 developed a loyal following among hobbyists and industrial users. It appeared in systems published by Elektor, Electronics Australia and numerous arcade and pinball machines.
 
 ---
 
 ## Technical Notes
 
-#### Why no tokeniser in uBASIC?
-
-A tokeniser saves RAM (shorter stored programs) and speeds execution (no re-parsing). But the tokeniser itself costs ROM. The aim hjere was to get an MVP 2650 Tiny BASIC as I have never seen source for a 2650 version before, which is what this is.  Note the original assumption was 2kBytes would be feasible, like the others in this repo, but the architecture required 4kbyte. I would be **very** interested to hear if anyone can get it under 2kbytes.
+TBD - Howie did-it.
 
 ---
 
