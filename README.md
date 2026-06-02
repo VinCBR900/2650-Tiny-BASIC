@@ -2,6 +2,8 @@
 
 Signetics 2650 Tiny BASIC - core functionality present
 
+You can play with this Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
+
 This minimal integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below.  
 No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 2 character keyword matching. This costs RAM and speed but keeps the interpreter small. Will fit into a 2732 EPROM (4096 bytes).
 
@@ -28,8 +30,6 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 | ?4 UK | Bad variable assignment |
 
 **Note Multi-statement lines** with `:` separator(e.g. `10 A=1 : B=2 : PRINT A+B`) **Not Supported** Unikley to be be due to Stack limitations as below. 
-
-You can play with this Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
 
 Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `CTRL-]` aborts running program. 
 
