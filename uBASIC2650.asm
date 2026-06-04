@@ -50,7 +50,7 @@
 ;
 ;        CHANGE HISTORY                                                                                                                                                                                  
 ;
-;   V3.0  2026-06-04  3306 Interpreter bytes 
+;   V3.0  2026-06-04  3292 Interpreter bytes 
 ;         Bug Fix: PARSE_U16 used LODI,R3 10 / BDRR,R3 for multiply-by-10
 ;         loop, clobbering R3 which holds the SW call stack pointer.
 ;         On return, PARSER_RET saw R3=0 (not $FF empty sentinel) and called
@@ -1214,10 +1214,10 @@ EAM_LO_LOOP:
         BSTA,UN WSKIP
         LODA,R0 *IPH
         COMI,R0 A'+'
-        BCTA,EQ EAM_PLUS
+        BCTR,EQ EAM_PLUS
         COMI,R0 A'-'
         BCTA,EQ EAM_MINUS
-        BCTA,UN PARSER_RET
+        BCTR,UN PARSER_RET
 EAM_PLUS:
         LODA,R0 EXPH
         STRA,R0 SAVEH
@@ -1262,7 +1262,7 @@ EAM_M_RET:
         STRA,R0 SWBASE,R3+
         LODI,R0 <EAM_MH_RET
         STRA,R0 SWBASE,R3+
-        BCTA,UN EAM_HI
+        BCTR,UN EAM_HI
 EAM_MH_RET:
         CPSL $08
         LODA,R0 SAVEL
@@ -1278,9 +1278,9 @@ EAM_HI:
         BSTA,UN WSKIP
         LODA,R0 *IPH
         COMI,R0 A'*'
-        BCTA,EQ EAM_MUL
+        BCTR,EQ EAM_MUL
         COMI,R0 A'/'
-        BCTA,EQ EAM_DIV
+        BCTR,EQ EAM_DIV
         COMI,R0 A'%'
         BCTA,EQ EAM_MOD
         BCTA,UN PARSER_RET
@@ -1330,7 +1330,7 @@ EAM_MOD:
         STRA,R0 SWBASE,R3+
         LODI,R0 <MD_AT_RET
         STRA,R0 SWBASE,R3+
-        BCTA,UN EAM_ATOM
+        BCTR,UN EAM_ATOM
 MD_AT_RET:
         LODA,R0 E1SAVH
         STRA,R0 TMPH
@@ -1346,11 +1346,11 @@ EAM_ATOM:
         BSTA,UN WSKIP
         LODA,R0 *IPH
         COMI,R0 A'-'
-        BCTA,EQ EAM_NEG
+        BCTR,EQ EAM_NEG
         COMI,R0 A'+'
-        BCTA,EQ EAM_POS
+        BCTR,EQ EAM_POS
         COMI,R0 A'('
-        BCTA,EQ EAM_PAREN
+        BCTR,EQ EAM_PAREN
         BSTA,UN PARSE_FACTOR
         BCTA,UN PARSER_RET
 EAM_NEG:
@@ -1359,7 +1359,7 @@ EAM_NEG:
         STRA,R0 SWBASE,R3+
         LODI,R0 <NEG_AT_RET
         STRA,R0 SWBASE,R3+
-        BCTA,UN EAM_ATOM
+        BCTR,UN EAM_ATOM
 NEG_AT_RET:
         BSTA,UN NEG_EXP_BODY
         BCTA,UN PARSER_RET
@@ -1369,7 +1369,7 @@ EAM_POS:
         STRA,R0 SWBASE,R3+
         LODI,R0 <POS_AT_RET
         STRA,R0 SWBASE,R3+
-        BCTA,UN EAM_ATOM
+        BCTR,UN EAM_ATOM
 POS_AT_RET:
         BCTA,UN PARSER_RET
 EAM_PAREN:
