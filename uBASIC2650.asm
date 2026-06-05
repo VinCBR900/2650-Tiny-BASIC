@@ -1,5 +1,5 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v3.0
+; Version: v3.1
 ; Date:    2026-06-04
 ;
 ; Target : PIPBUG 1 monitor (ROM $0000-$03FF, RAM $0400-$043F)
@@ -41,7 +41,6 @@
 ;   R3  loop counter (BDRR/BIRR); STORE_LINE shift count.
 ;
 ;        KNOWN OPEN ITEMS                                                                                                                                                                            
-;   BUG-LE:   Modifying existing BASIC lines unreliable,  corrupts program store
 ;   COLON-01: ':' multi-statement separator not supported ("A=1:GOTO 10").
 ;             Unlikely to be implemented, would consume a RAS slot per statement.
 ;   OPT-16:   MUL16/DIV16 use naive loop (O(N)). Bit-serial with RRL/RRR rotate
@@ -50,7 +49,25 @@
 ;
 ;        CHANGE HISTORY                                                                                                                                                                                  
 ;
-;   V3.0  2026-06-04  3292 Interpreter bytes 
+;   V3.1  2026-06-05
+;         BUG-SL Fix: SL_DOMOV pointer decrements used BCFR,LT to detect borrow
+;         after SUBI,R0 1, but BCFR,LT tests the CC field (set from result value
+;         bit-7), not the carry flag. Any lo-byte in $80..$FF gives CC=LT
+;         regardless of borrow, causing spurious hi-byte decrements and runaway
+;         src/dst pointers. Fix: replace BCFR,LT with TPSL $01 / BCTR,EQ to test
+;         carry directly. Loop-back BCTR,UN extended to BCTA,UN (+2 bytes overhead).
+;         Verified: insert/replace/delete all lines, first/middle/last positions.
+;         BUG-LE Fix: SL_SHLOOP stop condition in STORE_LINE was missing
+;         BCTR,LT SL_NOSHIFT after hi-byte subtract, and the lo-byte path
+;         fell through to SL_DOMOV when src.lo < ins.lo (CC=LT). Both cases
+;         caused the shift loop to walk src past the insertion point, corrupting
+;         the program store when replacing a line with content of different length.
+;         Fix: added BCTR,LT SL_NOSHIFT (hi-byte) and BCTR,GT/BCTR,UN (lo-byte)
+;         so all six hi/lo comparison outcomes route correctly.
+;         Verified with pipbug_wrap: 10 PRINT / 20 PRINT / 30 PRINT / LIST /
+;         20 PRINT "HELLO" / LIST now correctly shows updated line 20.
+;
+;   V3.0  2026-06-04  3306 Interpreter bytes 
 ;         Bug Fix: PARSE_U16 used LODI,R3 10 / BDRR,R3 for multiply-by-10
 ;         loop, clobbering R3 which holds the SW call stack pointer.
 ;         On return, PARSER_RET saw R3=0 (not $FF empty sentinel) and called
@@ -227,7 +244,7 @@ REPL:
 
 ; =============================================================================
 BANNER:
-        DB CR, LF, "uBASIC 2650 V3.0", CR, LF, NUL
+        DB CR, LF, "uBASIC 2650 V3.1", CR, LF, NUL
 
 ; =============================================================================
 ;  STMT_EXEC 
@@ -850,83 +867,69 @@ SL_ROOM:
         STRA,R0 EXPH
         LODA,R0 TMPL
         STRA,R0 EXPL
-        ; save line number to CURH:CURL  shift loop clobbers LNUMH:LNUML
+
+        ; save line number to CURH:CURL before shift loop clobbers LNUMH:LNUML
         LODA,R0 LNUMH
         STRA,R0 CURH
         LODA,R0 LNUML
         STRA,R0 CURL
-        ; shift bytes PE-1 down to EXPH:EXPL upward by SC1 positions (backwards copy)
-        ; (body pointer reloaded from IP at SL_NOSHIFT after shift completes)
-        ; shift count = PE - EXPH:EXPL
-        LODA,R0 PEL
-        SUBA,R0 EXPL
-        STRA,R0 TMPL
-        LODA,R0 PEH
-        SUBA,R0 EXPH
-        BCFR,LT SL_SHCNB
-        SUBI,R0 1
-SL_SHCNB:
-        STRA,R0 TMPH            ; TMPH:TMPL = shift count
 
-        ; if shift count == 0 skip loop
-        LODA,R0 TMPH
-        BCTR,GT SL_DOSHIFT
-        LODA,R0 TMPL
-        BCTA,EQ SL_NOSHIFT
-SL_DOSHIFT:
-        ; src = PE-1 in LNUMH:LNUML (shift uses these as src pointer)
-        LODA,R0 PEL
-        SUBI,R0 1
-        STRA,R0 LNUML
+        ; --- START GOLFED SHIFT LOOP ---
+        ; Setup src pointer (LNUMH:LNUML) = PE
         LODA,R0 PEH
-        BCFR,LT SL_SNBR
-        SUBI,R0 1
-SL_SNBR:
-        STRA,R0 LNUMH           ; LNUMH:LNUML = src = PE-1
-        ; dst = src + SC1 (record size = shift amount)
-        ; ISSUE-02 FIX: must test carry from ADDA before any LODA clobbers CC.
-        ; New code: test carry immediately after ADDA, then load LNUMH on both paths.
-        LODA,R0 LNUML
-        ADDA,R0 SC1
+        STRA,R0 LNUMH
+        LODA,R0 PEL
+        STRA,R0 LNUML
+
+        ; Setup dst pointer (GOTOH:GOTOL) = PE + SC1 (new record size)
+        ADDA,R0 SC1             ; R0 is still PEL
         STRA,R0 GOTOL
-        TPSL $01
-        BCTR,LT SL_DSNCA         ; branch if C=0 (no carry)
-        LODA,R0 LNUMH           ; carry path: hi += 1
-        ADDI,R0 1
+        LODA,R0 PEH
+        TPSL $01                ; Check carry from low-byte add
+        BCTR,LT SL_DNC          ; Branch if C=0 (no carry)
+        ADDI,R0 1               ; Add carry to high byte
+SL_DNC:
         STRA,R0 GOTOH
-        BCTR,UN SL_DSNCB
-SL_DSNCA:
-        LODA,R0 LNUMH           ; no-carry path: hi unchanged
-        STRA,R0 GOTOH
-SL_DSNCB:
 
-        ; use R3 as count (shift count lo; assume <256 for any real program)
-        ; Guard zero case first (BDRR with R3=0 would execute once wrongly).
-        LODA,R3 TMPL
 SL_SHLOOP:
-        BCTR,EQ SL_NOSHIFT
-        ; read from LNUMH:LNUML
-        LODA,R1 *LNUMH
-        ; write to GOTOH:GOTOL
-        STRA,R1 *GOTOH
-        ; decrement both pointers
+        ; Check-before-decrement. src starts at PE (one past last byte).
+        ; Loop stops when src has been decremented to the insertion point,
+        ; having moved all bytes in [ins .. PE-1] up by SC1.
+        ; Full 16-bit signed comparison covering all six hi/lo cases:
+        LODA,R0 LNUMH
+        SUBA,R0 EXPH
+        BCTR,GT SL_DOMOV         ; src.hi > ins.hi: keep moving
+        BCTR,LT SL_NOSHIFT       ; src.hi < ins.hi: done
+        LODA,R0 LNUML            ; src.hi == ins.hi: check lo
+        SUBA,R0 EXPL
+        BCTR,GT SL_DOMOV         ; src.lo > ins.lo: keep moving
+        BCTR,UN SL_NOSHIFT       ; src.lo <= ins.lo: done (EQ=at ins, LT=overshot)
+SL_DOMOV:
+        ; Pre-decrement src (LNUMH:LNUML)
         LODA,R0 LNUML
         SUBI,R0 1
         STRA,R0 LNUML
-        BCFR,LT SL_SRNB
+        TPSL $01                ; C=1 = no borrow, C=0 = borrow
+        BCTR,EQ SL_SNC          ; C=1 (no borrow): skip hi-byte dec
         LODA,R0 LNUMH
         SUBI,R0 1
         STRA,R0 LNUMH
-SL_SRNB:
+SL_SNC:
+        ; Pre-decrement dst (GOTOH:GOTOL)
         LODA,R0 GOTOL
         SUBI,R0 1
         STRA,R0 GOTOL
-        BCFR,LT SL_DRNB
+        TPSL $01                ; C=1 = no borrow, C=0 = borrow
+        BCTR,EQ SL_DNC2         ; C=1 (no borrow): skip hi-byte dec
         LODA,R0 GOTOH
         SUBI,R0 1
         STRA,R0 GOTOH
-SL_DRNB:
-        BDRR,R3 SL_SHLOOP       ; R3--; if R3!=0 branch
+SL_DNC2:
+        ; Move byte *dst = *src
+        LODA,R1 *LNUMH
+        STRA,R1 *GOTOH
+        BCTA,UN SL_SHLOOP        ; loop back to check (absolute: TPSL added 4 bytes, BCTR out of range)
+        ; --- END GOLFED SHIFT LOOP ---
 
 SL_NOSHIFT:
         ; write record at EXPH:EXPL (insertion point)
