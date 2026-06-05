@@ -49,24 +49,8 @@
 ;
 ;        CHANGE HISTORY                                                                                                                                                                                  
 ;
-;   V3.1  2026-06-05
-;         BUG-SL Fix: SL_DOMOV pointer decrements used BCFR,LT to detect borrow
-;         after SUBI,R0 1, but BCFR,LT tests the CC field (set from result value
-;         bit-7), not the carry flag. Any lo-byte in $80..$FF gives CC=LT
-;         regardless of borrow, causing spurious hi-byte decrements and runaway
-;         src/dst pointers. Fix: replace BCFR,LT with TPSL $01 / BCTR,EQ to test
-;         carry directly. Loop-back BCTR,UN extended to BCTA,UN (+2 bytes overhead).
-;         Verified: insert/replace/delete all lines, first/middle/last positions.
-;         BUG-LE Fix: SL_SHLOOP stop condition in STORE_LINE was missing
-;         BCTR,LT SL_NOSHIFT after hi-byte subtract, and the lo-byte path
-;         fell through to SL_DOMOV when src.lo < ins.lo (CC=LT). Both cases
-;         caused the shift loop to walk src past the insertion point, corrupting
-;         the program store when replacing a line with content of different length.
-;         Fix: added BCTR,LT SL_NOSHIFT (hi-byte) and BCTR,GT/BCTR,UN (lo-byte)
-;         so all six hi/lo comparison outcomes route correctly.
-;         Verified with pipbug_wrap: 10 PRINT / 20 PRINT / 30 PRINT / LIST /
-;         20 PRINT "HELLO" / LIST now correctly shows updated line 20.
-;
+;   V3.1  2026-06-05 - 3262 Interprteter ROM Bytes
+;         Refactor STORE_LINE: to fix line handling bug and make smaller.
 ;   V3.0  2026-06-04  3306 Interpreter bytes 
 ;         Bug Fix: PARSE_U16 used LODI,R3 10 / BDRR,R3 for multiply-by-10
 ;         loop, clobbering R3 which holds the SW call stack pointer.
