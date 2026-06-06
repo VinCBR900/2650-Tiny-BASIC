@@ -1,10 +1,11 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.9
+ * Version: 1.10
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
  *        asm2650 source.asm -s             (dump symbol table to stderr)
+ *        asm2650 source.asm -NoList        (suppress default .LST file)
  *
  * Supported assembler directives:
  *   ORG, EQU, DS, RES, DB, DW, END
@@ -12,6 +13,11 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.9 -> v1.10:
+ *   Automatically writes a source listing sidecar (.LST) unless -NoList is used.
+ *   Listing output includes addresses, opcode bytes, and a label summary with
+ *   unused labels marked.
  *
  * Changes v1.8 -> v1.9:
  *   db "string" supported, reggedize previosuly silent errors
@@ -52,11 +58,26 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.8"
+#define ASM2650_VERSION "1.10"
 
-typedef struct { char name[32]; int value; } Label;
+typedef struct { char name[32]; int value; int referenced; } Label;
 static Label labels[MAX_LABELS];
 static int   nlabels = 0;
+
+typedef struct {
+    int lineno;
+    int addr;
+    int nbytes;
+    unsigned char *bytes;
+    char *source;
+} ListLine;
+
+static ListLine *list_lines = NULL;
+static int nlist_lines = 0;
+static int list_cap = 0;
+static int list_line_addr = -1;
+static int list_line_nbytes = 0;
+static unsigned char list_line_bytes[MAX_ROM];
 
 static unsigned char rom[MAX_ROM];
 static int rom_lo = MAX_ROM, rom_hi = -1;
@@ -67,6 +88,7 @@ static int  errors = 0;
 static int  lineno = 0;
 static int  warn_inline_label = 1;
 static int  warn_local_abs_branch = 1;
+static int  list_enabled = 1;
 
     /* Upcase the assembler line but preserve content inside single-quoted literals.
      * Handles both 'x' and A'x' (Signetics ASCII) so A'u' stays 0x75 not 0x55. */
@@ -103,17 +125,29 @@ static void emit(int addr, unsigned char b){
     rom[addr]=b;
     if(addr<rom_lo) rom_lo=addr;
     if(addr>rom_hi) rom_hi=addr;
+    if(pass==2 && list_enabled){
+        if(list_line_addr<0) list_line_addr=addr;
+        if(list_line_nbytes<MAX_ROM) list_line_bytes[list_line_nbytes++]=b;
+    }
 }
 
+static int label_find_index(const char *n){
+    for(int i=0;i<nlabels;i++) if(strcmp(labels[i].name,n)==0) return i;
+    return -1;
+}
 static int label_find(const char *n){
-    for(int i=0;i<nlabels;i++) if(strcmp(labels[i].name,n)==0) return labels[i].value;
-    return UNDEF;
+    int i=label_find_index(n);
+    return i>=0 ? labels[i].value : UNDEF;
+}
+static void label_mark_referenced(const char *n){
+    int i=label_find_index(n);
+    if(i>=0) labels[i].referenced=1;
 }
 static void label_define(const char *n, int v){
     for(int i=0;i<nlabels;i++) if(strcmp(labels[i].name,n)==0){ labels[i].value=v; return; }
     if(nlabels>=MAX_LABELS){ fprintf(stderr,"ERROR: label table full\n"); errors++; return; }
     strncpy(labels[nlabels].name,n,31); labels[nlabels].name[31]=0;
-    labels[nlabels].value=v; nlabels++;
+    labels[nlabels].value=v; labels[nlabels].referenced=0; nlabels++;
 }
 
 static int eval_expr(char *s, int *ok){
@@ -148,6 +182,7 @@ static int eval_expr(char *s, int *ok){
             nm[i]=0;
             int lv=label_find(nm);
             if(lv==UNDEF){ if(pass==2){fprintf(stderr,"ERROR line %d: undefined '%s'\n",lineno,nm); errors++;} *ok=0; return 0; }
+            if(pass==2) label_mark_referenced(nm);
             val=lv;
         }
     } else if(*s=='\''){
@@ -506,6 +541,113 @@ static void write_binary(FILE *f, int lo, int hi){
     fwrite(&rom[lo],1,(size_t)(hi-lo+1),f);
 }
 
+static char *xstrdup(const char *s){
+    size_t n=strlen(s)+1;
+    char *p=(char *)malloc(n);
+    if(p) memcpy(p,s,n);
+    return p;
+}
+
+static char *list_path_for_source(const char *src_file){
+    const char *slash1=strrchr(src_file,'/');
+    const char *slash2=strrchr(src_file,'\\');
+    const char *slash=slash1;
+    if(!slash || (slash2 && slash2>slash)) slash=slash2;
+    const char *base=slash?slash+1:src_file;
+    const char *dot=strrchr(base,'.');
+    size_t stem_len=dot ? (size_t)(dot-src_file) : strlen(src_file);
+    char *path=(char *)malloc(stem_len+5);
+    if(!path) return NULL;
+    memcpy(path,src_file,stem_len);
+    memcpy(path+stem_len,".LST",5);
+    return path;
+}
+
+static void list_begin_line(void){
+    list_line_addr=-1;
+    list_line_nbytes=0;
+}
+
+static int list_add_line(int src_lineno, const char *source){
+    ListLine *ll;
+    if(nlist_lines>=list_cap){
+        int new_cap=list_cap?list_cap*2:256;
+        ListLine *new_lines=(ListLine *)realloc(list_lines,(size_t)new_cap*sizeof(*list_lines));
+        if(!new_lines){ fprintf(stderr,"ERROR: out of memory storing listing\n"); errors++; return 0; }
+        list_lines=new_lines;
+        list_cap=new_cap;
+    }
+    ll=&list_lines[nlist_lines++];
+    ll->lineno=src_lineno;
+    ll->addr=list_line_addr;
+    ll->nbytes=list_line_nbytes;
+    ll->bytes=NULL;
+    ll->source=xstrdup(source);
+    if(!ll->source){ fprintf(stderr,"ERROR: out of memory storing listing source\n"); errors++; return 0; }
+    if(list_line_nbytes>0){
+        ll->bytes=(unsigned char *)malloc((size_t)list_line_nbytes);
+        if(!ll->bytes){ fprintf(stderr,"ERROR: out of memory storing listing bytes\n"); errors++; return 0; }
+        memcpy(ll->bytes,list_line_bytes,(size_t)list_line_nbytes);
+    }
+    return 1;
+}
+
+static int write_listing(const char *src_file){
+    char *lst_file=list_path_for_source(src_file);
+    FILE *f;
+    if(!lst_file){ fprintf(stderr,"ERROR: out of memory creating list filename\n"); return 0; }
+    f=fopen(lst_file,"w");
+    if(!f){ fprintf(stderr,"Cannot create '%s'\n",lst_file); free(lst_file); return 0; }
+
+    fprintf(f,"asm2650 v%s listing for %s\n\n",ASM2650_VERSION,src_file);
+    fprintf(f,"Line  Addr   Opcodes                  Source\n");
+    fprintf(f,"----  -----  -----------------------  ------\n");
+    for(int i=0;i<nlist_lines;i++){
+        ListLine *ll=&list_lines[i];
+        if(ll->nbytes<=0){
+            fprintf(f,"%4d         %-23s  %s\n",ll->lineno,"",ll->source?ll->source:"");
+            continue;
+        }
+        int offset=0;
+        while(offset<ll->nbytes){
+            int chunk=ll->nbytes-offset;
+            if(chunk>8) chunk=8;
+            char opbuf[3*8+1];
+            int pos=0;
+            for(int j=0;j<chunk;j++) pos+=sprintf(opbuf+pos,"%02X%s",ll->bytes[offset+j],j==chunk-1?"":" ");
+            if(offset==0){
+                fprintf(f,"%4d  $%04X  %-23s  %s\n",ll->lineno,ll->addr+offset,opbuf,ll->source?ll->source:"");
+            } else {
+                fprintf(f,"%4s  $%04X  %-23s\n","",ll->addr+offset,opbuf);
+            }
+            offset+=chunk;
+        }
+    }
+
+    fprintf(f,"\nLabels:\n");
+    fprintf(f,"Name                             Value  Status\n");
+    fprintf(f,"-------------------------------  -----  ------\n");
+    for(int i=0;i<nlabels;i++){
+        fprintf(f,"%-31s  $%04X  %s\n",labels[i].name,labels[i].value,labels[i].referenced?"USED":"UNUSED");
+    }
+
+    if(fclose(f)!=0){ fprintf(stderr,"Cannot finish writing '%s'\n",lst_file); free(lst_file); return 0; }
+    fprintf(stderr,"List: %s\n",lst_file);
+    free(lst_file);
+    return 1;
+}
+
+static void free_listing(void){
+    for(int i=0;i<nlist_lines;i++){
+        free(list_lines[i].bytes);
+        free(list_lines[i].source);
+    }
+    free(list_lines);
+    list_lines=NULL;
+    nlist_lines=0;
+    list_cap=0;
+}
+
 static void print_usage(FILE *f){
     fprintf(f,"asm2650 v%s - Signetics 2650 cross-assembler\n", ASM2650_VERSION);
     fprintf(f,"Usage: asm2650 [options] source.asm [output.hex]\n");
@@ -514,6 +656,7 @@ static void print_usage(FILE *f){
     fprintf(f,"  --binary                       Write flat 32768-byte binary image\n");
     fprintf(f,"  -o <file>                      Write binary image to <file>\n");
     fprintf(f,"  -r $HHHH-$HHHH                 Limit binary output address range (inclusive)\n");
+    fprintf(f,"  -NoList                        Suppress default .LST listing sidecar\n");
     fprintf(f,"  --no-warn-inline-label         Disable warning for LABEL: INSTR on same line\n");
     fprintf(f,"  --no-warn-local-branch         Disable warning when absolute branch could be relative\n");
     fprintf(f,"  -h, --help                     Show this help and exit\n");
@@ -538,6 +681,7 @@ int main(int argc,char *argv[]){
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"-s")) dump_syms=1;
         else if(!strcmp(argv[i],"--binary")) binary_mode=1;
+        else if(!strcmp(argv[i],"-NoList")) list_enabled=0;
         else if(!strcmp(argv[i],"-o")){
             if(i+1>=argc){ fprintf(stderr,"ERROR: -o requires a file path\n"); return 1; }
             bin_file=argv[++i];
@@ -573,13 +717,21 @@ int main(int argc,char *argv[]){
     for(pass=1;pass<=2;pass++){
         FILE *f=fopen(src_file,"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",src_file);return 1;}
         pc=0; lineno=0; char line[MAX_LINE];
-        while(fgets(line,MAX_LINE,f)){ lineno++; int l=strlen(line); while(l>0&&(line[l-1]=='\r'||line[l-1]=='\n')) line[--l]=0; assemble_line(line); }
+        while(fgets(line,MAX_LINE,f)){
+            lineno++;
+            int l=strlen(line);
+            while(l>0&&(line[l-1]=='\r'||line[l-1]=='\n')) line[--l]=0;
+            if(pass==2 && list_enabled) list_begin_line();
+            assemble_line(line);
+            if(pass==2 && list_enabled) list_add_line(lineno,line);
+        }
         fclose(f);
     }
     fprintf(stderr,"Pass complete: %d error(s), %d label(s)\n",errors,nlabels);
     if(dump_syms){ for(int i=0;i<nlabels;i++) fprintf(stderr,"  %-20s $%04X\n",labels[i].name,labels[i].value); }
-    if(errors) return 1;
+    if(errors){ free_listing(); return 1; }
     if(rom_hi>=rom_lo) fprintf(stderr,"Code: $%04X-$%04X (%d bytes)\n",rom_lo,rom_hi,rom_hi-rom_lo+1);
+    if(list_enabled && !write_listing(src_file)){ free_listing(); return 1; }
     FILE *out=stdout;
     if(binary_mode){
         if(bin_file){
@@ -592,5 +744,6 @@ int main(int argc,char *argv[]){
         write_hex(out);
     }
     if(out!=stdout) fclose(out);
+    free_listing();
     return 0;
 }
