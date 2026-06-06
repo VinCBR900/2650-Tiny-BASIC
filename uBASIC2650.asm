@@ -1,6 +1,6 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
 ; Version: v3.1
-; Date:    2026-06-04
+; Date:    2026-06-05
 ;
 ; Target : PIPBUG 1 monitor (ROM $0000-$03FF, RAM $0400-$043F)
 ;          Code base $0440.  Single 8192-byte address page (bit15-13 always 0).
@@ -49,8 +49,28 @@
 ;
 ;        CHANGE HISTORY                                                                                                                                                                                  
 ;
-;   V3.1  2026-06-05 - 3262 Interprteter ROM Bytes
-;         Refactor STORE_LINE: to fix line handling bug and make smaller.
+;   V3.1  2026-06-05  3228 interpreter bytes
+;         OPT-A (ERRFLG/CC): FIND_LINE returns CC=EQ (found) or CC=GT (not found)
+;           instead of writing ERRFLG. DELETE_LINE reads CC directly. Saves 11 bytes.
+;           JERRLINE label removed (dead code, nothing jumped to it). Saves 5 bytes.
+;         OPT-B (ERRFLG/CC): TRY_STORE_LINE returns CC=GT (line stored) or CC=EQ/LT
+;           (not stored). REPL tests CC directly after BSTA. CPSL $C0 added to force
+;           CC=EQ on the char>'9' early-exit path. EORZ+STRA ERRFLG at REPL and
+;           LODA ERRFLG after return both removed. Net saves 8 bytes.
+;         ERRFLG-free: With no remaining readers, defensive ERRFLG clears in
+;           DIV16, PARSE_EXPR, and PF_LOADVAR removed. Saves 12 bytes.
+;           ERRFLG variable ($1610) freed for future use.
+;         BUG-SL Fix: SL_DOMOV pointer decrements used BCFR,LT to detect borrow
+;           after SUBI,R0 1, but BCFR,LT tests CC (set from result bit-7), not the
+;           carry flag. Any lo-byte $80..$FF gives CC=LT regardless of borrow,
+;           causing spurious hi-byte decrements and runaway src/dst pointers.
+;           Fix: TPSL $01 / BCTR,EQ tests carry directly. Loop-back BCTR,UN
+;           extended to BCTA,UN (+2 bytes). Net saves 0 bytes (overhead absorbed).
+;         BUG-LE Fix: SL_SHLOOP stop condition was missing BCTR,LT SL_NOSHIFT
+;           after hi-byte subtract, and lo-byte path fell through to SL_DOMOV when
+;           src.lo < ins.lo. Both cases walked src past the insertion point.
+;           Fix: full 6-case 16-bit comparison with BCTR,GT/BCTR,UN routing.
+;
 ;   V3.0  2026-06-04  3306 Interpreter bytes 
 ;         Bug Fix: PARSE_U16 used LODI,R3 10 / BDRR,R3 for multiply-by-10
 ;         loop, clobbering R3 which holds the SW call stack pointer.
@@ -218,11 +238,8 @@ REPL:
         STRA,R0 IPH
         LODI,R0 >IBUF
         STRA,R0 IPL
-        EORZ,R0             ; BUG-NF-02 FIX: clear ERRFLG before TRY_STORE_LINE;
-        STRA,R0 ERRFLG      ; stale $01 from previous line-store would suppress STMT_EXEC
-        BSTA,UN TRY_STORE_LINE
-        LODA,R0 ERRFLG                   ; OPT-10: LODA sets CC; ERRFLG=0EQ, 1GT
-        BCTR,GT REPL             ; branch if ERRFLG=1 (was COMI $01/BCTR,EQ)
+        BSTA,UN TRY_STORE_LINE           ; OPT-B: CC=GT if line stored, EQ/LT if not
+        BCTR,GT REPL                     ; CC=GT: line stored, loop back
         BSTR,UN STMT_EXEC
         BCTR,UN REPL
 
@@ -769,6 +786,7 @@ TRY_STORE_LINE:
         RETC,LT
         COMI,R0 A'9'+1
         BCTR,LT TSL_NUM
+        CPSL $C0                         ; OPT-B: force CC=EQ (not GT) for non-digit > '9'
         RETC,UN
 TSL_NUM:
         BSTA,UN WSKIP
@@ -790,8 +808,7 @@ TSL_NZ:
 TSL_DEL:
         BSTA,UN DELETE_LINE              ; [+1]
 TSL_DONE:
-        LODI,R0 1
-        STRA,R0 ERRFLG
+        LODI,R0 1                        ; OPT-B: CC=GT signals 'line stored'
         RETC,UN
 
 ; =============================================================================
@@ -958,10 +975,9 @@ SL_WDONE:
 ; =============================================================================
 ;  DELETE_LINE 
 DELETE_LINE:
-        BSTA,UN FIND_LINE                ; [+1]
-        LODA,R0 ERRFLG
-        BCTR,EQ DL2_FOUND               ; ERRFLG=0 (EQ)  found
-        RETC,UN                          ; not found  silent return
+        BSTA,UN FIND_LINE                ; [+1] CC=EQ found, CC=GT not found
+        BCTR,EQ DL2_FOUND               ; OPT-A: CC from FIND_LINE (EQ=found, GT=not found)
+        RETC,UN                          ; not found: silent return
 DL2_FOUND:
         ; record start in TMPH:TMPL.  CR-format: size = scan from +2 until CR + 3.
         LODA,R0 TMPH
@@ -1052,17 +1068,10 @@ FL_CHK:
         SUBA,R0 LNUMH
         BCTR,EQ FL_CHKLO
 FL_RET_NF:
-        ; BUG-NF-01 FIX: FL_RET_NF must return to caller with ERRFLG=$01 (not found).
-        ; Previously FL_RET_NF fell into JERRLINE which jumped to DO_ERROR, jettisoning
-        ; the RAS. DELETE_LINE calls FIND_LINE and needs a normal return when the line
-        ; doesn't exist (silent no-op). JERRLINE is kept as a separate label for callers
-        ; (DR_GOTO) that always want an error on not-found.
-        LODI,R0 1
-        STRA,R0 ERRFLG
+        ; OPT-A: LODI,R0 1 sets CC=GT, signals not-found to DELETE_LINE via CC.
+        LODI,R0 1                        ; CC=GT = not found
         RETC,UN
-JERRLINE:
-        LODI,R0 ERR_UND_LINE
-        BCTA,UN DO_ERROR  ; undefined line  returns to REPL
+; JERRLINE removed: dead code (DR_GOTO ignores not-found; nothing else jumped here)
 FL_CHKLO:
         LODA,R0 TMPL
         ADDI,R0 1
@@ -1080,8 +1089,7 @@ FL_LH:
         BCTR,EQ FL_FOUND
         BCTR,UN FL_RET_NF
 FL_FOUND:
-        EORZ,R0
-        STRA,R0 ERRFLG
+        EORZ,R0                          ; CC=EQ signals found (replaces STRA ERRFLG)
         RETC,UN
 
 ; =============================================================================
@@ -1177,12 +1185,10 @@ PARSER_RET:
 ; Handles: literals, variables (A-Z), unary +/-, parens, */% then +/-.
 ; Callers handle relational operators after this returns.
 ; In:  IPH:IPL = pointer to expression string
-; Out: EXPH:EXPL = 16-bit signed result; ERRFLG cleared
+; Out: EXPH:EXPL = 16-bit signed result
 ; Clobbers: R0, R3, SAVEH, SAVEL, E1SAVH, E1SAVL, NEGFLG, SC0, SC1, TMPH, TMPL
 PARSE_EXPR:
-        EORZ,R0
-        STRA,R0 ERRFLG
-        LODI,R3 $FF                      ; SW stack empty sentinel (pre-increment: first write goes to SWBASE[0])
+        LODI,R3 $FF                      ; ERRFLG-free: no reader remains                      ; SW stack empty sentinel (pre-increment: first write goes to SWBASE[0])
 EXPR_AM_RAS:
 EXPR_AM:
         LODI,R0 >EAM0_RET
@@ -1408,9 +1414,7 @@ PF_LOADVAR:
         STRA,R0 EXPH             
         LODA,R0 VARS+1,R1        ; Native Indexed Load Lo byte
         STRA,R0 EXPL             
-        EORZ,R0 
-        STRA,R0 ERRFLG           
-        RETC,UN
+        RETC,UN                          ; ERRFLG-free: no reader remains
 
 ; =============================================================================
 ;  PARSE_RELOP 
@@ -1659,9 +1663,7 @@ MU_DONE:
 ; Signed TMPH:TMPL  EXPH:EXPL  EXPH:EXPL  (truncate toward zero)
 ; ERRFLG=$01 and DO_ERROR called on divide-by-zero.
 DIV16:
-        EORZ,R0 ; Clear R0
-        STRA,R0 ERRFLG
-        LODA,R0 EXPH
+        LODA,R0 EXPH                     ; ERRFLG-free: no reader remains
         BCTR,GT DV_NZ
         BCTR,LT DV_NZ
         LODA,R0 EXPL
