@@ -41,7 +41,6 @@
 ;   R3  loop counter (BDRR/BIRR); STORE_LINE shift count.
 ;
 ;        KNOWN OPEN ITEMS                                                                                                                                                                            
-;   BUG-LE:   FIXED in v3.1
 ;   COLON-01: ':' multi-statement separator not supported ("A=1:GOTO 10").
 ;             Unlikely to be implemented, would consume a RAS slot per statement.
 ;   OPT-16:   MUL16/DIV16 use naive loop (O(N)). Bit-serial with RRL/RRR rotate
@@ -2291,7 +2290,7 @@ ROMEND: ; so we can measure Binary rom size
 ; =============================================================================
 ; Pre-loaded showcase program  
 ;
-;   Stored as raw ASCII.  Line format: <lineno_lo> <lineno_hi> <body> <CR>
+;   Stored as raw ASCII.  Line format: <lineno_Hi> <lineno_Lo> <body> <CR>
 ;
 ;   Lines  10-260: feature demos (PRINT, CHR$, arithmetic, comparisons, loops)
 ;   Lines 270-480: Mandelbrot set renderer
