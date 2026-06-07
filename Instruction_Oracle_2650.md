@@ -1,4 +1,4 @@
-# **Signetics 2650 Instruction Set Oracle v1.5**
+# **Signetics 2650 Instruction Set Oracle v1.7**
 
 ## **1\. Definitions & Addressing Modes**
 
@@ -55,7 +55,7 @@ high byte has bit 7 clear (e.g., target address \<= $7FFF). If you attempt to po
 to an address with Bit 15 set, the 2650 will enter an indirect resolution loop,   
 clobbering execution tracking.
 
-**HI/LO Byte Operators** *(WinArcadia / asm2650.py / Signetics standard)*
+**HI/LO Byte Operators** *(WinArcadia / asm2650 / Signetics standard)*
 
 * **\<ADDR** \= **HIGH byte** (bits 15:8) — e.g. \<$1584 \= $15.  
 * **\>ADDR** \= **LOW byte** (bits 7:0) — e.g. \>$1584 \= $84.  
@@ -221,7 +221,7 @@ COMR,rn rel         ;rn : \*(rel) \-\> sets CC;                   ;3,2
 COMZ,rn             ;r0 : rn    \-\> sets CC;                    ;2,1  
 COMA,r0 abs,x       ;r0 : \*(abs+x) \-\> sets CC;                 ;4,3
 
-**KEY:** In indexed absolute mode the register field in the opcode byte encodes the **index register**, NOT the destination. Destination is always R0. LODA,R0 BASE,R2 emits opcode $0E (R2 in field), not $0C (R0). Confirmed by asm2650.py and WinArcadia.
+**KEY:** In indexed absolute mode the register field in the opcode byte encodes the **index register**, NOT the destination. Destination is always R0. LODA,R0 BASE,R2 emits opcode $0E (R2 in field), not $0C (R0 in field). Confirmed by asm2650 and WinArcadia.
 
 ### **Branching & Subroutine Calls**
 
@@ -230,7 +230,7 @@ BCTA,cond \*abs      ;if(cond) PC \= \*abs;                       ;3,3
 BCTR,cond rel       ;if(cond) PC \+= rel;                       ;3,2  
 BCFA,cond abs       ;if(\!cond) PC \= abs;                       ;3,3  
 BCFA,cond \*abs      ;if(\!cond) PC \= \*abs;                      ;3,3  
-BCFR,cond rel       ;if(\!cond) PC \+= rel;                      ;3,2
+BCFR,cond rel       ;if(\!cond) PC \+= rel;                      ;3,2  
 
 BSTA,cond abs       ;if(cond) { push(PC); PC \= abs; }          ;3,3  
 BSTA,cond \*abs      ;if(cond) { push(PC); PC \= \*abs; }         ;3,3  
@@ -241,10 +241,29 @@ BSFR,cond rel       ;if(\!cond){ push(PC); PC \+= rel; }         ;3,2
 RETC,cond           ;if(cond) PC \= pop();                      ;3,1  
 RETE,cond           ;if(cond) { PC \= pop(); enable ints; }     ;3,1
 
-ZBRR    offset      ;PC \= page\_base \+/- sign\_extend\_7bit (offset))          ;2,2  
-ZBRR    \*offset     ;PC \= \*(page\_base \+/- sign\_extend\_7bit (offset))          ;2,2  
-ZBSR    offset      ;push(PC); PC \= page\_base \+/- sign\_extend\_7bit(offset) ;3,2  
-ZBSR    \*offset     ;push(PC); PC \= \*(page\_base \+/- sign\_extend\_7bit(offset)) ;3,2
+### **Zero-Page Branch Instructions (ZBRR / ZBSR)**
+
+These are 2-byte instructions. The second byte encodes an **indirect flag (bit 7)** and a
+**signed 7-bit displacement from address zero** — NOT from the current PC.
+
+Binary format: `iaaaaaaa` where i=indirect flag, aaaaaaa=signed 7-bit displacement.
+
+The effective address is: `(0 + sign_extend(aaaaaaa)) mod 8192`
+
+This clears address bits 13 and 14 (the page bits), forcing execution into page zero
+regardless of where the instruction appears in memory.
+
+Range: -64 to +63 relative to address zero.  
+Negative displacements wrap to the end of page zero (e.g. -8 → address $1FF8).
+
+ZBRR    zero        ;PC \= (0 + zero) mod 8192;                 ;3,2  
+ZBRR    \*zero       ;PC \= \*(0 + zero);                         ;5,2  
+ZBSR    zero        ;push(PC); PC \= (0 + zero) mod 8192;       ;3,2  
+ZBSR    \*zero       ;push(PC); PC \= \*(0 + zero);               ;5,2
+
+⚠️ **PIPBUG CONSTRAINT:** ZBRR/ZBSR target range $0000–$007F is entirely within  
+PIPBUG ROM — these instructions are **unusable for user jumps under PIPBUG**.  
+User code base is $0C00; there is no page-zero RAM available for targets.
 
 BXA     abs,r3       ;goto abs \+ r3;                          ;3,3  
 BXA     \*abs,r3      ;goto \*(abs) \+ r3;                       ;5,3  
@@ -310,6 +329,22 @@ RRR,rn              ;Rotate Right rn (circular or w/carry);    ;2,1
 RRL,rn              ;Rotate Left  rn (circular or w/carry);    ;2,1  
 TMI,rn imm          ;Test mask: CC=EQ if (rn\&imm)==imm, else LT ;3,2
 
+**Note on RRL Rotate Register Left**: 
+  This one-byte instruction causes the contents of the specified register,
+r, to be shifted left one bit. If the WC bit in the Program Status Word
+(PSW) is set to zero, bit #7 of register r flows into bit #0; if WC=1,
+then bit #7 flows into the Carry (C) bit and the Carry (C) bit flows into
+bit #0.
+  Register bit #4 flows into the IDC if WC=1.
+
+**Note on RRR Rotate Register Right**: 
+  This one-byte instruction causes the contents of the specified register,
+r, to be shifted right one bit. If the WC bit in the Program Status Word
+(PSW) is set to zero, bit #0 of register r flows into bit #7; if WC=1,
+then bit #0 flows into the Carry (C) bit and the Carry (C) bit flows into
+bit #7.
+  Register bit #6 flows into the IDC if WC=1.
+
 ### **PSL Bit Layout**
 
 PSL: CC1\[7\] CC0\[6\] IDC\[5\] RS\[4\] WC\[3\] OVF\[2\] COM\[1\] C\[0\]
@@ -358,6 +393,17 @@ CRLF  $008A   BSTA,UN $008A   print CR+LF
 User code: ORG $0C00, run via G 0C00. PIPBUG ROM $0000-$03FF (read-only). First free RAM: $0440. PIPBUG RAM $0400-$043F (reserved). ZBSR/ZBRR target range $0000-$007F is entirely within PIPBUG ROM — unusable under PIPBUG.
 
 ## **7\. Version History**
+
+### **Changes v1.6 \-\> v1.7 Updated: 2026-06-07**
+
+* **FIXED ZBRR/ZBSR documentation:** These are 2-byte instructions (not 1-byte as previously implied for ZBRR). The second byte encodes `iaaaaaaa` — indirect flag (bit 7) + signed 7-bit displacement **from address zero**, NOT from PC. Range -64 to +63 relative to address $0000. Negative displacements wrap to end of page zero via modulo 8192. Confirmed from Signetics 2650 User Manual.
+* **NOTED asm2650 assembler fixes (v1.11):** Three bugs corrected in asm2650.c:
+  1. **TMI mask byte** — was always emitting $00 regardless of operand. Fixed: mask now correctly parsed from space-separated operand in ops[0].
+  2. **ZBRR** — was emitting only 1 byte with no displacement operand. Fixed: now emits 2 bytes with signed 7-bit zero-page displacement.
+  3. **ZBSR** — was applying PC-relative range validation, causing false out-of-range errors for valid zero-page addresses. Fixed: validates -64..+63 as zero-page signed displacement.
+
+  ### **Changes v1.5 \-\> v1.6 Updated: 2026-06-05**
+Added RRL/RRR description for MUL/DIV usage.
 
 ### **Changes v1.4 \-\> v1.5 Updated: 2026-05-21**
 
