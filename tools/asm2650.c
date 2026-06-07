@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.11
+ * Version: 1.12
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -13,6 +13,12 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.11 -> v1.12:
+ *   BUG-ASM-05 FIXED: Semicolons inside quoted literals were treated as comments.
+ *     Added quote-aware comment stripping and operand splitting so DB "PRINT ;",
+ *     DB strings containing commas/semicolons, and single-quoted character literals
+ *     such as LODI,R1 ';' encode correctly while real comments still work.
  *
  * Changes v1.10 -> v1.11:
  *   BUG-ASM-02 FIXED: TMI mask byte was always emitting $00 regardless of operand.
@@ -69,7 +75,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.10"
+#define ASM2650_VERSION "1.12"
 
 typedef struct { char name[32]; int value; int referenced; } Label;
 static Label labels[MAX_LABELS];
@@ -212,24 +218,62 @@ static int eval_expr(char *s, int *ok){
     return val;
 }
 
+/* Strip comments from an assembler line while preserving semicolons inside
+ * single-quoted character literals and double-quoted DB strings.  The assembler
+ * does not define escape sequences, so a matching quote always closes the
+ * current quoted region; only semicolons seen outside quotes start comments. */
+static void strip_comment(char *s)
+{
+    int quote = 0;   /* 0 = not in quote, otherwise quote char (' or ") */
+
+    for (; *s; s++) {
+        if (quote) {
+            if (*s == quote)
+                quote = 0;
+            continue;
+        }
+
+        if (*s == '\'' || *s == '"') {
+            quote = *s;
+            continue;
+        }
+
+        if (*s == ';') {
+            *s = 0;
+            return;
+        }
+    }
+}
+
+/* Split operands on commas and stop at semicolon comments, but only when those
+ * delimiter characters are outside quoted text.  This keeps DB strings such as
+ * "A,B;C" and character literals such as ';' intact for later evaluation. */
 static int split_ops(char *s, char ops[][64], int maxops){
-    /* Split on commas, but treat single-quoted chars ('x' and A'x') as atomic tokens
-     * so that A',' is not split at the comma inside the quotes. */
     int n=0; s=skip_ws(s);
     while(*s&&n<maxops){
         int i=0;
-        while(*s&&*s!=','&&*s!=';'&&i<63){
-            if(*s=='\''){ /* 'x' literal — copy opening quote, char, closing quote */
-                if(i<63) ops[n][i++]=*s++;          /* opening ' */
-                if(*s&&i<63) ops[n][i++]=*s++;       /* the char itself */
-                if(*s=='\''&&i<63) ops[n][i++]=*s++; /* closing ' */
-            } else {
-                ops[n][i++]=*s++;
+        int quote=0;
+        while(*s&&i<63){
+            if(quote){
+                ops[n][i++]=*s;
+                if(*s==quote) quote=0;
+                s++;
+                continue;
             }
+            if(*s=='\''||*s=='"'){
+                quote=*s;
+                ops[n][i++]=*s++;
+                continue;
+            }
+            if(*s==','||*s==';') break;
+            ops[n][i++]=*s++;
         }
         ops[n][i]=0;
         for(int j=i-1;j>=0&&(ops[n][j]==' '||ops[n][j]=='\t');j--) ops[n][j]=0;
-        n++; if(*s==',') s++; s=skip_ws(s);
+        n++;
+        if(*s==',') s++;
+        else if(*s==';') break;
+        s=skip_ws(s);
     }
     return n;
 }
@@ -273,7 +317,8 @@ static int rel_offset_if_possible(int target, int base_pc, int *off_out){
 static void assemble_line(char *line){
     char buf[MAX_LINE]; strncpy(buf,line,MAX_LINE-1); buf[MAX_LINE-1]=0;
     upcase(buf);
-    char *p=buf; while(*p){ if(*p==';'){*p=0;break;} p++; }
+    strip_comment(buf);
+    char *p=buf;
     p=skip_ws(buf); if(!*p) return;
     char lbl[32]="";
     int lbl_has_colon = 0;
