@@ -9,7 +9,7 @@
 ;     relative-memory group so they fall within ±63 byte reach.
 ;   - Absolute-memory forms use a fixed data page at $0F00.
 ;   - ZBSR target placed within its tight ±63 byte range.
-;   - TMI known assembler bug: mask byte always emits $00.
+;   - ZBRR/ZBSR: 2-byte, signed 7-bit displacement from address zero (NOT PC-relative).
 ; ============================================================
 
 TESTVAL equ     $A5
@@ -42,7 +42,8 @@ ABSDAT  equ     $0F00           ; data page for absolute forms
         lodr,r1 DAT_LODR        ; $09 xx
         lodr,r2 DAT_LODR        ; $0A xx
         lodr,r3 DAT_LODR        ; $0B xx
-DAT_LODR db     $55             ; data patch - within reach above
+        bctr,un DAT_LODR+1      ; skip over inline data byte
+DAT_LODR db     $55             ; data byte - within relative reach above
 
 ; ============================================================
 ; GROUP 4: LOAD ABSOLUTE  (LODA)  $0C-$0F
@@ -67,7 +68,8 @@ DAT_LODR db     $55             ; data patch - within reach above
         strr,r1 DAT_STRR        ; $C9 xx
         strr,r2 DAT_STRR        ; $CA xx
         strr,r3 DAT_STRR        ; $CB xx
-DAT_STRR db     $00             ; scratch byte within reach above
+        bctr,un DAT_STRR+1      ; skip over inline data byte
+DAT_STRR db     $00             ; scratch byte - within relative reach above
 
 ; ============================================================
 ; GROUP 7: STORE ABSOLUTE  (STRA)  $CC-$CF
@@ -91,7 +93,8 @@ DAT_STRR db     $00             ; scratch byte within reach above
         addr,r1 DAT_ADDR        ; $89 xx
         addr,r2 DAT_ADDR        ; $8A xx
         addr,r3 DAT_ADDR        ; $8B xx
-DAT_ADDR db     $01             ; within reach
+        bctr,un DAT_ADDR+1      ; skip over inline data byte
+DAT_ADDR db     $01             ; data byte - within relative reach above
         adda,r0 ABSDAT          ; $8C 00 xx
         adda,r1 ABSDAT,r2       ; $8D xx xx
         adda,r2 ABSDAT          ; $8E 00 xx
@@ -111,6 +114,7 @@ DAT_ADDR db     $01             ; within reach
         subr,r1 DAT_SUBR        ; $A9 xx
         subr,r2 DAT_SUBR        ; $AA xx
         subr,r3 DAT_SUBR        ; $AB xx
+        bctr,un DAT_SUBR+1      ; skip over inline data byte
 DAT_SUBR db     $01
         suba,r0 ABSDAT          ; $AC 00 xx
         suba,r1 ABSDAT,r2       ; $AD xx xx
@@ -131,6 +135,7 @@ DAT_SUBR db     $01
         eorr,r1 DAT_EORR        ; $29 xx
         eorr,r2 DAT_EORR        ; $2A xx
         eorr,r3 DAT_EORR        ; $2B xx
+        bctr,un DAT_EORR+1      ; skip over inline data byte
 DAT_EORR db     $FF
         eora,r0 ABSDAT          ; $2C 00 xx
         eora,r1 ABSDAT,r2       ; $2D xx xx
@@ -151,6 +156,7 @@ DAT_EORR db     $FF
         andr,r1 DAT_ANDR        ; $49 xx
         andr,r2 DAT_ANDR        ; $4A xx
         andr,r3 DAT_ANDR        ; $4B xx
+        bctr,un DAT_ANDR+1      ; skip over inline data byte
 DAT_ANDR db     $FF
         anda,r0 ABSDAT          ; $4C 00 xx
         anda,r1 ABSDAT,r2       ; $4D xx xx
@@ -171,6 +177,7 @@ DAT_ANDR db     $FF
         iorr,r1 DAT_IORR        ; $69 xx
         iorr,r2 DAT_IORR        ; $6A xx
         iorr,r3 DAT_IORR        ; $6B xx
+        bctr,un DAT_IORR+1      ; skip over inline data byte
 DAT_IORR db     $AA
         iora,r0 ABSDAT          ; $6C 00 xx
         iora,r1 ABSDAT,r2       ; $6D xx xx
@@ -191,6 +198,7 @@ DAT_IORR db     $AA
         comr,r1 DAT_COMR        ; $E9 xx
         comr,r2 DAT_COMR        ; $EA xx
         comr,r3 DAT_COMR        ; $EB xx
+        bctr,un DAT_COMR+1      ; skip over inline data byte
 DAT_COMR db     $A5
         coma,r0 ABSDAT          ; $EC 00 xx
         coma,r1 ABSDAT,r2       ; $ED xx xx
@@ -199,12 +207,12 @@ DAT_COMR db     $A5
 
 ; ============================================================
 ; GROUP 14: TEST MASK IMMEDIATE  (TMI)  $F4-$F7
-; BUG: assembler emits $00 for mask byte regardless of operand
+; Correctly encodes mask byte. Fixed in asm2650 v1.11.
 ; ============================================================
-        tmi,r0  $FF             ; $F4 00  (BUG: should be F4 FF)
-        tmi,r1  MASK_HI         ; $F5 00  (BUG: should be F5 F0)
-        tmi,r2  MASK_LO         ; $F6 00  (BUG: should be F6 0F)
-        tmi,r3  TESTVAL         ; $F7 00  (BUG: should be F7 A5)
+        tmi,r0  $FF             ; $F4 FF
+        tmi,r1  MASK_HI         ; $F5 F0
+        tmi,r2  MASK_LO         ; $F6 0F
+        tmi,r3  TESTVAL         ; $F7 A5
 
 ; ============================================================
 ; GROUP 15: ROTATE  (RRR/RRL)  $50-$53, $D0-$D3
@@ -291,7 +299,7 @@ BT_EQ   bctr,eq BT_EQ          ; $18 7E  self-loop
 BF_EQ   bcfr,eq BF_EQ          ; $98 7E
         bcfr,gt BF_EQ          ; $99 7C
         bcfr,lt BF_EQ          ; $9A 7A
-        zbrr    BF_EQ          ; $9B      1 byte only
+        zbrr    $00            ; $9B 00  zero-page displacement to addr $0000
 
 ; ============================================================
 ; GROUP 22: BRANCH CONDITION FALSE absolute  BCFA  $9C-$9E
@@ -325,7 +333,7 @@ BS_EQ   bstr,eq BS_EQ          ; $38 7E
 BF2_EQ  bsfr,eq BF2_EQ         ; $B8 7E
         bsfr,gt BF2_EQ         ; $B9 7C
         bsfr,lt BF2_EQ         ; $BA 7A
-        zbsr    $0000          ; $BB 00  zero-page absolute addr (0x00-0x3F only)
+        zbsr    $00            ; $BB 00  zero-page displacement (manual: -64..+63 from page zero)
 
 ; ============================================================
 ; GROUP 26: BRANCH TO SUB FALSE absolute  BSFA  $BC-$BE

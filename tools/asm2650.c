@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.10
+ * Version: 1.11
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -13,6 +13,17 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.10 -> v1.11:
+ *   BUG-ASM-02 FIXED: TMI mask byte was always emitting $00 regardless of operand.
+ *     Root cause: mask and register were both in ops[0] space-separated; ops[1] was
+ *     empty. Fixed by using ops0_after_reg() to extract mask from after register token.
+ *   BUG-ASM-03 FIXED: ZBRR was emitting only 1 byte with no displacement operand.
+ *     Fixed: now correctly emits 2 bytes with signed 7-bit zero-page displacement
+ *     plus indirect flag in bit 7, per Signetics 2650 User Manual.
+ *   BUG-ASM-04 FIXED: ZBSR was applying PC-relative range validation causing false
+ *     out-of-range errors. Fixed: validates as -64..+63 zero-page signed displacement;
+ *     indirect flag (*) correctly sets bit 7 of displacement byte.
  *
  * Changes v1.9 -> v1.10:
  *   Automatically writes a source listing sidecar (.LST) unless -NoList is used.
@@ -345,16 +356,21 @@ static void assemble_line(char *line){
         Indirect addressing may be specified. (Bit 7 2nd byte)
     * ZBSR replaces BSTA,UN & ZBRR replaces BCTA,UN both unconditional
     * short form 2 byte replacements instead of 3, with indirect (*) lookup table*/
-    if(strcmp(mn,"ZBRR")==0){ emit(pc,0x9B);pc++; return; }
-    if(strcmp(mn,"ZBSR")==0){
-        emit(pc,0xBB); pc++;
-        char *a=ops[0]; if(*a=='*') a++;  /* strip optional * prefix */
+    /* ZBRR / ZBSR: 2-byte instructions. Second byte = indirect flag (bit7) + signed 7-bit
+     * displacement from address zero (NOT PC-relative). Range -64..+63.
+     * Negative displacements address end of page zero via modulo 8192. */
+    if(strcmp(mn,"ZBRR")==0||strcmp(mn,"ZBSR")==0){
+        emit(pc,(strcmp(mn,"ZBRR")==0)?0x9B:0xBB); pc++;
+        char *a=ops[0]; int ind=0;
+        if(*a=='*'){ind=1;a++;}
         int ok,v=eval_expr(a,&ok);
         if(pass==2&&ok&&(v<-64||v>63)){
-            fprintf(stderr,"ERROR line %d: ZBSR offset %d out of range (-64..+63)\n",lineno,v);
+            fprintf(stderr,"ERROR line %d: %s displacement %d out of range (-64..+63)\n",lineno,mn,v);
             errors++;
         }
-        emit(pc,(unsigned char)(v&0x7F)); pc++;
+        unsigned char disp=(unsigned char)(v&0x7F);
+        if(ind) disp|=0x80;
+        emit(pc,disp); pc++;
         return;
     }
     if(strcmp(mn,"RETC")==0){ int cc=cc_val(ops[0]); if(cc<0){fprintf(stderr,"ERROR line %d: RETC needs EQ/GT/LT/UN\n",lineno);errors++;return;} emit(pc,(unsigned char)(0x14|cc));pc++;return; }
@@ -366,7 +382,17 @@ static void assemble_line(char *line){
     if(strcmp(mn,"TPSU")==0){ emit(pc,0xB4);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
     if(strcmp(mn,"TPSL")==0){ emit(pc,0xB5);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
     if(strcmp(mn,"DAR")==0){ int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: DAR needs Rn\n",lineno);errors++;return;} emit(pc,(unsigned char)(0x94|r));pc++;return; }
-    if(strcmp(mn,"TMI")==0){ int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: TMI needs Rn\n",lineno);errors++;return;} emit(pc,(unsigned char)(0xF4|r));pc++; int ok,v=eval_expr(ops[1],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
+    if(strcmp(mn,"TMI")==0){
+        int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: TMI needs Rn\n",lineno);errors++;return;}
+        emit(pc,(unsigned char)(0xF4|r)); pc++;
+        /* mask is space-separated after register in ops[0], or in ops[1] if comma-separated */
+        char *mask_s = (nops>=2 && ops[1][0]) ? ops[1] : ops0_after_reg(ops[0]);
+        if(!mask_s||!mask_s[0]){fprintf(stderr,"ERROR line %d: TMI needs mask operand\n",lineno);errors++;emit(pc,0);pc++;return;}
+        int ok,v=eval_expr(mask_s,&ok);
+        if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad TMI mask '%s'\n",lineno,mask_s);errors++;}
+        emit(pc,(unsigned char)(v&0xFF)); pc++;
+        return;
+    }
     if(strcmp(mn,"RRL")==0){ int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: RRL needs Rn\n",lineno);errors++;return;} emit(pc,(unsigned char)(0xD0|r));pc++;return; }
     if(strcmp(mn,"RRR")==0){ int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: RRR needs Rn\n",lineno);errors++;return;} emit(pc,(unsigned char)(0x50|r));pc++;return; }
     struct { const char *mn; int base; } io[]={{"REDC",0x30},{"REDD",0x70},{"REDE",0x54},{"WRTC",0xB0},{"WRTD",0xF0},{"WRTE",0xD4},{NULL,0}};
