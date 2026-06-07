@@ -1,6 +1,6 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v3.1
-; Date:    2026-06-05
+; Version: v3.2
+; Date:    2026-06-06
 ;
 ; Target : PIPBUG 1 monitor (ROM $0000-$03FF, RAM $0400-$043F)
 ;          Code base $0440.  Single 8192-byte address page (bit15-13 always 0).
@@ -41,6 +41,7 @@
 ;   R3  loop counter (BDRR/BIRR); STORE_LINE shift count.
 ;
 ;        KNOWN OPEN ITEMS                                                                                                                                                                            
+;   BUG-LE:   FIXED in v3.1
 ;   COLON-01: ':' multi-statement separator not supported ("A=1:GOTO 10").
 ;             Unlikely to be implemented, would consume a RAS slot per statement.
 ;   OPT-16:   MUL16/DIV16 use naive loop (O(N)). Bit-serial with RRL/RRR rotate
@@ -48,6 +49,26 @@
 ;             Worthwhile for real-hardware performance; deferred.
 ;
 ;        CHANGE HISTORY                                                                                                                                                                                  
+;
+;   V3.2  2026-06-06  3472 interpreter bytes
+;         GOSUB/RETURN: 8-level GOSUB stack at GSBASE=$1618 (fixed from proposed
+;           $1660 which conflicted with TEMPRETH). GSSTKLIM=$0E (fixed from $0F
+;           off-by-one allowing 9th frame). DO_RETURN writes NLP directly to
+;           GOTOH:GOTOL with GOTOFLG=$02; DR_RETURN path restores TMPH:TMPL
+;           (fixed from proposed GOTOFLG=$01 which wrongly called FIND_LINE on
+;           an address). ERR_RET='6' added.
+;         SE_SCAN: stride 4->5, c3 field added. c3=NUL=2-char match (IF, PRINT
+;           etc); c3!=NUL=non-destructive IP peek then consume on match. Table
+;           c3 saved in NEGFLG (not SC0) to preserve SC0=char1 for SE_NOTKW.
+;           Disambiguates GO(TO/SUB), RE(M/TURN), NE(W/XT-future).
+;         PARSE_S16: BCFR,EQ replaces BCTR,EQ+BCTR,UN (-2 bytes).
+;         PARSE_EXPR: inline RAS guard (SPSU/ANDI/COMI,R0 5/BCTA,LT/DO_ERROR).
+;           Fires before SP>=5 would overflow during FACTOR+S16 chain (+11 bytes).
+;         ERR_NEST='5', ERR_RET='6' added to error constants.
+;         Showcase rewritten: DB hi,lo byte order corrected (was lo,hi causing
+;           garbled line numbers and broken GOSUB targets). GOSUB/RETURN demo
+;           added (lines 140-170, subs at 500-530). Semicolons in DB strings
+;           encoded as $3B (assembler treats ; as comment delimiter).
 ;
 ;   V3.1  2026-06-05  3228 interpreter bytes
 ;         OPT-A (ERRFLG/CC): FIND_LINE returns CC=EQ (found) or CC=GT (not found)
@@ -135,6 +156,10 @@ ERR_UND_LINE    EQU '1'
 ERR_DIV_ZERO    EQU '2'
 ERR_OOM         EQU '3'
 ERR_VAR         EQU '4'
+ERR_NEST        EQU '5'            ; nesting too deep (RAS overflow)
+ERR_RET         EQU '6'            ; RETURN without GOSUB
+GSBASE          EQU $1618          ; GOSUB return stack: 8 frames * 2 bytes = 16 bytes ($1618-$1627)
+GSSTKLIM        EQU $0E            ; overflow threshold: SWSP >= $0E means 8 frames full
 
 ;  PIPBUG 1 I/O entry points 
 COUT    EQU     $02B4   ; putchar: R0 = char to output
@@ -245,13 +270,15 @@ REPL:
 
 ; =============================================================================
 BANNER:
-        DB CR, LF, "uBASIC 2650 V3.1", CR, LF, NUL
+        DB CR, LF, "uBASIC 2650 V3.0", CR, LF, NUL
 
 ; =============================================================================
 ;  STMT_EXEC 
 ; Decode and dispatch one statement from IP.
-; KW_TAB format: [c1][c2][hi][lo] where hi:lo = handler address.
-; SE_SCAN advances TMPH:TMPL by 4 per entry; at match loads hi:lo into
+; KW_TAB format: [c1][c2][c3][hi][lo], stride 5.
+;   c3=NUL: 2-char match (c1+c2 sufficient, no third char consumed).
+;   c3!=NUL: 3-char match (peek at *IPH, consume only on match).
+; SE_SCAN advances TMPH:TMPL by 5 per entry; at match loads hi:lo into
 ; EXPH:EXPL and branches via BCTA,UN *EXPH (absolute indirect jump).
 ; RAS depth: 1 from REPL, or 3 from DO_IF (THEN body).
 ; Worst inner depth from here: +4 (->DO_xxx->PARSE_EXPR->PARSE_FACTOR->UPCASE)
@@ -272,13 +299,13 @@ STMT_EXEC:
         STRA,R0 TMPL
 SE_SCAN:
         LODA,R0 *TMPH                    ; c1
-        BCTA,EQ SE_NOTKW                 ; BUG-LET-01 FIX: end of table  check bare assignment
+        BCTA,EQ SE_NOTKW                 ; end of table: check bare assignment
         SUBA,R0 SC0
         BCTR,EQ SE_CHK2
 
-        ; advance 4 bytes to next entry (with 16-bit carry)
+        ; c1 mismatch: advance 5 bytes to next entry
         LODA,R0 TMPL
-        ADDI,R0 4
+        ADDI,R0 5
         STRA,R0 TMPL
         TPSL $01
         BCTR,LT SE_SCAN                  ; no carry
@@ -290,10 +317,10 @@ SE_CHK2:
         BSTA,UN INC_TMP                  ; point to c2 byte
         LODA,R0 *TMPH
         SUBA,R0 SC1
-        BCTR,EQ SE_MATCH
-        ; c2 mismatch: advance remaining 3 bytes (back to next c1)
+        BCTR,EQ SE_CHK3
+        ; c2 mismatch: advance remaining 4 bytes (back to next c1)
         LODA,R0 TMPL
-        ADDI,R0 3
+        ADDI,R0 4
         STRA,R0 TMPL
         TPSL $01
         BCTR,LT SE_SCAN
@@ -301,6 +328,29 @@ SE_CHK2:
         ADDI,R0 1
         STRA,R0 TMPH
         BCTA,UN SE_SCAN
+SE_CHK3:
+        BSTA,UN INC_TMP                  ; point to c3 byte
+        LODA,R0 *TMPH                    ; load c3 from table
+        BCTR,EQ SE_MATCH                 ; c3=NUL: 2-char match complete
+        ; c3 != NUL: peek at next IP char (non-destructive), compare
+        ; Use NEGFLG as temp to preserve SC0 (which holds input char1 for SE_NOTKW)
+        STRA,R0 NEGFLG                   ; save table c3 in NEGFLG
+        LODA,R0 *IPH                     ; peek at next input char (no advance)
+        BSTA,UN UPCASE                   ; [+1] uppercase it
+        SUBA,R0 NEGFLG                   ; compare to table c3
+        BCTR,EQ SE_CHK3_MATCH
+SE_CHK3_MISMATCH:
+        LODA,R0 TMPL
+        ADDI,R0 3
+        STRA,R0 TMPL
+        TPSL $01
+        BCTA,LT SE_SCAN              ; absolute: SE_SCAN too far for BCTR
+        LODA,R0 TMPH
+        ADDI,R0 1
+        STRA,R0 TMPH
+        BCTA,UN SE_SCAN
+SE_CHK3_MATCH:
+        BSTA,UN GETCI_UC                 ; [+1] consume the matched c3 char from IP
 SE_MATCH:
         BSTA,UN EATWORD                  ; [+1] consume remaining alpha chars
         ; load handler address from next 2 bytes: [hi][lo]
@@ -634,6 +684,88 @@ DO_GOTO:
         BCTA,UN CLR_RUNFLG
 
 ; =============================================================================
+; DO_GOSUB
+; Syntax: GOSUB <line>
+; In:  IP = pointer to line number; SWSTK[0:1] = NLP (next-line ptr) saved by DR_EXEC.
+;      SWSP = GOSUB stack pointer ($FF=empty).
+; Out: GOTOH:GOTOL = target line#; GOTOFLG=$02; NLP pushed onto GSBASE stack.
+; Clobbers: R0, R1, EXPH, EXPL, GOTOH, GOTOL, GOTOFLG, SWSP, GSBASE frame.
+; Stack: GSBASE[SWSP]=lo, GSBASE[SWSP+1]=hi. SWSP $FF=empty, 0/2/4..E = 8 frames.
+DO_GOSUB:
+        BSTA,UN WSKIP                    ; [+1]
+        BSTA,UN PARSE_EXPR               ; [+1] target line# -> EXPH:EXPL
+        ; overflow check: SWSP >= GSSTKLIM ($0E) means all 8 frames full
+        LODA,R0 SWSP
+        COMI,R0 $FF
+        BCTR,EQ DGS_FIRST                ; $FF=empty: first push
+        COMI,R0 GSSTKLIM                 ; GSSTKLIM=$0E: 8 frames full
+        BCTR,LT DGS_NEXT                 ; room: advance and push
+        LODI,R0 ERR_OOM
+        BCTA,UN DO_ERROR                 ; GOSUB stack overflow
+DGS_FIRST:
+        EORZ,R0                          ; SWSP = 0: first frame at GSBASE[0:1]
+        STRA,R0 SWSP
+        BCTA,UN DGS_STORE
+DGS_NEXT:
+        LODA,R0 SWSP
+        ADDI,R0 2
+        STRA,R0 SWSP
+DGS_STORE:
+        ; store NLP lo at GSBASE[SWSP], NLP hi at GSBASE[SWSP+1]
+        LODA,R0 SWSTK+1                  ; NLP lo byte (saved by DR_EXEC)
+        LODA,R1 SWSP                     ; R1 = SWSP (index)
+        STRA,R0 GSBASE,R1                ; GSBASE[SWSP] = lo
+        LODA,R0 SWSTK                    ; NLP hi byte
+        ADDI,R1 1
+        STRA,R0 GSBASE,R1                ; GSBASE[SWSP+1] = hi
+        ; set branch target and flag
+        LODA,R0 EXPH
+        STRA,R0 GOTOH
+        LODA,R0 EXPL
+        STRA,R0 GOTOL
+        LODI,R0 1                        ; GOTOFLG=$01 = plain GOTO to target line
+        STRA,R0 GOTOFLG
+        LODA,R0 RUNFLG
+        RETC,GT                          ; return if running
+        BCTA,UN CLR_RUNFLG
+
+; =============================================================================
+; DO_RETURN
+; Syntax: RETURN
+; In:  SWSP = GOSUB stack pointer; GSBASE[SWSP]=lo, GSBASE[SWSP+1]=hi of NLP.
+; Out: GOTOH:GOTOL = popped NLP address; GOTOFLG=$02 (direct NLP, no FIND_LINE).
+; Clobbers: R0, R1, GOTOH, GOTOL, GOTOFLG, SWSP.
+; Error: SWSP=$FF (stack empty) -> ERR_RET.
+DO_RETURN:
+        LODA,R0 SWSP
+        COMI,R0 $FF
+        BCTR,EQ DRT_UNDERFLOW            ; empty: RETURN without GOSUB
+        ; pop: hi from GSBASE[SWSP+1], lo from GSBASE[SWSP]
+        LODA,R1 SWSP
+        ADDI,R1 1
+        LODA,R0 GSBASE,R1                ; hi byte
+        STRA,R0 GOTOH
+        LODA,R1 SWSP
+        LODA,R0 GSBASE,R1                ; lo byte
+        STRA,R0 GOTOL
+        ; decrement SWSP: 0 -> $FF (empty), else -= 2
+        LODA,R0 SWSP
+        BCTR,EQ DRT_WAS_ZERO
+        SUBI,R0 2
+        STRA,R0 SWSP
+        BCTA,UN DRT_GO
+DRT_WAS_ZERO:
+        LODI,R0 $FF
+        STRA,R0 SWSP
+DRT_GO:
+        LODI,R0 2                        ; GOTOFLG=$02 = direct NLP (DR_RETURN path)
+        STRA,R0 GOTOFLG
+        RETC,UN
+DRT_UNDERFLOW:
+        LODI,R0 ERR_RET
+        BCTA,UN DO_ERROR
+
+; =============================================================================
 ; DO_LIST: Lists program lines from PROG to PEH:PEL
 DO_LIST:
         LODI,R0 <PROG
@@ -733,7 +865,7 @@ DR_CD:
         
         ; SC0:SC1. SC0 and SC1 are scratch bytes clobbered by STMT_EXEC (used
         ; by PRINT_S16, STORE_LINE, parser, etc.).  SWSTK is the GOSUB return
-        ; SWSP=$FF (empty) and GOSUB is not yet implemented.
+        ; address saved as NLP (next-line ptr) hi:lo for DO_GOSUB.
         LODA,R0 TMPH
         STRA,R0 SC0      ; SC0:SC1 still set (DO_GOSUB reads them for return addr)
         ; address stored AT SWSTK ($012E:$012F), not into SWSTK itself. After CLRV
@@ -760,13 +892,27 @@ DR_CD:
         STRA,R0 TMPL
         BCTA,UN DR_LP
 DR_GOTO:
-        EORZ,R0 ; Clear R0
-        STRA,R0 GOTOFLG
+        ; GOTOFLG: $01=plain GOTO (seek by line#), $02=GOSUB return (direct NLP address)
+        LODA,R0 GOTOFLG
+        STRA,R0 SC0                      ; save GOTOFLG value
+        EORZ,R0                          ; R0=0
+        STRA,R0 GOTOFLG                  ; clear flag
+        LODA,R0 SC0
+        COMI,R0 2
+        BCTR,EQ DR_RETURN                ; was $02: GOSUB return path
+        ; plain GOTO: seek target line number via FIND_LINE
         LODA,R0 GOTOH
         STRA,R0 LNUMH
         LODA,R0 GOTOL
         STRA,R0 LNUML
         BSTA,UN FIND_LINE                ; [+1]
+        BCTA,UN DR_LP
+DR_RETURN:
+        ; GOSUB return: GOTOH:GOTOL is the direct NLP address (from DO_RETURN)
+        LODA,R0 GOTOH
+        STRA,R0 TMPH
+        LODA,R0 GOTOL
+        STRA,R0 TMPL
         BCTA,UN DR_LP
 DR_STOP:
         ; drop through
@@ -1188,7 +1334,17 @@ PARSER_RET:
 ; Out: EXPH:EXPL = 16-bit signed result
 ; Clobbers: R0, R3, SAVEH, SAVEL, E1SAVH, E1SAVL, NEGFLG, SC0, SC1, TMPH, TMPL
 PARSE_EXPR:
-        LODI,R3 $FF                      ; ERRFLG-free: no reader remains                      ; SW stack empty sentinel (pre-increment: first write goes to SWBASE[0])
+        ; RAS guard: PARSE_FACTOR+PARSE_S16 need 2 more slots after this.
+        ; SP>=5 at entry means SP would hit 7+ before U16 inline — overflow.
+        ; Inline (no BSTA) so the guard itself does not consume a RAS slot.
+        SPSU                             ; R0 = PSU; SP in bits 2:0
+        ANDI,R0 $07                      ; isolate SP
+        COMI,R0 5                        ; compare to threshold
+        BCTA,LT PE_SAFE                  ; SP < 5: safe
+        LODI,R0 ERR_NEST
+        BCTA,UN DO_ERROR                 ; abort gracefully
+PE_SAFE:
+        LODI,R3 $FF                      ; SW stack empty sentinel (pre-increment: first write goes to SWBASE[0])
 EXPR_AM_RAS:
 EXPR_AM:
         LODI,R0 >EAM0_RET
@@ -1207,10 +1363,10 @@ EAM_LO_LOOP:
         BSTA,UN WSKIP
         LODA,R0 *IPH
         COMI,R0 A'+'
-        BCTR,EQ EAM_PLUS
+        BCTA,EQ EAM_PLUS             ; absolute: guard added 13 bytes, BCTR out of range
         COMI,R0 A'-'
         BCTA,EQ EAM_MINUS
-        BCTR,UN PARSER_RET
+        BCTA,UN PARSER_RET           ; absolute: guard displacement
 EAM_PLUS:
         LODA,R0 EXPH
         STRA,R0 SAVEH
@@ -1468,12 +1624,11 @@ PARSE_S16:
         STRA,R0 NEGFLG
         LODA,R0 *IPH
         COMI,R0 A'-'
-        BCTR,EQ PS16_NEG
-        BCTR,UN PS16_UN
+        BCFR,EQ PS16_UN                  ; OPT: skip neg handler if not '-' (saves 2 bytes)
 PS16_NEG:
-        BSTA,UN INC_IP
         LODI,R0 1
         STRA,R0 NEGFLG
+        BSTA,UN INC_IP
 PS16_UN:
         BSTR,UN PARSE_U16                ; [+1]
         BCTA,UN NEG_EXP                  ; OPT-15: negate if NEGFLG set (tail-call)
@@ -2116,16 +2271,19 @@ DE_NL:
 ; SE_SCAN loads hi:lo, stores to TMPH:TMPL, branches via *TMPH (indirect jump).
 ; THEN matched internally by DO_IF  not dispatched here.
 KW_TAB:
-        DB A'P',A'R', <DO_PRINT, >DO_PRINT   ; PRINT
-        DB A'L',A'E', <DO_LET,   >DO_LET     ; LET
-        DB A'L',A'I', <DO_LIST,  >DO_LIST    ; LIST
-        DB A'R',A'E', <DO_REM,   >DO_REM     ; REM
-        DB A'R',A'U', <DO_RUN,   >DO_RUN     ; RUN
-        DB A'E',A'N', <DO_END,   >DO_END     ; END
-        DB A'I',A'N', <DO_INPUT, >DO_INPUT   ; INPUT
-        DB A'I',A'F', <DO_IF,    >DO_IF      ; IF
-        DB A'N',A'E', <DO_NEW,   >DO_NEW     ; NEW
-        DB A'G',A'O', <DO_GOTO,  >DO_GOTO    ; GOTO
+        ; stride 5: [c1][c2][c3][hi][lo]. c3=NUL means match on c1+c2 only.
+        DB A'P',A'R',NUL,  <DO_PRINT,  >DO_PRINT   ; PRINT
+        DB A'L',A'E',NUL,  <DO_LET,    >DO_LET     ; LET
+        DB A'L',A'I',NUL,  <DO_LIST,   >DO_LIST    ; LIST
+        DB A'R',A'E',A'M', <DO_REM,    >DO_REM     ; REM   (c3 needed: RE+M vs RE+T)
+        DB A'R',A'U',NUL,  <DO_RUN,    >DO_RUN     ; RUN
+        DB A'E',A'N',NUL,  <DO_END,    >DO_END     ; END
+        DB A'I',A'N',NUL,  <DO_INPUT,  >DO_INPUT   ; INPUT
+        DB A'I',A'F',NUL,  <DO_IF,     >DO_IF      ; IF
+        DB A'N',A'E',A'W', <DO_NEW,    >DO_NEW     ; NEW   (c3 needed: NE+W vs NE+X)
+        DB A'G',A'O',A'T', <DO_GOTO,   >DO_GOTO    ; GOTO  (c3 needed: GO+T vs GO+S)
+        DB A'G',A'O',A'S', <DO_GOSUB,  >DO_GOSUB   ; GOSUB
+        DB A'R',A'E',A'T', <DO_RETURN, >DO_RETURN  ; RETURN
         DB NUL
 
 ROMEND: ; so we can measure Binary rom size
@@ -2143,63 +2301,71 @@ ROMEND: ; so we can measure Binary rom size
 ; =============================================================================
          ORG PROG
 
-         DB $00,$0A,$52,$45,$4D,$20,$75,$42,$41,$53,$49,$43,$20,$2D,$20,$53,$48,$4F,$57,$43,$41,$53,$45,$0D  ; 10 REM uBASIC - SHOWCASE
-         DB $00,$14,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$20,$75,$42,$41,$53,$49,$43,$20,$32,$36,$35,$30,$20,$56,$33,$2E,$30,$20,$53,$68,$6F,$77,$63,$61,$73,$65,$20,$2D,$2D,$22,$0D  ; 20 PRINT "-- uBASIC 2650 Vx.x Showcase --" 
-         DB $00,$1E,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$50,$52,$49,$4E,$54,$20,$2F,$20,$43,$48,$52,$24,$20,$2D,$2D,$2D,$22,$0D  ; 30 PRINT "--- PRINT / CHR$ ---"
-         DB $00,$28,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$36,$35,$29,$3B,$43,$48,$52,$24,$28,$36,$36,$29,$3B,$43,$48,$52,$24,$28,$36,$37,$29,$0D  ; 40 PRINT CHR$(65);CHR$(66);CHR$(67)
-         DB $00,$32,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$41,$52,$49,$54,$48,$4D,$45,$54,$49,$43,$20,$2D,$2D,$2D,$22,$0D  ; 50 PRINT "--- ARITHMETIC ---"
-         DB $00,$3C,$50,$52,$49,$4E,$54,$20,$22,$33,$2B,$34,$3D,$22,$3B,$33,$2B,$34,$3B,$22,$20,$20,$31,$30,$2D,$33,$3D,$22,$3B,$31,$30,$2D,$33,$3B,$22,$20,$20,$36,$2A,$37,$3D,$22,$3B,$36,$2A,$37,$0D  ; 60 PRINT "3+4=";3+4;"  10-3=";10-3;"  6*7=";6*7
-         DB $00,$46,$50,$52,$49,$4E,$54,$20,$22,$32,$30,$2F,$34,$3D,$22,$3B,$32,$30,$2F,$34,$3B,$22,$20,$20,$31,$37,$25,$35,$3D,$22,$3B,$31,$37,$25,$35,$0D  ; 70 PRINT "20/4=";20/4;"  17%5=";17%5
-         DB $00,$50,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$43,$4F,$4D,$50,$41,$52,$49,$53,$4F,$4E,$53,$20,$2D,$2D,$2D,$22,$0D  ; 80 PRINT "--- COMPARISONS ---"
-         DB $00,$5A,$49,$46,$20,$35,$3E,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$35,$3E,$33,$20,$6F,$6B,$22,$0D  ; 90 IF 5>3 THEN PRINT "5>3 ok"
-         DB $00,$64,$49,$46,$20,$33,$3C,$35,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3C,$35,$20,$6F,$6B,$22,$0D  ; 100 IF 3<5 THEN PRINT "3<5 ok"
-         DB $00,$6E,$49,$46,$20,$33,$3E,$3D,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3E,$3D,$33,$20,$6F,$6B,$22,$0D  ; 110 IF 3>=3 THEN PRINT "3>=3 ok"
-         DB $00,$78,$49,$46,$20,$34,$3C,$3E,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$34,$3C,$3E,$33,$20,$6F,$6B,$22,$0D  ; 120 IF 4<>3 THEN PRINT "4<>3 ok"
-         DB $00,$82,$49,$46,$20,$33,$3D,$33,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$22,$33,$3D,$33,$20,$6F,$6B,$22,$0D  ; 130 IF 3=3 THEN PRINT "3=3 ok"
-         DB $00,$8C,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4C,$4F,$4F,$50,$20,$76,$69,$61,$20,$47,$4F,$54,$4F,$20,$2D,$2D,$2D,$22,$0D  ; 140 PRINT "--- LOOP via GOTO ---"
-         DB $00,$96,$49,$3D,$31,$0D                                                                                                          ; 150 I=1        
-         DB $00,$A0,$49,$46,$20,$49,$3E,$35,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$31,$39,$30,$0D                                      ; 160 IF I>5 THEN GOTO 190
-         DB $00,$AA,$50,$52,$49,$4E,$54,$20,$49,$3B,$0D                                                                                      ; 170 PRINT I;
-         DB $00,$B4,$49,$3D,$49,$2B,$31,$0D                                                                                                   ; 180 I=I+1     
-         DB $00,$B9,$47,$4F,$54,$4F,$20,$31,$36,$30,$0D                                                                                      ; 185 GOTO 160
-         DB $00,$BE,$50,$52,$49,$4E,$54,$20,$22,$22,$0D                                                                                      ; 190 PRINT ""
-         DB $00,$C8,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4E,$45,$53,$54,$45,$44,$20,$4C,$4F,$4F,$50,$20,$2D,$2D,$2D,$22,$0D          ; 200 PRINT "--- NESTED LOOP ---"
-         DB $00,$D2,$49,$3D,$31,$0D                                                                                                           ; 210 I=1      
-         DB $00,$DC,$49,$46,$20,$49,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$37,$30,$0D                                      ; 220 IF I>3 THEN GOTO 270
-         DB $00,$E6,$4A,$3D,$31,$0D                                                                                                           ; 230 J=1       
-         DB $00,$F0,$49,$46,$20,$4A,$3E,$33,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$32,$36,$30,$0D                                      ; 240 IF J>3 THEN GOTO 260
-         DB $00,$FA,$50,$52,$49,$4E,$54,$20,$4A,$3B,$0D                                                                                      ; 250 PRINT J;
-         DB $00,$FF,$4A,$3D,$4A,$2B,$31,$0D                                                                                                   ; 255 J=J+1      (split: was J=J+1:GOTO 240)
-         DB $01,$00,$47,$4F,$54,$4F,$20,$32,$34,$30,$0D                                                                                      ; 256 GOTO 240   (split from 255)
-         DB $01,$04,$50,$52,$49,$4E,$54,$20,$22,$22,$0D                                                                                      ; 260 PRINT ""   (split: was PRINT "":I=I+1:GOTO 220)
-         DB $01,$05,$49,$3D,$49,$2B,$31,$0D                                                                                                   ; 261 I=I+1      (split from 260)
-         DB $01,$06,$47,$4F,$54,$4F,$20,$32,$32,$30,$0D                                                                                      ; 262 GOTO 220   (split from 260)
-         DB $01,$0E,$50,$52,$49,$4E,$54,$20,$22,$2D,$2D,$2D,$20,$4D,$41,$4E,$44,$45,$4C,$42,$52,$4F,$54,$20,$2D,$2D,$2D,$22,$0D             ; 270 PRINT "--- MANDELBROT ---"
-         DB $01,$18,$49,$3D,$2D,$36,$34,$0D                                                                                                  ; 280 I=-64
-         DB $01,$22,$49,$46,$20,$49,$3E,$35,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$38,$30,$0D                                  ; 290 IF I>56 THEN GOTO 480
-         DB $01,$2C,$44,$3D,$49,$0D                                                                                                          ; 300 D=I
-         DB $01,$36,$43,$3D,$2D,$31,$32,$30,$0D                                                                                              ; 310 C=-120
-         DB $01,$40,$49,$46,$20,$43,$3E,$34,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$34,$35,$30,$0D                                      ; 320 IF C>4 THEN GOTO 450
-         DB $01,$4A,$41,$3D,$43,$0D                                                                                                           ; 330 A=C        (split: was A=C:B=D:E=0:N=1)
-         DB $01,$4B,$42,$3D,$44,$0D                                                                                                           ; 331 B=D        (split from 330)
-         DB $01,$4C,$45,$3D,$30,$0D                                                                                                           ; 332 E=0        (split from 330)
-         DB $01,$4D,$4E,$3D,$31,$0D                                                                                                           ; 333 N=1        (split from 330)
-         DB $01,$54,$49,$46,$20,$4E,$3E,$31,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$39,$30,$0D                                  ; 340 IF N>16 THEN GOTO 390
-         DB $01,$5E,$49,$46,$20,$45,$3E,$30,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$38,$30,$0D                                      ; 350 IF E>0 THEN GOTO 380
-         DB $01,$68,$54,$3D,$41,$2A,$41,$2F,$36,$34,$2D,$42,$2A,$42,$2F,$36,$34,$2B,$43,$0D                                                  ; 360 T=A*A/64-B*B/64+C
-         DB $01,$72,$42,$3D,$32,$2A,$41,$2A,$42,$2F,$36,$34,$2B,$44,$0D                                                                      ; 370 B=2*A*B/64+D  (split: was B=...:A=T)
-         DB $01,$73,$41,$3D,$54,$0D                                                                                                           ; 371 A=T        (split from 370)
-         DB $01,$7C,$49,$46,$20,$41,$2A,$41,$2F,$36,$34,$2B,$42,$2A,$42,$2F,$36,$34,$3E,$32,$35,$36,$20,$54,$48,$45,$4E,$20,$49,$46,$20,$45,$3D,$30,$20,$54,$48,$45,$4E,$20,$45,$3D,$4E,$0D  ; 380 IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N
-         DB $01,$86,$4E,$3D,$4E,$2B,$31,$0D                                                                                                   ; 390 N=N+1      (split: was N=N+1:IF N<=16...)
-         DB $01,$87,$49,$46,$20,$4E,$3C,$3D,$31,$36,$20,$54,$48,$45,$4E,$20,$47,$4F,$54,$4F,$20,$33,$34,$30,$0D                              ; 391 IF N<=16 THEN GOTO 340  (split from 390)
-         DB $01,$90,$49,$46,$20,$45,$3E,$30,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$45,$2B,$33,$32,$29,$3B,$0D  ; 400 IF E>0 THEN PRINT CHR$(E+32);
-         DB $01,$9A,$49,$46,$20,$45,$3D,$30,$20,$54,$48,$45,$4E,$20,$50,$52,$49,$4E,$54,$20,$43,$48,$52,$24,$28,$33,$32,$29,$3B,$0D          ; 410 IF E=0 THEN PRINT CHR$(32);
-         DB $01,$A4,$43,$3D,$43,$2B,$34,$0D                                                                                                  ; 420 C=C+4
-         DB $01,$AE,$47,$4F,$54,$4F,$20,$33,$32,$30,$0D                                                                                      ; 430 GOTO 320
-         DB $01,$C2,$50,$52,$49,$4E,$54,$0D                                                                                                  ; 450 PRINT
-         DB $01,$CC,$49,$3D,$49,$2B,$36,$0D                                                                                                  ; 460 I=I+6
-         DB $01,$D6,$47,$4F,$54,$4F,$20,$32,$39,$30,$0D                                                                                      ; 470 GOTO 290
-         DB $01,$E0,$45,$4E,$44,$0D                                                                                                          ; 480 END
+         DB 0,10,"REM uBASIC 2650 - SHOWCASE V3.2",$0D  ; 10
+         DB 0,20,"PRINT ",$22,"-- uBASIC 2650 V3.2 Showcase --",$22,$0D  ; 20
+         DB 0,30,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,$0D  ; 30
+         DB 0,40,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",$0D  ; 40
+         DB 0,50,"PRINT ",$22,"--- ARITHMETIC ---",$22,$0D  ; 50
+         DB 0,60,"PRINT ",$22,"3+4=",$22,$3B,"3+4",$3B,$22,"  10-3=",$22,$3B,"10-3",$3B,$22,"  6*7=",$22,$3B,"6*7",$0D  ; 60
+         DB 0,70,"PRINT ",$22,"20/4=",$22,$3B,"20/4",$3B,$22,"  17%5=",$22,$3B,"17%5",$0D  ; 70
+         DB 0,80,"PRINT ",$22,"--- COMPARISONS ---",$22,$0D  ; 80
+         DB 0,90,"IF 5>3 THEN PRINT ",$22,"5>3 ok",$22,$0D  ; 90
+         DB 0,100,"IF 3<5 THEN PRINT ",$22,"3<5 ok",$22,$0D  ; 100
+         DB 0,110,"IF 3>=3 THEN PRINT ",$22,"3>=3 ok",$22,$0D  ; 110
+         DB 0,120,"IF 4<>3 THEN PRINT ",$22,"4<>3 ok",$22,$0D  ; 120
+         DB 0,130,"IF 3=3 THEN PRINT ",$22,"3=3 ok",$22,$0D  ; 130
+         DB 0,140,"PRINT ",$22,"--- GOSUB/RETURN ---",$22,$0D  ; 140
+         DB 0,150,"GOSUB 500",$0D  ; 150
+         DB 0,160,"GOSUB 500",$0D  ; 160
+         DB 0,170,"GOSUB 520",$0D  ; 170
+         DB 0,180,"PRINT ",$22,"--- LOOP via GOTO ---",$22,$0D  ; 180
+         DB 0,190,"I=1",$0D  ; 190
+         DB 0,200,"IF I>5 THEN GOTO 230",$0D  ; 200
+         DB 0,210,"PRINT I",$3B,$0D  ; 210
+         DB 0,220,"I=I+1",$0D  ; 220
+         DB 0,225,"GOTO 200",$0D  ; 225
+         DB 0,230,"PRINT ",$22,"",$22,$0D  ; 230
+         DB 0,240,"PRINT ",$22,"--- NESTED LOOP ---",$22,$0D  ; 240
+         DB 0,250,"I=1",$0D  ; 250
+         DB 1,4,"IF I>3 THEN GOTO 310",$0D  ; 260
+         DB 1,14,"J=1",$0D  ; 270
+         DB 1,19,"IF J>3 THEN GOTO 300",$0D  ; 275
+         DB 1,24,"PRINT J",$3B,$0D  ; 280
+         DB 1,29,"J=J+1",$0D  ; 285
+         DB 1,34,"GOTO 275",$0D  ; 290
+         DB 1,44,"PRINT ",$22,"",$22,$0D  ; 300
+         DB 1,49,"I=I+1",$0D  ; 305
+         DB 1,52,"GOTO 260",$0D  ; 308
+         DB 1,54,"PRINT ",$22,"--- MANDELBROT ---",$22,$0D  ; 310
+         DB 1,64,"I=-64",$0D  ; 320
+         DB 1,74,"IF I>56 THEN GOTO 490",$0D  ; 330
+         DB 1,84,"D=I",$0D  ; 340
+         DB 1,94,"C=-120",$0D  ; 350
+         DB 1,104,"IF C>4 THEN GOTO 460",$0D  ; 360
+         DB 1,114,"A=C",$0D  ; 370
+         DB 1,119,"B=D",$0D  ; 375
+         DB 1,124,"E=0",$0D  ; 380
+         DB 1,129,"N=1",$0D  ; 385
+         DB 1,134,"IF N>16 THEN GOTO 430",$0D  ; 390
+         DB 1,144,"IF E>0 THEN GOTO 420",$0D  ; 400
+         DB 1,154,"T=A*A/64-B*B/64+C",$0D  ; 410
+         DB 1,159,"B=2*A*B/64+D",$0D  ; 415
+         DB 1,164,"A=T",$0D  ; 420
+         DB 1,169,"IF A*A/64+B*B/64>256 THEN IF E=0 THEN E=N",$0D  ; 425
+         DB 1,174,"N=N+1",$0D  ; 430
+         DB 1,179,"IF N<=16 THEN GOTO 390",$0D  ; 435
+         DB 1,184,"IF E>0 THEN PRINT CHR$(E+32)",$3B,$0D  ; 440
+         DB 1,194,"IF E=0 THEN PRINT CHR$(32)",$3B,$0D  ; 450
+         DB 1,199,"C=C+4",$0D  ; 455
+         DB 1,202,"GOTO 360",$0D  ; 458
+         DB 1,204,"PRINT",$0D  ; 460
+         DB 1,214,"I=I+6",$0D  ; 470
+         DB 1,224,"GOTO 330",$0D  ; 480
+         DB 1,234,"END",$0D  ; 490
+         DB 1,244,"PRINT ",$22,"GOSUB CALL 1",$22,$0D  ; 500
+         DB 1,254,"RETURN",$0D  ; 510
+         DB 2,8,"PRINT ",$22,"2+2=",$22,$3B,"2+2",$0D  ; 520
+         DB 2,18,"RETURN",$0D  ; 530
 
 SHOWCASE_END:
         DB $D, $D, $D, $D
