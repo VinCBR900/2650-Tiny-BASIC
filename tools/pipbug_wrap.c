@@ -1180,18 +1180,23 @@ static int assemble_source(const char *prog, const char *asm_file, char **hex_ou
         return 0;
     }
 
+    /* FIX: Append the opening outer quote required by Windows cmd.exe */
+#if PIPBUG_WRAP_WIN32
+    if (!append_to_command(&cmd, &len, &cap, "\"")) goto mem_error;
+#endif
+
     if (!append_quoted_arg(&cmd, &len, &cap, asm_exe) ||
         !append_to_command(&cmd, &len, &cap, " ") ||
         !append_quoted_arg(&cmd, &len, &cap, asm_file) ||
         !append_to_command(&cmd, &len, &cap, " ") ||
         !append_quoted_arg(&cmd, &len, &cap, hex_file)) {
-        fprintf(stderr, "Out of memory building assembler command.\n");
-        free(asm_exe);
-        free(hex_file);
-        free(lst_file);
-        free(cmd);
-        return 0;
+        goto mem_error;
     }
+
+    /* FIX: Append the closing outer quote required by Windows cmd.exe */
+#if PIPBUG_WRAP_WIN32
+    if (!append_to_command(&cmd, &len, &cap, "\"")) goto mem_error;
+#endif
 
     fprintf(stderr, "Assembling '%s' -> '%s'\n", asm_file, hex_file);
     rc = system(cmd);
@@ -1208,6 +1213,14 @@ static int assemble_source(const char *prog, const char *asm_file, char **hex_ou
     free(lst_file);
     *hex_out = hex_file;
     return 1;
+
+mem_error:
+    fprintf(stderr, "Out of memory building assembler command.\n");
+    free(asm_exe);
+    free(hex_file);
+    free(lst_file);
+    free(cmd);
+    return 0;
 #endif
 }
 
