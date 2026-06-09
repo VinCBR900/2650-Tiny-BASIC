@@ -66,8 +66,7 @@
 ;         ERR_NEST='5', ERR_RET='6' added to error constants.
 ;         Showcase rewritten: DB hi,lo byte order corrected (was lo,hi causing
 ;           garbled line numbers and broken GOSUB targets). GOSUB/RETURN demo
-;           added (lines 140-170, subs at 500-530). Semicolons in DB strings
-;           encoded as $3B (assembler treats ; as comment delimiter).
+;           added (lines 140-170, subs at 500-530). .
 ;
 ;   V3.1  2026-06-05  3228 interpreter bytes
 ;         OPT-A (ERRFLG/CC): FIND_LINE returns CC=EQ (found) or CC=GT (not found)
