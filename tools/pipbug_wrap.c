@@ -1,6 +1,6 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
- * Version: 2.1
- * Date:    2026-06-09
+ * Version: 2.0
+ * Date:    2026-05-28
  *
  * Purpose:
  *   Wraps 2650.c (the WinArcadia CPU core, compiled -DGAMER to strip all UI
@@ -9,7 +9,6 @@
  *
  * Usage:
  *   ./pipbug_wrap [options] program.hex
- *   ./pipbug_wrap [options] program.asm
  *
  * Options:
  *   -t              Trace every instruction to stderr
@@ -26,11 +25,6 @@
  *   -h, --help      Show usage help
  *   -v, --version   Show version number
  *
- * ASM input:
- *   Native builds accept .asm input by invoking asm2650 beside this wrapper,
- *   loading the generated .hex file, and reading the generated .LST file to
- *   auto-detect CHIN, COUT and program entry labels unless overridden.
- *
  * PIPBUG 1 intercepts (entry points match Oracle / uBASIC2650 EQUs):
  *   COUT  $02B4  putchar(R0)
  *   CHIN  $0286  R0 = host input byte
@@ -40,8 +34,6 @@
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
- *   v2.1  Added native .asm input support via asm2650 plus .LST auto-detection
- *         for CHIN, COUT and program entry addresses.
  *   v2.0  Added cross-platform interactive terminal mode (-i) with raw
  *         byte input/output and Ctrl-] graceful exit. Browser builds use
  *         non-blocking FIFO polling so WASM never blocks the event loop.
@@ -378,9 +370,6 @@ static UWORD chin_addr    = 0x0286; /* --chin                              */
 static UWORD cout_addr    = 0x02B4; /* --cout                              */
 static UWORD crlf_addr    = 0x008A; /* --crlf                              */
 static UWORD entry_addr   = 0x0440; /* --entry                             */
-static int  chin_addr_set = 0;      /* explicit --chin was supplied        */
-static int  cout_addr_set = 0;      /* explicit --cout was supplied        */
-static int  entry_addr_set = 0;     /* explicit --entry was supplied       */
 
 #if PIPBUG_WRAP_EMSCRIPTEN
 static int terminal_restore_needed = 0;
@@ -620,7 +609,7 @@ void platform_putchar(char ch)
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s [options] program.hex|program.asm\n"
+        "Usage: %s [options] program.hex\n"
         "Options:\n"
         "  -t              Trace every instruction to stderr\n"
         "  -s              Step mode: pause each instruction\n"
@@ -633,12 +622,6 @@ static void print_usage(const char *prog)
         "  --cout 0xADDR   COUT intercept address (default 0x02B4)\n"
         "  --crlf 0xADDR   CRLF intercept address (default 0x008A)\n"
         "  --entry 0xADDR  Program entry address (default 0x0440)\n"
-#if PIPBUG_WRAP_EMSCRIPTEN
-        "  ASM input is not available in Emscripten/browser builds.\n"
-#else
-        "  ASM input invokes asm2650 and reads the generated .LST to auto-detect\n"
-        "                  CHIN, COUT and entry labels unless explicitly overridden.\n"
-#endif
         "  -h, --help      Show this help message\n"
         "  -v, --version   Show version\n",
         prog);
@@ -654,7 +637,7 @@ static void print_usage(const char *prog)
  */
 static void print_version(void)
 {
-    fprintf(stderr, "pipbug_wrap v2.1\n");
+    fprintf(stderr, "pipbug_wrap v2.0\n");
 }
 
 /* ── Minimal PIPBUG stubs ─────────────────────────────────────────────────
@@ -815,413 +798,6 @@ static void print_halt_summary(long count)
         }
         fprintf(stderr, "\n");
     }
-}
-
-
-/* ── ASM input support ───────────────────────────────────────────────────── */
-
-/*
- * Description:
- *   Compare two NUL-terminated strings without regard to ASCII case.
- * Inputs:
- *   a - first string to compare.
- *   b - second string to compare.
- * Outputs:
- *   Returns non-zero when both strings are equal ignoring case, otherwise 0.
- */
-static int str_case_equal(const char *a, const char *b)
-{
-    while (*a && *b) {
-        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
-        a++;
-        b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-/*
- * Description:
- *   Test whether a path's final filename component ends with a given extension.
- * Inputs:
- *   path - filesystem path to inspect.
- *   ext  - extension to match, including the leading dot.
- * Outputs:
- *   Returns non-zero when the filename extension matches case-insensitively,
- *   otherwise 0.
- */
-static int has_extension(const char *path, const char *ext)
-{
-    const char *slash1 = strrchr(path, '/');
-    const char *slash2 = strrchr(path, '\\');
-    const char *slash = slash1;
-    const char *dot;
-    if (!slash || (slash2 && slash2 > slash)) slash = slash2;
-    dot = strrchr(slash ? slash + 1 : path, '.');
-    return dot && str_case_equal(dot, ext);
-}
-
-/*
- * Description:
- *   Build a new path by replacing the extension of the final filename component.
- * Inputs:
- *   path - source filesystem path.
- *   ext  - replacement extension, including the leading dot.
- * Outputs:
- *   Returns a heap-allocated path string that the caller must free, or NULL on
- *   allocation failure.
- */
-static char *replace_extension(const char *path, const char *ext)
-{
-    const char *slash1 = strrchr(path, '/');
-    const char *slash2 = strrchr(path, '\\');
-    const char *slash = slash1;
-    const char *base;
-    const char *dot;
-    size_t stem_len;
-    size_t ext_len = strlen(ext);
-    char *out;
-
-    if (!slash || (slash2 && slash2 > slash)) slash = slash2;
-    base = slash ? slash + 1 : path;
-    dot = strrchr(base, '.');
-    stem_len = dot ? (size_t)(dot - path) : strlen(path);
-
-    out = (char *)malloc(stem_len + ext_len + 1);
-    if (!out) return NULL;
-    memcpy(out, path, stem_len);
-    memcpy(out + stem_len, ext, ext_len + 1);
-    return out;
-}
-
-/*
- * Description:
- *   Derive the asm2650 executable path that should live beside pipbug_wrap.
- * Inputs:
- *   prog - argv[0] path used to launch the wrapper.
- * Outputs:
- *   Returns a heap-allocated assembler executable path that the caller must
- *   free, or NULL on allocation failure.
- */
-static char *assembler_path_for_wrapper(const char *prog)
-{
-    const char *slash1 = strrchr(prog, '/');
-    const char *slash2 = strrchr(prog, '\\');
-    const char *slash = slash1;
-#if PIPBUG_WRAP_WIN32
-    const char *name = "asm2650.exe";
-#else
-    const char *name = "asm2650";
-#endif
-    size_t dir_len = 0;
-    char *out;
-
-    if (!slash || (slash2 && slash2 > slash)) slash = slash2;
-    if (slash) dir_len = (size_t)(slash - prog + 1);
-
-    if (!dir_len) {
-#if PIPBUG_WRAP_WIN32
-        const char *curdir = ".\\";
-#else
-        const char *curdir = "./";
-#endif
-        dir_len = strlen(curdir);
-        out = (char *)malloc(dir_len + strlen(name) + 1);
-        if (!out) return NULL;
-        memcpy(out, curdir, dir_len);
-    } else {
-        out = (char *)malloc(dir_len + strlen(name) + 1);
-        if (!out) return NULL;
-        memcpy(out, prog, dir_len);
-    }
-    memcpy(out + dir_len, name, strlen(name) + 1);
-    return out;
-}
-
-/*
- * Description:
- *   Append literal text to a growable command-line buffer.
- * Inputs:
- *   cmd  - address of the heap buffer pointer to grow and append to.
- *   len  - address of the current command string length.
- *   cap  - address of the allocated buffer capacity.
- *   text - NUL-terminated text to append.
- * Outputs:
- *   Updates cmd, len and cap as needed. Returns 1 on success, or 0 on
- *   allocation failure.
- */
-static int append_to_command(char **cmd, size_t *len, size_t *cap, const char *text)
-{
-    size_t need = strlen(text);
-    if (*len + need + 1 > *cap) {
-        size_t new_cap = *cap ? *cap : 128;
-        char *new_cmd;
-        while (*len + need + 1 > new_cap) new_cap *= 2;
-        new_cmd = (char *)realloc(*cmd, new_cap);
-        if (!new_cmd) return 0;
-        *cmd = new_cmd;
-        *cap = new_cap;
-    }
-    memcpy(*cmd + *len, text, need + 1);
-    *len += need;
-    return 1;
-}
-
-/*
- * Description:
- *   Append one shell-quoted command argument using native Win32 or POSIX rules.
- * Inputs:
- *   cmd - address of the heap command buffer pointer to grow and append to.
- *   len - address of the current command string length.
- *   cap - address of the allocated buffer capacity.
- *   arg - unquoted argument text to append.
- * Outputs:
- *   Updates cmd, len and cap as needed. Returns 1 on success, or 0 on
- *   allocation failure.
- */
-static int append_quoted_arg(char **cmd, size_t *len, size_t *cap, const char *arg)
-{
-#if PIPBUG_WRAP_WIN32
-    if (!append_to_command(cmd, len, cap, "\"")) return 0;
-    for (const char *p = arg; *p; p++) {
-        if (*p == '"') {
-            if (!append_to_command(cmd, len, cap, "\\\"")) return 0;
-        } else {
-            char tmp[2] = {*p, '\0'};
-            if (!append_to_command(cmd, len, cap, tmp)) return 0;
-        }
-    }
-    return append_to_command(cmd, len, cap, "\"");
-#else
-    if (!append_to_command(cmd, len, cap, "'")) return 0;
-    for (const char *p = arg; *p; p++) {
-        if (*p == '\'') {
-            if (!append_to_command(cmd, len, cap, "'\\''")) return 0;
-        } else {
-            char tmp[2] = {*p, '\0'};
-            if (!append_to_command(cmd, len, cap, tmp)) return 0;
-        }
-    }
-    return append_to_command(cmd, len, cap, "'");
-#endif
-}
-
-/*
- * Description:
- *   Parse one asm2650 listing symbol-table line into a label name and value.
- * Inputs:
- *   line      - listing line to parse.
- *   name      - destination buffer for the parsed symbol name.
- *   name_size - size of the destination name buffer in bytes.
- *   value     - destination for the parsed symbol address/value.
- * Outputs:
- *   Writes name and value when parsing succeeds. Returns 1 for a symbol line,
- *   otherwise 0.
- */
-static int parse_symbol_line(const char *line, char *name, size_t name_size, unsigned *value)
-{
-    char sym[128];
-    unsigned val;
-    int consumed = 0;
-
-    if (sscanf(line, " %127s $%x %n", sym, &val, &consumed) < 2) return 0;
-    if (consumed <= 0) return 0;
-    if (name_size > 0) {
-        snprintf(name, name_size, "%s", sym);
-    }
-    *value = val & AMSK;
-    return 1;
-}
-
-/*
- * Description:
- *   Parse a listing source line and identify the first emitted code address.
- * Inputs:
- *   line  - listing line to inspect.
- *   value - destination for the parsed code address.
- * Outputs:
- *   Writes value when the line contains an address and opcode byte. Returns 1
- *   on success, otherwise 0.
- */
-static int parse_first_listing_code_addr(const char *line, unsigned *value)
-{
-    int lineno;
-    unsigned addr;
-    unsigned byte;
-    if (sscanf(line, " %d $%x %x", &lineno, &addr, &byte) == 3) {
-        if (byte <= 0xff) {
-            *value = addr & AMSK;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/*
- * Description:
- *   Check whether a label name is one of the recognized program entry labels.
- * Inputs:
- *   name - symbol name from the assembler listing.
- * Outputs:
- *   Returns non-zero when name matches a recognized entry label, otherwise 0.
- */
-static int is_entry_symbol(const char *name)
-{
-    static const char *const names[] = {
-        "ENTRY", "START", "RESET", "MAIN", "INIT", "BEGIN", "BOOT", NULL
-    };
-    for (int i = 0; names[i]; i++) {
-        if (str_case_equal(name, names[i])) return 1;
-    }
-    return 0;
-}
-
-/*
- * Description:
- *   Read an asm2650 .LST file and apply auto-detected simulator addresses.
- * Inputs:
- *   lst_file - path to the assembler listing sidecar.
- * Outputs:
- *   Updates CHIN, COUT and entry globals when matching symbols are found and
- *   the user did not override them. Returns non-zero when useful listing data
- *   was found, otherwise 0.
- */
-static int apply_listing_config(const char *lst_file)
-{
-    FILE *f = fopen(lst_file, "r");
-    char line[512];
-    int in_labels = 0;
-    int found_any = 0;
-    int found_chin = 0, found_cout = 0, found_entry = 0;
-    unsigned first_code = 0;
-    int have_first_code = 0;
-
-    if (!f) {
-        fprintf(stderr, "Cannot open assembler listing '%s' for auto-detection\n", lst_file);
-        return 0;
-    }
-
-    while (fgets(line, sizeof(line), f)) {
-        if (!have_first_code && parse_first_listing_code_addr(line, &first_code))
-            have_first_code = 1;
-
-        if (!in_labels) {
-            if (strncmp(line, "Labels:", 7) == 0) in_labels = 1;
-            continue;
-        }
-
-        {
-            char name[128];
-            unsigned value;
-            if (!parse_symbol_line(line, name, sizeof(name), &value)) continue;
-
-            if (!chin_addr_set && str_case_equal(name, "CHIN")) {
-                chin_addr = (UWORD)value;
-                found_chin = 1;
-                found_any = 1;
-            } else if (!cout_addr_set && str_case_equal(name, "COUT")) {
-                cout_addr = (UWORD)value;
-                found_cout = 1;
-                found_any = 1;
-            } else if (!entry_addr_set && !found_entry && is_entry_symbol(name)) {
-                entry_addr = (UWORD)value;
-                found_entry = 1;
-                found_any = 1;
-            }
-        }
-    }
-    fclose(f);
-
-    if (!entry_addr_set && !found_entry && have_first_code) {
-        entry_addr = (UWORD)first_code;
-        found_any = 1;
-        fprintf(stderr, "ASM auto-detect: entry=$%04X (first code address)\n", entry_addr);
-    }
-    if (found_chin || found_cout || found_entry) {
-        fprintf(stderr, "ASM auto-detect:%s%s%s\n",
-                found_cout ? " COUT" : "",
-                found_chin ? " CHIN" : "",
-                found_entry ? " entry" : "");
-    }
-    return found_any || have_first_code;
-}
-
-/*
- * Description:
- *   Assemble an ASM input file with asm2650 and prepare the generated HEX file.
- * Inputs:
- *   prog     - argv[0] path used to locate the sibling asm2650 executable.
- *   asm_file - source ASM file to assemble.
- *   hex_out  - destination for the generated heap-allocated HEX path.
- * Outputs:
- *   Invokes asm2650 on native builds and applies .LST auto-detection. Writes
- *   *hex_out on success. Returns 1 on success, or 0 on failure.
- */
-static int assemble_source(const char *prog, const char *asm_file, char **hex_out)
-{
-#if PIPBUG_WRAP_EMSCRIPTEN
-    (void)prog;
-    (void)asm_file;
-    (void)hex_out;
-    fprintf(stderr, "ASM input is not supported in Emscripten/browser builds. Assemble to HEX first.\n");
-    return 0;
-#else
-    char *asm_exe = assembler_path_for_wrapper(prog);
-    char *hex_file = replace_extension(asm_file, ".hex");
-    char *lst_file = replace_extension(asm_file, ".LST");
-    char *cmd = NULL;
-    size_t len = 0, cap = 0;
-    int rc;
-
-    if (!asm_exe || !hex_file || !lst_file) {
-        fprintf(stderr, "Out of memory preparing ASM input.\n");
-        free(asm_exe);
-        free(hex_file);
-        free(lst_file);
-        return 0;
-    }
-
-    /* FIX: Append the opening outer quote required by Windows cmd.exe */
-#if PIPBUG_WRAP_WIN32
-    if (!append_to_command(&cmd, &len, &cap, "\"")) goto mem_error;
-#endif
-
-    if (!append_quoted_arg(&cmd, &len, &cap, asm_exe) ||
-        !append_to_command(&cmd, &len, &cap, " ") ||
-        !append_quoted_arg(&cmd, &len, &cap, asm_file) ||
-        !append_to_command(&cmd, &len, &cap, " ") ||
-        !append_quoted_arg(&cmd, &len, &cap, hex_file)) {
-        goto mem_error;
-    }
-
-    /* FIX: Append the closing outer quote required by Windows cmd.exe */
-#if PIPBUG_WRAP_WIN32
-    if (!append_to_command(&cmd, &len, &cap, "\"")) goto mem_error;
-#endif
-
-    fprintf(stderr, "Assembling '%s' -> '%s'\n", asm_file, hex_file);
-    rc = system(cmd);
-    free(cmd);
-    free(asm_exe);
-    if (rc != 0) {
-        fprintf(stderr, "asm2650 failed for '%s' (status %d)\n", asm_file, rc);
-        free(hex_file);
-        free(lst_file);
-        return 0;
-    }
-
-    (void)apply_listing_config(lst_file);
-    free(lst_file);
-    *hex_out = hex_file;
-    return 1;
-
-mem_error:
-    fprintf(stderr, "Out of memory building assembler command.\n");
-    free(asm_exe);
-    free(hex_file);
-    free(lst_file);
-    free(cmd);
-    return 0;
-#endif
 }
 
 /* ── Intel HEX loader ────────────────────────────────────────────────────── */
@@ -1395,9 +971,7 @@ EMSCRIPTEN_KEEPALIVE int pipbug_run_chunk(int instruction_budget)
  */
 int main(int argc, char **argv)
 {
-    const char *input_file = NULL;
     const char *hexfile = NULL;
-    char *generated_hexfile = NULL;
 
     /* ── Parse args ── */
     for (int i = 1; i < argc; i++) {
@@ -1417,15 +991,12 @@ int main(int argc, char **argv)
             inst_limit_set = 1;
         } else if (!strcmp(argv[i], "--chin") && i+1 < argc) {
             chin_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
-            chin_addr_set = 1;
         } else if (!strcmp(argv[i], "--cout") && i+1 < argc) {
             cout_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
-            cout_addr_set = 1;
         } else if (!strcmp(argv[i], "--crlf") && i+1 < argc) {
             crlf_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
         } else if (!strcmp(argv[i], "--entry") && i+1 < argc) {
             entry_addr = (UWORD)(strtol(argv[++i], NULL, 16) & AMSK);
-            entry_addr_set = 1;
         } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             print_usage(argv[0]);
             return 0;
@@ -1433,18 +1004,17 @@ int main(int argc, char **argv)
             print_version();
             return 0;
         } else if (argv[i][0] != '-') {
-            input_file = argv[i];
+            hexfile = argv[i];
         } else {
             fprintf(stderr, "Unknown option '%s'\n", argv[i]);
             print_usage(argv[0]);
             return 1;
         }
     }
-    if (!input_file) {
+    if (!hexfile) {
         print_usage(argv[0]);
         return 1;
     }
-
     if (interactive_mode && step_mode) {
         fprintf(stderr, "Options -i and -s cannot be used together.\n");
         return 1;
@@ -1453,13 +1023,6 @@ int main(int argc, char **argv)
         inst_limit = 0;
     if (interactive_mode && !terminal_enable_interactive())
         return 1;
-
-    if (has_extension(input_file, ".asm")) {
-        if (!assemble_source(argv[0], input_file, &generated_hexfile)) return 1;
-        hexfile = generated_hexfile;
-    } else {
-        hexfile = input_file;
-    }
 
     /* ── Initialise CPU state ── */
     memset(memory,   0, sizeof(memory));
@@ -1477,10 +1040,7 @@ int main(int argc, char **argv)
     halted       = 0;
 
     /* ── Load program ── */
-    if (!load_hex(hexfile)) {
-        free(generated_hexfile);
-        return 1;
-    }
+    if (!load_hex(hexfile)) return 1;
 
     /* ── Entry point (default $0440, override with --entry) ── */
     iar = entry_addr;
@@ -1499,12 +1059,10 @@ int main(int argc, char **argv)
      * execution with pipbug_run_chunk() from requestAnimationFrame(), allowing
      * keyboard events to fill the FIFO between chunks.
      */
-    free(generated_hexfile);
     return 0;
 #else
     while (!run_finished)
         (void)pipbug_run_chunk(0);
-    free(generated_hexfile);
     return 0;
 #endif
 }
