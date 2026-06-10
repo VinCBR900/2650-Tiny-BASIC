@@ -1,5 +1,6 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
 ; Version: v3.6
+; By Vincent Crabtree, 2026.  MIT License
 ; Date:    2026-06-10
 ;
 ; Target : PIPBUG 1 monitor (ROM $0000-$03FF, RAM $0400-$043F)
@@ -29,9 +30,9 @@
 ;   >ADDR = LOW  byte (bits  7:0)   e.g. >$1634 = $34
 ;
 ;        RAS DEPTH BUDGET (8-level hardware stack)
-;   Every BSxx (BSTA/BSTR/BSFA/BSFR) consumes one slot regardless of condition.
+;   Every followed BSxx (BSTA/BSTR/BSFA/BSFR) consumes one slot regardless of condition.
 ;   BCTA/BCTR/BCFA/BCFR are plain branches -- no RAS cost.
-;   COUT/CHIN use 1 internal sub: add 1 to caller depth.
+;   COUT/CHIN use 1 internal delay sub: add 1 to caller depth.
 ;   PARSE_EXPR entry guard: SPSU/ANDI/COMI fires ERR_NEST if SP>=5 at entry.
 ;   This costs 0 RAS slots (no BSTA) and protects against stack overflow.
 ;
@@ -57,43 +58,23 @@
 ;         EXP16_TO_GOTO helper: EXPH->GOTOH / EXPL->GOTOL (3 sites, ~7 bytes saved).
 ;         EXP16_TO_LNUM helper: EXPH->LNUMH / EXPL->LNUML (3 sites, ~7 bytes saved).
 ;         ERRFLG eliminated: status returned in CC (R0 side-effect), not RAM flag.
-;           TRY_STORE_LINE: RETC,UN with CC=GT (stored) or CC=EQ (not stored).
-;           FIND_LINE: RETC,UN with CC=GT (not found) or CC=EQ (found).
-;           PARSE_EXPR/PF_LOADVAR/DIV16: dead ERRFLG clears and EORZ removed.
-;           RAM cell $1610 freed. Net ~28 bytes saved.
 ;         DEC_ET family: mirrors INC_ET using $EC/$C4 byte-skip chain for offsets 0/8/12.
-;           DEC_IP: rewritten as 1-byte stub (EORZ,R0) falling into shared DEC_ET body.
-;           DEC_GOTO (offset 8): LODI,R0 8 + $C4 stub -> replaces SL_SNC inline (saves 15).
-;           DEC_LNUM (offset 12): LODI,R0 12 + $EC stub -> replaces SL_DOMOV inline (saves 15).
-;           DEC_EXP/DEC_TMP omitted: MUL16 site is at RAS depth 5+1=6 (unsafe).
-;           Net: 44 bytes saved at call sites, +11 bytes family overhead = 33 bytes net.
 ;         DL2_SCAN: inline TMP+2 replaced by 2x BSTA INC_TMP. Saves 14 bytes.
 ;         FREE memory keyword added.
 ;
 ;   V3.5  2026-06-09  Merged v3.3+v3.4 FOR/NEXT into v3.2 optimised baseline.
-;         Source policy: smallest code + correct functionality.
 ;         DO_FOR:  v3.3 parse (GETCI_UC for '=', LNUMH/LNUML for limit,
-;                  EXPH/EXPL direct for step -- OPT-F2/F3/F4).
-;                  v3.4 DF_PUSH (R1-indexed FORBASE,R1 -- no INC_TMP chain,
-;                  reads LNUMH/LNUML for limit, EXPH/EXPL for step).
 ;         DO_NEXT: v3.4 VARS access (direct VARS,R1 indexed -- VARS_FP dropped).
-;                  v3.3 compare (shared biased-compare with fall-through,
-;                  step sign from EXPH bit7 -- shorter than v3.4 TMI dual path).
-;                  v3.3 WC idiom for 16-bit step add.
-;                  v3.4 FORBASE,R1 for nlp load and frame pop.
 ;         DO_RETURN: v3.3 GOTOFLG=$03 (direct NLP). v3.4 regressed to $01.
 ;         DR_EXEC:   v3.3 three-way GOTOFLG dispatch (inline COMI $03).
 ;         STORE_LINE: v3.4 BUG-LE fix (BCTR,LT SL_NOSHIFT both paths).
 ;         PARSE_EXPR: v3.3 body + v3.2 RAS guard restored.
-;                     ERR_NEST='8' (v3.2 had '5'; '5'/'6'/'7' now used by
-;                     ERR_RET/ERR_FOR/ERR_NXT respectively).
 ;         VARS_FP: dropped (replaced by inline VARS,R1 indexing in DO_NEXT).
 ;
 ;   V3.4  2026-06-09  FOR/NEXT variant 2 (v3.3 parallel branch).
 ;         BUG-SE-01, BUG-DN-01..04, BUG-LE fixes.
 ;         DF_PUSH R1-indexed frame write (smaller than INC_TMP chain).
 ;         DO_NEXT VARS,R1 indexed (drops VARS_FP subroutine).
-;         Regression: DO_RETURN GOTOFLG=$01 (should be $03). Not carried forward.
 ;
 ;   V3.3  2026-06-07  FOR/NEXT and GOSUB/RETURN complete. ROMEND=$13AC.
 ;         ERR_FOR='6', ERR_NXT='7'. PSL_WC EQU $08.
@@ -212,8 +193,6 @@ PROGLIM EQU $1FFF   ; one past end of program store
 ; =============================================================================
 ;  RESET / ENTRY
 ; In:  nothing (cold start)
-; Out: banner printed, REPL entered
-; Clobbers: all
 RESET:
         CPSL $FF                ; clear PSL: CC=EQ, C=0, RS=0, SP=0
 
@@ -575,6 +554,7 @@ DIN_VAROK:
         BSTR,UN SET_IP_IBUF              ; IPH:IPL = IBUF
         BSTA,UN PARSE_S16                ; [+1]
         BCTR,UN DL_STORE
+
 ; =============================================================================
 ;  SET_IP_IBUF -- Set IPH:IPL = IBUF base address
 ; In:  nothing
@@ -691,6 +671,7 @@ EXP16_TO_GOTO:
         LODA,R0 EXPL
         STRA,R0 GOTOL
         RETC,UN
+
 ; =============================================================================
 ;  DO_GOSUB -- Subroutine call
 ; Syntax: GOSUB <line>
@@ -863,6 +844,19 @@ DF_PUSH:
         RETC,UN
 
 ; =============================================================================
+;  EXP16_TO_LNUM -- Copy EXPH:EXPL to LNUMH:LNUML
+; In:  EXPH:EXPL = 16-bit value
+; Out: LNUMH = EXPH, LNUML = EXPL
+; Clobbers: R0
+; Used by: DO_IF (save left operand), DO_FOR (save limit), DR_GOTO (load target).
+EXP16_TO_LNUM:
+        LODA,R0 EXPH
+        STRA,R0 LNUMH
+        LODA,R0 EXPL
+        STRA,R0 LNUML
+        RETC,UN
+
+; =============================================================================
 ;  DO_NEXT -- FOR loop iteration
 ; Syntax: NEXT [V]
 ; In:  FORSP = FOR stack pointer; top frame at FORBASE[FORSP].
@@ -872,12 +866,6 @@ DF_PUSH:
 ; Clobbers: R0, R1, EXPH, EXPL, LNUMH, LNUML, SC0, GOTOH, GOTOL, GOTOFLG.
 ; Errors: FORSP=$FF -> ERR_NXT.
 ; Variable name after NEXT consumed but not checked against frame (smallest code).
-; Implementation notes:
-;   VARS access: v3.4 direct VARS,R1 indexed (VARS_FP subroutine dropped).
-;   Step add:    v3.3 WC idiom (CPSL $08/lo-add/PPSL $08/hi-add/CPSL $08).
-;   Compare:     v3.3 shared biased-compare with fall-through DN_VAR_LT->DN_LOOP.
-;                Step sign from EXPH bit7 (LT=negative). Shorter than v3.4 TMI paths.
-;   nlp/pop:     v3.4 FORBASE,R1 indexed.
 DO_NEXT:
         LODA,R0 FORSP
         COMI,R0 $FF
@@ -1287,7 +1275,7 @@ SL_NOSHIFT:
 SL_WBODY:
         LODA,R1 *TMPH
         BCTR,EQ SL_WDONE
-        BSTA,UN TMP2EXP
+        BSTR,UN TMP2EXP
         BCTR,UN SL_WBODY
 SL_WDONE:
         LODI,R0 CR
@@ -1302,6 +1290,18 @@ SL_WDONE:
         LODA,R0 PEH
         ADDI,R0 1
         STRA,R0 PEH
+        RETC,UN
+
+; =============================================================================
+;  TMP2EXP -- Copy single byte: *EXP++ = *TMP++
+; In:  TMPH:TMPL -> source, EXPH:EXPL -> dest
+; Out: one byte copied; both pointers incremented
+; Clobbers: R0, R1
+TMP2EXP:
+        LODA,R1 *TMPH
+        STRA,R1 *EXPH
+        BSTA,UN INC_TMP
+        BSTA,UN INC_EXP
         RETC,UN
 
 ; =============================================================================
@@ -1346,7 +1346,7 @@ DL2_LP:
         TPSL $01
         BCTR,EQ DL2_DONE
 DL2_MOV:
-        BSTR,UN TMP2EXP
+        BSTA,UN TMP2EXP
         BCTR,UN DL2_LP
 DL2_DONE:
         ; PEH:PEL -= SC0
@@ -1358,18 +1358,6 @@ DL2_DONE:
         LODA,R0 PEH
         SUBI,R0 1
         STRA,R0 PEH
-        RETC,UN
-
-; =============================================================================
-;  TMP2EXP -- Copy single byte: *EXP++ = *TMP++
-; In:  TMPH:TMPL -> source, EXPH:EXPL -> dest
-; Out: one byte copied; both pointers incremented
-; Clobbers: R0, R1
-TMP2EXP:
-        LODA,R1 *TMPH
-        STRA,R1 *EXPH
-        BSTA,UN INC_TMP
-        BSTA,UN INC_EXP
         RETC,UN
 
 ; =============================================================================
@@ -2477,21 +2465,6 @@ KW_TAB:
         DB A'N',A'E',A'X', <DO_NEXT,   >DO_NEXT    ; NEXT (c3='X' vs NEW c3='W')
         DB "FRE", <DO_FREE, >DO_FREE               ; FREE
         DB NUL
-
-
-
-; =============================================================================
-;  EXP16_TO_LNUM -- Copy EXPH:EXPL to LNUMH:LNUML
-; In:  EXPH:EXPL = 16-bit value
-; Out: LNUMH = EXPH, LNUML = EXPL
-; Clobbers: R0
-; Used by: DO_IF (save left operand), DO_FOR (save limit), DR_GOTO (load target).
-EXP16_TO_LNUM:
-        LODA,R0 EXPH
-        STRA,R0 LNUMH
-        LODA,R0 EXPL
-        STRA,R0 LNUML
-        RETC,UN
 
 ROMEND: ; measure interpreter size: ROMEND-$0440
 
