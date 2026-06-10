@@ -52,7 +52,7 @@
 ;
 ;        CHANGE HISTORY
 ;
-;   V3.6  2026-06-10  - 3787 Interpreter bytes
+;   V3.6  2026-06-10  - 3748 Interpreter bytes
 ;         SET_IP_IBUF helper: LODI IPH=<IBUF / IPL=>IBUF (5 call sites, ~25 bytes saved).
 ;         EXP16_TO_GOTO helper: EXPH->GOTOH / EXPL->GOTOL (3 sites, ~7 bytes saved).
 ;         EXP16_TO_LNUM helper: EXPH->LNUMH / EXPL->LNUML (3 sites, ~7 bytes saved).
@@ -226,17 +226,12 @@ RESET:
 
         BSTA,UN DO_END          ; clear RUNFLG, SWSP, FORSP, GOTOFLG
 
-        ; clear A-Z variables (52 bytes) using IPH:IPL as scratch pointer
-        LODI,R0 <VARS
-        STRA,R0 IPH
-        LODI,R0 >VARS
-        STRA,R0 IPL
-        LODI,R3 52             ; 52 iterations
+        ; clear A-Z variables (52 bytes) 
+        LODI,R3 51       ; Loop bounds: 51 down to 0 (52 total bytes)
+        EORZ,R0          ; Clear R0 (Stays zero; STRA doesn't alter ALU states)
 CLRV:
-        EORZ,R0
-        STRA,R0 *IPH
-        BSTA,UN INC_IP
-        BDRR,R3 CLRV
+        STRA,R0 VARS,R3  ; Clear target index byte directly
+        BDRR,R3 CLRV     ; Decrement R3 and loop until underflow to $FF
 
         ; print sign-on banner
         LODI,R0 <BANNER
@@ -534,26 +529,14 @@ DL_EQC:
 DL_EX:
         BSTA,UN PARSE_EXPR               ; [+1]
 DL_STORE:
-        ; address = VARS + (R2 - 'A') * 2
-        ; R2 preserved across PARSE_EXPR; resync SC0 for safety.
-        LODZ,R2
-        STRA,R0 SC0
-        SUBI,R0 A'A'                     ; 0..25
-        STRA,R0 SC1
-        ADDA,R0 SC1                      ; index*2
-        LODI,R1 >VARS
-        ADDZ,R1
-        STRA,R0 TMPL
-        LODI,R0 <VARS
-        BCTR,GT DL_NC
-        ADDI,R0 1
-DL_NC:
-        STRA,R0 TMPH
-        LODA,R0 EXPH
-        STRA,R0 *TMPH                    ; store hi
-        BSTA,UN INC_TMP
-        LODA,R0 EXPL
-        STRA,R0 *TMPH                    ; store lo
+        LODZ,R2          ; R0 = R2 (Variable character letter)
+        SUBI,R0 A'A'     ; R0 = R0 - 'A' (0 to 25)
+        ADDZ,R0          ; R0 = R0 * 2 (Double for 16-bit word stride)
+        STRZ,R1          ; R1 = R0 (Transfer offset to Index Register R1)
+        LODA,R0 EXPH     ; R0 = High byte of expression
+        STRA,R0 VARS,R1  ; Store directly to VARS array + offset
+        LODA,R0 EXPL     ; R0 = Low byte of expression
+        STRA,R0 VARS+1,R1; Store directly to VARS array + offset + 1
         ; fall through to DO_REM (RETC,UN)
 
 ; =============================================================================
@@ -591,7 +574,7 @@ DIN_VAROK:
         BSTA,UN RDLINE                   ; [+1]
         BSTR,UN SET_IP_IBUF              ; IPH:IPL = IBUF
         BSTA,UN PARSE_S16                ; [+1]
-        BCTA,UN DL_STORE
+        BCTR,UN DL_STORE
 ; =============================================================================
 ;  SET_IP_IBUF -- Set IPH:IPL = IBUF base address
 ; In:  nothing
