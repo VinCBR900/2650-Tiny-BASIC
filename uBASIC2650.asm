@@ -1863,7 +1863,7 @@ NEG_EXP:
         LODA,R0 NEGFLG
         RETC,EQ
 NEG_EXP_BODY:
-        LODI,R1 4                        ; offset for EXPH/EXPL from IPH
+        LODI,R1 EXPH-IPH                        ; offset for EXPH/EXPL from IPH
         BCTR,UN NEG_SHARED
 
 ; =============================================================================
@@ -1877,7 +1877,7 @@ ABS_TMP:
         RETC,EQ
         LODI,R0 1
         STRA,R0 NEGFLG
-        LODI,R1 2                        ; offset for TMPH/TMPL from IPH
+        LODI,R1 TMPH-IPH                        ; offset for TMPH/TMPL from IPH
         ; fall through to NEG_SHARED
 
 ; =============================================================================
@@ -1893,7 +1893,7 @@ NEG_SHARED:
         EORI,R0 $FF
         STRA,R0 IPL,R1
         LODZ R1
-        BCTA,UN INC_ET                   ; tail call: adds 1 (INC_ET uses alt bank R1)
+        BCTA,UN INC_ET                   ; tail call: adds 1 
 
 ; =============================================================================
 ;  ABS_EXP -- Absolute value of EXPH:EXPL; toggle NEGFLG if was negative
@@ -1907,7 +1907,7 @@ ABS_EXP:
         LODA,R0 NEGFLG
         EORI,R0 $01
         STRA,R0 NEGFLG
-        LODI,R1 4
+        LODI,R1 EXPH-IPH        ; offset
         BCTR,UN NEG_SHARED
 
 ; =============================================================================
