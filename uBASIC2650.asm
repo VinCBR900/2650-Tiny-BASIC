@@ -1,5 +1,5 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v3.6
+; Version: v3.6c
 ; By Vincent Crabtree, 2026.  MIT License
 ; Date:    2026-06-10
 ;
@@ -239,7 +239,7 @@ REPL:
 
 ; =============================================================================
 BANNER:
-        DB CR, LF, "uBASIC 2650 V3.6", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V3.6c", CR, LF, "Bytes Free:",NUL
 
 ; =============================================================================
 ;  STMT_EXEC -- Decode and dispatch one BASIC statement from IP.
@@ -2301,10 +2301,10 @@ EW_ADV:
 ; Carry idiom: ADDI R0,1: no-carry -> R0 non-zero (GT if was $01..$FE),
 ;   carry -> R0 wraps to $00 (EQ). TPSL $01: EQ=carry, LT=no-carry.
 INC_EXP:
-        LODI,R0 4               ; EXP is 4 bytes after IP
+        LODI,R0 EXPH-IPH        ; EXP is 4 bytes after IP
         db $EC                  ; COMA,R0 -- consume next 2 bytes (skip to INC_IP path)
 INC_TMP:
-        LODI,R0 2               ; TMP is 2 bytes after IP
+        LODI,R0 TMPH-IPH        ; TMP is 2 bytes after IP
         db $C4                  ; COMI,R0 -- consume next 1 byte
 INC_IP:
         EORZ,R0                 ; offset = 0 (IPH itself)
@@ -2339,10 +2339,10 @@ ET_RET:
 ; RAS rule: NO BSTA inside body -- must not consume extra depth.
 ; DEC_EXP/DEC_TMP omitted: MUL16 call site is at RAS depth 5+1=6 (unsafe).
 DEC_LNUM:
-        LODI,R0 12              ; LNUMH is 12 bytes after IPH ($160C-$1600)
+        LODI,R0 LNUMH-IPH       ; LNUMH is 12 bytes after IPH ($160C-$1600)
         db $EC                  ; COMA,R0: skip next 2 bytes (the LODI,R0 8)
 DEC_GOTO:
-        LODI,R0 8               ; GOTOH is 8 bytes after IPH ($1608-$1600)
+        LODI,R0 GOTOH-IPH       ; GOTOH is 8 bytes after IPH ($1608-$1600)
         db $C4                  ; COMI,R0: skip next 1 byte (the EORZ,R0)
 DEC_IP:
         EORZ,R0                 ; offset = 0 (IPH:IPL)
