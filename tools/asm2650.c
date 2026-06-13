@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.12
+ * Version: 1.13
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -14,7 +14,13 @@
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
  *
- * Changes v1.11 -> v1.12:
+ * Changes v1.12 -> v1.13:
+ *   BUG-ASM-06 FIXED: DW with an unresolved forward reference emitted 0 bytes
+ *     on pass 1 instead of reserving 2 bytes. This caused all subsequent label
+ *     addresses to be wrong on pass 1, which in turn made BCTR/BSTR relative
+ *     displacements incorrect on pass 2 (they used the pass-1 address of the
+ *     target). Fix: emit two $00 placeholder bytes on pass 1 when the DW
+ *     operand does not resolve, matching the behaviour of DB and RES.
  *   BUG-ASM-05 FIXED: Semicolons inside quoted literals were treated as comments.
  *     Added quote-aware comment stripping and operand splitting so DB "PRINT ;",
  *     DB strings containing commas/semicolons, and single-quoted character literals
@@ -75,7 +81,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.12"
+#define ASM2650_VERSION "1.13"
 
 typedef struct { char name[32]; int value; int referenced; } Label;
 static Label labels[MAX_LABELS];
@@ -375,7 +381,7 @@ static void assemble_line(char *line){
         }
         return;
     }
-    if(strcmp(mn,"DW" )==0){ for(int i=0;i<nops;i++){int ok,v=eval_expr(ops[i],&ok); if(!ok){ if(pass==2){fprintf(stderr,"ERROR line %d: bad DW expression '%s'\n",lineno,ops[i]); errors++;} continue; } emit(pc,(unsigned char)((v>>8)&0xFF));pc++; emit(pc,(unsigned char)(v&0xFF));pc++;} return; }
+    if(strcmp(mn,"DW" )==0){ for(int i=0;i<nops;i++){int ok,v=eval_expr(ops[i],&ok); if(!ok){ if(pass==2){fprintf(stderr,"ERROR line %d: bad DW expression '%s'\n",lineno,ops[i]); errors++;} emit(pc,0);pc++; emit(pc,0);pc++; continue; } emit(pc,(unsigned char)((v>>8)&0xFF));pc++; emit(pc,(unsigned char)(v&0xFF));pc++;} return; }
     if(strcmp(mn,"END")==0) return;
     /* 2650 hardware constraints — warn on architecturally invalid encodings */
     if(strcmp(mn,"NOP" )==0){ emit(pc,0xC0);pc++; return; }

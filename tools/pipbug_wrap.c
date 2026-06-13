@@ -1,6 +1,6 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
- * Version: 2.0
- * Date:    2026-05-28
+ * Version: 2.1
+ * Date:    2026-06-12
  *
  * Purpose:
  *   Wraps 2650.c (the WinArcadia CPU core, compiled -DGAMER to strip all UI
@@ -13,7 +13,9 @@
  * Options:
  *   -t              Trace every instruction to stderr
  *   -b 0xADDR       Breakpoint at address (hex); pauses and dumps state
- *   -m 0xADDR LEN   Dump LEN bytes from address at halt
+ *   -w 0xADDR       Write watchpoint: log every write to address, continue
+ *   -W 0xADDR       Write watchpoint: log and halt on first write to address
+ *   -m 0xADDR LEN   Dump LEN bytes from address at halt (up to 4 -m options)
  *   -s              Step mode: pause at every instruction, press Enter to continue
  *   -i              Interactive terminal mode; raw I/O, Ctrl-] exits
  *                   and defaults to unlimited instructions
@@ -34,6 +36,11 @@
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
+ *   v2.1  Added write watchpoints (-w log, -W halt-on-first), multiple -m
+ *         dumps (up to 4), enhanced trace showing alternate register bank
+ *         (r[4]-r[6]) when PSL RS is active, and decoded PSU flags
+ *         (SP/RS/OVF/C). Watchpoints use per-instruction memory polling
+ *         after cpu_emu() so no 2650.c modification is required.
  *   v2.0  Added cross-platform interactive terminal mode (-i) with raw
  *         byte input/output and Ctrl-] graceful exit. Browser builds use
  *         non-blocking FIFO polling so WASM never blocks the event loop.
@@ -354,8 +361,22 @@ EXPORT void checkinterrupt(void);
 /* ── Wrapper-specific globals ────────────────────────────────────────────── */
 
 static int  bp_addr       = -1;     /* -b breakpoint address (-1 = none)   */
-static int  dump_addr     = -1;     /* -m dump base address                 */
-static int  dump_len      = 0;
+
+/* Up to 4 independent -m memory dumps at halt */
+#define PW_MAX_DUMPS 4
+static int  dump_addr[PW_MAX_DUMPS];
+static int  dump_len [PW_MAX_DUMPS];
+static int  dump_count        = 0;
+
+/* Write watchpoints: -w (log, continue) and -W (log, halt on first hit)   */
+#define PW_MAX_WATCH 8
+static int           pw_waddr[PW_MAX_WATCH];  /* watched address            */
+static int           pw_whalt[PW_MAX_WATCH];  /* 1=-W halt, 0=-w log        */
+static unsigned char pw_wprev[PW_MAX_WATCH];  /* value before last insn     */
+static int           pw_wcount       = 0;
+static int           pw_halt_pending = 0;     /* set when -W fires          */
+static int           pw_halt_addr    = 0;
+static unsigned char pw_halt_newval  = 0;
 static long inst_limit    = 5000000;
 static int  inst_limit_set = 0;      /* explicit -n was supplied             */
 static int  step_mode     = 0;      /* -s step mode                        */
@@ -616,7 +637,9 @@ static void print_usage(const char *prog)
         "  -i              Interactive terminal mode; raw I/O, Ctrl-] exits\n"
         "                  and defaults to unlimited instructions\n"
         "  -b 0xADDR       Breakpoint at address (hex)\n"
-        "  -m 0xADDR LEN   Dump LEN bytes from address at halt\n"
+        "  -w 0xADDR       Write watchpoint: log every write, continue\n"
+        "  -W 0xADDR       Write watchpoint: log and halt on first write\n"
+        "  -m 0xADDR LEN   Dump LEN bytes from address at halt (up to 4)\n"
         "  -n LIMIT        Instruction limit (default 5000000, 0=unlimited)\n"
         "  --chin 0xADDR   CHIN intercept address (default 0x0286)\n"
         "  --cout 0xADDR   COUT intercept address (default 0x02B4)\n"
@@ -637,7 +660,7 @@ static void print_usage(const char *prog)
  */
 static void print_version(void)
 {
-    fprintf(stderr, "pipbug_wrap v2.0\n");
+    fprintf(stderr, "pipbug_wrap v2.1\n");
 }
 
 /* ── Minimal PIPBUG stubs ─────────────────────────────────────────────────
@@ -758,26 +781,54 @@ static const char *cc_name(void)
 
 /*
  * Purpose:
- *   Print the current CPU state for tracing or step mode.
- * Inputs:
- *   None.
- * Outputs:
- *   Writes the formatted CPU state to stderr.
+ *   Build a short decoded string for PSU/PSL flags relevant to the 2650.
+ * Inputs:  None (reads psu, psl globals).
+ * Outputs: Fills caller-supplied buf; returns it.
  */
-static void print_state(void)
+static const char *psu_flags_str(char *buf, int bufsz)
 {
-    fprintf(stderr,
-        "[%04X] %02X  R0=%02X R1=%02X R2=%02X R3=%02X "
-        "PSL=%02X(%s) PSU=%02X SP=%d\n",
-        iar, memory[WRAPMEM(0)],
-        r[0], r[1], r[2], r[3],
-        psl, cc_name(),
-        psu, (int)(psu & PSU_SP));
+    snprintf(buf, bufsz, "SP=%d%s%s%s",
+        psu & PSU_SP,
+        (psl & PSL_RS)  ? " RS"  : "",
+        (psl & PSL_OVF) ? " OVF" : "",
+        (psl & PSL_C)   ? " C"   : "");
+    return buf;
 }
 
 /*
  * Purpose:
- *   Print a halt/break summary and optional memory dump.
+ *   Print the current CPU state for tracing or step mode.
+ *   Shows alternate register bank (r[4]-r[6]) when PSL RS is active.
+ * Inputs:  None.
+ * Outputs: Writes formatted CPU state to stderr.
+ */
+static void print_state(void)
+{
+    char psuf[32];
+    psu_flags_str(psuf, sizeof(psuf));
+    if (psl & PSL_RS)
+        fprintf(stderr,
+            "[%04X] %02X  R0=%02X R1=%02X R2=%02X R3=%02X "
+            "ALT R1=%02X R2=%02X R3=%02X "
+            "PSL=%02X(%s) PSU=%02X(%s) SP=%d\n",
+            iar, memory[WRAPMEM(0)],
+            r[0], r[1], r[2], r[3],
+            r[4], r[5], r[6],
+            psl, cc_name(), psu, psuf,
+            (int)(psu & PSU_SP));
+    else
+        fprintf(stderr,
+            "[%04X] %02X  R0=%02X R1=%02X R2=%02X R3=%02X "
+            "PSL=%02X(%s) PSU=%02X(%s) SP=%d\n",
+            iar, memory[WRAPMEM(0)],
+            r[0], r[1], r[2], r[3],
+            psl, cc_name(), psu, psuf,
+            (int)(psu & PSU_SP));
+}
+
+/*
+ * Purpose:
+ *   Print a halt/break summary and all requested memory dumps.
  * Inputs:
  *   count - number of emulated instructions executed.
  * Outputs:
@@ -785,16 +836,23 @@ static void print_state(void)
  */
 static void print_halt_summary(long count)
 {
+    char psuf[32];
+    psu_flags_str(psuf, sizeof(psuf));
     fprintf(stderr, "\nHalted after %ld instructions\n", count);
-    fprintf(stderr, "R0=$%02X R1=$%02X R2=$%02X R3=$%02X\n",
+    if (psl & PSL_RS)
+        fprintf(stderr,
+            "R0=$%02X R1=$%02X R2=$%02X R3=$%02X  ALT R1=$%02X R2=$%02X R3=$%02X\n",
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+    else
+        fprintf(stderr, "R0=$%02X R1=$%02X R2=$%02X R3=$%02X\n",
             r[0], r[1], r[2], r[3]);
-    fprintf(stderr, "IAR=$%04X PSU=$%02X PSL=$%02X CC=%s\n",
-            iar, psu, psl, cc_name());
-    if (dump_addr >= 0) {
-        fprintf(stderr, "\nMEM $%04X+%d:\n  ", dump_addr, dump_len);
-        for (int i = 0; i < dump_len; i++) {
-            fprintf(stderr, "%02X ", memory[(dump_addr + i) & AMSK]);
-            if ((i & 15) == 15 && i < dump_len-1) fprintf(stderr, "\n  ");
+    fprintf(stderr, "IAR=$%04X PSU=$%02X PSL=$%02X CC=%s (%s)\n",
+        iar, psu, psl, cc_name(), psuf);
+    for (int d = 0; d < dump_count; d++) {
+        fprintf(stderr, "\nMEM $%04X+%d:\n  ", dump_addr[d], dump_len[d]);
+        for (int i = 0; i < dump_len[d]; i++) {
+            fprintf(stderr, "%02X ", memory[(dump_addr[d] + i) & AMSK]);
+            if ((i & 15) == 15 && i < dump_len[d]-1) fprintf(stderr, "\n  ");
         }
         fprintf(stderr, "\n");
     }
@@ -941,10 +999,52 @@ EMSCRIPTEN_KEEPALIVE int pipbug_run_chunk(int instruction_budget)
 
         oldcycles = cycles_2650;
         opcode = memory[iar];
+        /* Snapshot watched bytes before the instruction */
+        for (int wi = 0; wi < pw_wcount; wi++)
+            pw_wprev[wi] = memory[pw_waddr[wi] & AMSK];
         one_instruction();
         cpu_emu();
         instruction_count++;
         executed++;
+
+        /* Check watchpoints: did any watched byte change? */
+        for (int wi = 0; wi < pw_wcount; wi++) {
+            unsigned char newval = memory[pw_waddr[wi] & AMSK];
+            if (newval != pw_wprev[wi]) {
+                char psuf[32];
+                psu_flags_str(psuf, sizeof(psuf));
+                if (psl & PSL_RS)
+                    fprintf(stderr,
+                        "[WATCH] IAR=$%04X  WR $%04X: $%02X->$%02X  "
+                        "R0=%02X R1=%02X R2=%02X R3=%02X "
+                        "ALT R1=%02X R2=%02X R3=%02X "
+                        "PSL=%02X(%s) PSU=%02X(%s)  insn=%ld\n",
+                        iar, pw_waddr[wi], pw_wprev[wi], newval,
+                        r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+                        psl, cc_name(), psu, psuf, instruction_count);
+                else
+                    fprintf(stderr,
+                        "[WATCH] IAR=$%04X  WR $%04X: $%02X->$%02X  "
+                        "R0=%02X R1=%02X R2=%02X R3=%02X "
+                        "PSL=%02X(%s) PSU=%02X(%s)  insn=%ld\n",
+                        iar, pw_waddr[wi], pw_wprev[wi], newval,
+                        r[0], r[1], r[2], r[3],
+                        psl, cc_name(), psu, psuf, instruction_count);
+                if (pw_whalt[wi] && !pw_halt_pending) {
+                    pw_halt_pending = 1;
+                    pw_halt_addr    = pw_waddr[wi];
+                    pw_halt_newval  = newval;
+                }
+            }
+        }
+        if (pw_halt_pending) {
+            fprintf(stderr,
+                "\n*** WRITE WATCHPOINT $%04X <= $%02X (insn %ld) ***\n",
+                pw_halt_addr, pw_halt_newval, instruction_count);
+            print_halt_summary(instruction_count);
+            finish_run();
+            return PIPBUG_RUN_DONE;
+        }
 
         if (halted) {
             fprintf(stderr, "\n*** HALT ($40) at $%04X ***\n", iar);
@@ -983,9 +1083,20 @@ int main(int argc, char **argv)
             interactive_mode = 1;
         } else if (!strcmp(argv[i], "-b") && i+1 < argc) {
             bp_addr = (int)strtol(argv[++i], NULL, 16);
+        } else if ((!strcmp(argv[i], "-w") || !strcmp(argv[i], "-W")) && i+1 < argc) {
+            if (pw_wcount < PW_MAX_WATCH) {
+                pw_waddr[pw_wcount] = (int)strtol(argv[i+1], NULL, 16);
+                pw_whalt[pw_wcount] = (argv[i][1] == 'W') ? 1 : 0;
+                pw_wcount++;
+            } else { fprintf(stderr, "Too many watchpoints (max %d)\n", PW_MAX_WATCH); }
+            i++;
         } else if (!strcmp(argv[i], "-m") && i+2 < argc) {
-            dump_addr = (int)strtol(argv[++i], NULL, 16);
-            dump_len  = (int)strtol(argv[++i], NULL, 10);
+            if (dump_count < PW_MAX_DUMPS) {
+                dump_addr[dump_count] = (int)strtol(argv[i+1], NULL, 16);
+                dump_len [dump_count] = (int)strtol(argv[i+2], NULL, 10);
+                dump_count++;
+            } else { fprintf(stderr, "Too many -m options (max %d)\n", PW_MAX_DUMPS); }
+            i += 2;
         } else if (!strcmp(argv[i], "-n") && i+1 < argc) {
             inst_limit = atol(argv[++i]);
             inst_limit_set = 1;
@@ -1050,6 +1161,9 @@ int main(int argc, char **argv)
         cout_addr, chin_addr, crlf_addr, entry_addr,
         interactive_mode ? "  interactive=on" : "",
         inst_limit > 0 ? "set" : "unlimited");
+    for (int i = 0; i < pw_wcount; i++)
+        fprintf(stderr, "Watchpoint %s $%04X\n",
+            pw_whalt[i] ? "HALT" : "LOG ", pw_waddr[i]);
 
     if(interactive_mode) fprintf(stderr,"\n*** Press Ctrl-] to exit Interactive Mode ***\n");
    
