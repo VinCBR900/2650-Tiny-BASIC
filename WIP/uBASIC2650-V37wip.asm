@@ -45,7 +45,8 @@
 ;   R3  loop counter (BDRR/BIRR); STORE_LINE shift count. SW expr-stack pointer.
 ;
 ;        KNOWN OPEN ITEMS
-;   COLON-01: ':' multi-statement separator not supported.
+;   LE-01:    Line Entry - CRITICAL overwrite existing line with larger corrupts program.
+;   COLON-01: ':' multi-statement separator not supported - likely never due to RAS.
 ;   OPT-16:   MUL16/DIV16 naive O(N) loop -- O(16) bit-serial deferred.
 ;   OPT-FOR:  DF_PUSH loop-based frame write 
 ;   FOR-01:   NEXT variable not checked against frame var (smallest code, by spec).
@@ -56,7 +57,6 @@
 ;         Page-zero vector table + Zxxx size optimisation 
 ;         DO_NEW memory clear.
 ;         SWSTK RES 1->2: fixed SWSTK+1/RELOP aliasing bug (v36d fix).
-;         --crlf must be PRT_CRLF from .sym (not old PIPBUG $008A).
 ;
 ;   V3.6G 2026-06-12  Interpreter: 3700 bytes
 ;         Code ORG now 0x0, added CHIN/COUT routines from Pipbug M20 App note,
