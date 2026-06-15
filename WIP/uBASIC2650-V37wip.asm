@@ -2318,7 +2318,6 @@ UPCASE:
         RETC,LT
         COMI,R0 A'z'+1
         BCFR,LT WSKIPRET
-UC_DO:
         SUBI,R0 32
         RETC,UN
 
@@ -2423,14 +2422,14 @@ DRT_UNDERFLOW:
 ; Out: jumps to REPL
 ; Clobbers: all (RAS cleared by REPL)
 DO_ERROR:
-        STRA,R0 SC0                      ; save error code
-        BSTR,UN PRT_QUEST
-        LODA,R0 SC0
-        ZBSR *VCOUT                      ; print error code
+        STRZ,R1                         ; Save ASCII error code
+        BSTR,UN PRT_QUEST               ; Print Question mark
+        LODZ,R1
+        ZBSR *VCOUT                     ; print error code
         LODA,R0 RUNFLG                  ; OPT-10: SC1=RUNFLG, 0->EQ, 1->GT
         BCTR,EQ DE_NL                   ; not running, no line number
-        LODI,R0 '@'
-        ZBSR *VCOUT  
+        LODI,R0 '@'                     
+        ZBSR *VCOUT                     ; Print at line
         LODA,R0 CURH
         STRA,R0 EXPH
         LODA,R0 CURL
