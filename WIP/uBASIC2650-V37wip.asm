@@ -1,5 +1,5 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v3.7
+; Version: v3.7b
 ; By Vincent Crabtree, 2026.  MIT License
 ; Date:    2026-06-14
 ;
@@ -45,7 +45,6 @@
 ;   R3  loop counter (BDRR/BIRR); STORE_LINE shift count. SW expr-stack pointer.
 ;
 ;        KNOWN OPEN ITEMS
-;   LE-01:    Line Entry - CRITICAL overwrite existing line with larger corrupts program.
 ;   COLON-01: ':' multi-statement separator not supported - likely never due to RAS.
 ;   OPT-16:   MUL16/DIV16 naive O(N) loop -- O(16) bit-serial deferred.
 ;   OPT-FOR:  DF_PUSH loop-based frame write 
@@ -53,9 +52,23 @@
 ;   FOR-02:   Body always executes at least once (no skip-if-false-at-entry, by spec).
 ;
 ;        CHANGE HISTORY
+;   V3.7b 2026-06-15  3543 rom bytes
+;         BUG-DEC-01: DEC_ET borrow detection used BCFR,LT (sign test)
+;         not carry. Any lo-byte in $80-$FF range sets CC=LT after SUBI,R0 1
+;         even without borrow, causing spurious hi-byte decrement.
+;         Fix: TPSL $01 / BCTR,EQ ET_RET (C=1=no borrow -> CC=EQ -> skip hi--).
+;         BUG-DL-01: DELETE_LINE / DL2_LP early exit.
+;         TPSL $01 / BCTR,EQ DL2_DONE exited when TMPL > PEL
+;         (TPSL maps GT->EQ same as EQ, causing early loop exit).
+;         Fix: BCFR,LT DL2_DONE (branch if TMPL >= PEL, i.e. no borrow).
+;         BUG-SL-01: STORE_LINE / SL_SHLOOP GOTOH carry detection.
+;         STRA,R0 GOTOL between ADDA,R0 SC1 and TPSL $01 clobbered carry.
+;         Fix: SUBA,R0 PEL after STRA GOTOL (sum-addend<0 iff carry);
+;         BCFR,LT SL_DNC skips ADDI when no carry (result >= addend).
+;
 ;   V3.7  2026-06-14  Interpreter: 3567 bytes
 ;         Page-zero vector table + Zxxx size optimisation 
-;         DO_NEW memory clear.
+;         DO_NEW memory clear. Refactor PRINT_S16 intro for size.
 ;         SWSTK RES 1->2: fixed SWSTK+1/RELOP aliasing bug (v36d fix).
 ;
 ;   V3.6G 2026-06-12  Interpreter: 3700 bytes
@@ -221,7 +234,7 @@ CLRV:
 ; Clobbers: all
 REPL:
         CPSL PSW_RS + 7             ; ensure primary reg bank, Clear stack so SP=0
-        LODI,R0 '>'                    ; print prompt 
+        LODI,R0 '>'                    ; print prompt only used here
         ZBSR *VCOUT  
         ZBSR *VPRT_SPACE  
         BSTA,UN RDLINE
@@ -438,7 +451,7 @@ DP_SEMI:
         ZBSR *VINC_IP  
         ZBSR *VWSKIP  
         LODA,R0 *IPH
-        RETC,EQ
+        RETC,EQ                 ; bail if NUL
         BCTA,UN DP_ITEM
 
 DP_STRING:
@@ -628,8 +641,7 @@ DO_RETURN:
         COMI,R0 $FF
         BCTA,EQ DRT_UNDERFLOW
         LODA,R1 SWSP
-        ADDI,R1 1
-        LODA,R0 GSBASE,R1                ; hi byte
+        LODA,R0 GSBASE,R1+                ; hi byte
         STRA,R0 GOTOH
         LODA,R1 SWSP
         LODA,R0 GSBASE,R1                ; lo byte
@@ -652,7 +664,7 @@ DRT_GO:
 ; Character IO
 ; 110 Baud teletype from PIPBUG V1 as per Signetics M20 application note
 ; CHIN must be at $286, COUt must be at $2B4 for Pipbug 1 compatability
-      ;  ORG $286
+        ORG $286
 CHIN:
         PPSL PSW_RS
         LODI,R0 $80
@@ -816,8 +828,7 @@ DGS_STORE:
         LODA,R1 SWSP
         STRA,R0 GSBASE,R1                ; GSBASE[SWSP] = lo
         LODA,R0 SWSTK                    ; NLP hi byte
-        ADDI,R1 1
-        STRA,R0 GSBASE,R1                ; GSBASE[SWSP+1] = hi
+        STRA,R0 GSBASE,R1+                ; GSBASE[SWSP+1] = hi
         BSTA,UN EXP16_TO_GOTO            ; GOTOH:GOTOL = EXPH:EXPL (target line)
         LODI,R0 2                        ; GOTOFLG=$02 = GOSUB pending
         STRA,R0 GOTOFLG
@@ -895,24 +906,18 @@ DF_PUSH:
         LODA,R1 FORSP                    ; R1 = frame base offset
         LODA,R0 FORVAR
         STRA,R0 FORBASE,R1               ; [0] var
-        ADDI,R1 1
         LODA,R0 LNUMH
-        STRA,R0 FORBASE,R1               ; [1] limH
-        ADDI,R1 1
+        STRA,R0 FORBASE,R1+               ; [1] limH
         LODA,R0 LNUML
-        STRA,R0 FORBASE,R1               ; [2] limL
-        ADDI,R1 1
+        STRA,R0 FORBASE,R1+               ; [2] limL
         LODA,R0 EXPH
-        STRA,R0 FORBASE,R1               ; [3] stpH  (OPT-F4: direct from EXPH)
-        ADDI,R1 1
+        STRA,R0 FORBASE,R1+               ; [3] stpH  (OPT-F4: direct from EXPH)
         LODA,R0 EXPL
-        STRA,R0 FORBASE,R1               ; [4] stpL  (OPT-F4: direct from EXPL)
-        ADDI,R1 1
+        STRA,R0 FORBASE,R1+               ; [4] stpL  (OPT-F4: direct from EXPL)
         LODA,R0 SWSTK
-        STRA,R0 FORBASE,R1               ; [5] nlpH
-        ADDI,R1 1
+        STRA,R0 FORBASE,R1+               ; [5] nlpH
         LODA,R0 SWSTK+1
-        STRA,R0 FORBASE,R1               ; [6] nlpL
+        STRA,R0 FORBASE,R1+               ; [6] nlpL
         RETC,UN
 
 ; =============================================================================
@@ -949,8 +954,7 @@ DO_NEXT:
         ADDI,R1 3
         LODA,R0 FORBASE,R1               ; frame[3] = stpH
         STRA,R0 EXPH
-        ADDI,R1 1
-        LODA,R0 FORBASE,R1               ; frame[4] = stpL
+        LODA,R0 FORBASE,R1+               ; frame[4] = stpL
         STRA,R0 EXPL
 
         ; --- load current var value -> LNUMH:LNUML (via VARS,R1 indexed) ---
@@ -976,17 +980,14 @@ DO_NEXT:
         LODA,R1 SC0                      ; R1 = index*2
         STRA,R0 VARS,R1                  ; write var hi  (R0 still = new var hi)
         LODA,R0 LNUML
-        ADDI,R1 1
-        STRA,R0 VARS,R1                  ; write var lo
+        STRA,R0 VARS,R1+                  ; write var lo
 
         ; --- signed 16-bit compare: var vs limit ---
         ; Read limit from frame[1:2]
         LODA,R1 FORSP
-        ADDI,R1 1
-        LODA,R0 FORBASE,R1               ; frame[1] = limH
+        LODA,R0 FORBASE,R1+               ; frame[1] = limH
         STRA,R0 SC0                      ; SC0 = limH (biased below)
-        ADDI,R1 1
-        LODA,R0 FORBASE,R1               ; frame[2] = limL
+        LODA,R0 FORBASE,R1+               ; frame[2] = limL
         STRA,R0 EXPL                     ; EXPL = limL (scratch; step already saved)
         ; Note: EXPH still holds stpH -- needed for step sign test below.
         ; Shared biased signed compare:
@@ -1017,8 +1018,7 @@ DN_LOOP:
         ADDI,R1 5
         LODA,R0 FORBASE,R1               ; frame[5] = nlpH
         STRA,R0 GOTOH
-        ADDI,R1 1
-        LODA,R0 FORBASE,R1               ; frame[6] = nlpL
+        LODA,R0 FORBASE,R1+               ; frame[6] = nlpL
         STRA,R0 GOTOL
         BCTA,UN DRT_GO                   ; Set GOTOFLG $03 = FOR direct NLP branch (DO_RETURN)
 DN_VAR_GT:
@@ -1252,12 +1252,12 @@ SL_ROOM:
         STRA,R0 LNUMH
         LODA,R0 PEL
         STRA,R0 LNUML
-        ADDA,R0 SC1                      ; R0 = PEL + SC1
-        STRA,R0 GOTOL
+        ADDA,R0 SC1                      ; R0 = sum = PEL + SC1
+        STRA,R0 GOTOL                    ; GOTOL = lo byte of (PE + SC1)
+        SUBA,R0 PEL                      ; sum-PEL: LT = carry (wrapped), GE = no carry
         LODA,R0 PEH
-        TPSL $01
-        BCTR,LT SL_DNC
-        ADDI,R0 1
+        BCFR,LT SL_DNC                   ; branch if NOT LT = no carry: GOTOH = PEH
+        ADDI,R0 1                        ; LT = carry: GOTOH = PEH + 1
 SL_DNC:
         STRA,R0 GOTOH
 
@@ -1384,8 +1384,7 @@ DL2_LP:
         BCTR,LT DL2_MOV
         LODA,R0 TMPL
         SUBA,R0 PEL
-        TPSL $01
-        BCTR,EQ DL2_DONE
+        BCFR,LT DL2_DONE                 ; TMPL >= PEL (no borrow): at or past end
 DL2_MOV:
         BSTA,UN TMP2EXP
         BCTR,UN DL2_LP
@@ -2187,8 +2186,8 @@ PR_PRINT:
 SWRETURN:
         LODA,R0 SWBASE,R3
         STRA,R0 TEMPRETH
-        SUBI,R3 1
-        LODA,R0 SWBASE,R3
+        ;SUBI,R3 1
+        LODA,R0 SWBASE,R3-
         STRA,R0 TEMPRETL
         SUBI,R3 1
         BCTA,UN *TEMPRETH
@@ -2377,7 +2376,8 @@ DEC_ET:
         LODA,R0 IPL,R1          ; load lo byte
         SUBI,R0 1
         STRA,R0 IPL,R1
-        BCFR,LT ET_RET      ; CC != LT -> no borrow: hi unchanged
+        TPSL $01                ; C=1 = no borrow (lo was >=1): CC=EQ -> skip hi--
+        BCTR,EQ ET_RET          ; C=0 = borrow (lo was 0): fall through to hi--
         LODA,R0 IPH,R1          ; borrow: decrement hi byte
         SUBI,R0 1
         BCTR,UN ET_STORE        ; borrow tail from INC_xx
@@ -2484,7 +2484,7 @@ PRT_BS:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V3.7", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V3.7b", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword dispatch table
 ; Format: [c1][c2][c3][hi][lo]  NUL-terminated on c1.
@@ -2591,8 +2591,8 @@ VARS    RES 52      ; $14AC  A-Z variables 2 bytes each  $14AC-$14DF
 ;  $22=DQ $3B=semicolon  in-string chars that need escaping.
 ; =============================================================================
 PROG:
-        DB 0,10,"REM uBASIC 2650 - SHOWCASE V3.7",$0D                          ; 10  REM uBASIC 2650 - SHOWCASE V3.6d
-        DB 0,20,"PRINT ",$22,"-- uBASIC 2650 V3.7 Showcase --",$22,$0D         ; 20  PRINT "-- uBASIC 2650 V3.6d Showcase --"
+        DB 0,10,"REM uBASIC 2650 - SHOWCASE V3.7b",$0D                          ; 10  REM uBASIC 2650 - SHOWCASE V3.6d
+        DB 0,20,"PRINT ",$22,"-- uBASIC 2650 V3.7b Showcase --",$22,$0D         ; 20  PRINT "-- uBASIC 2650 V3.6d Showcase --"
         DB 0,30,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,$0D                    ; 30  PRINT "--- PRINT / CHR$ ---"
         DB 0,40,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",$0D             ; 40  PRINT CHR$(65);CHR$(66);CHR$(67)
         DB 0,50,"PRINT ",$22,"--- ARITHMETIC ---",$22,$0D                      ; 50  PRINT "--- ARITHMETIC ---"
