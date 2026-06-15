@@ -53,7 +53,7 @@
 ;   FOR-02:   Body always executes at least once (no skip-if-false-at-entry, by spec).
 ;
 ;        CHANGE HISTORY
-;   V3.7  2026-06-14  Interpreter: 3593 bytes
+;   V3.7  2026-06-14  Interpreter: 3567 bytes
 ;         Page-zero vector table + Zxxx size optimisation 
 ;         DO_NEW memory clear.
 ;         SWSTK RES 1->2: fixed SWSTK+1/RELOP aliasing bug (v36d fix).
@@ -2055,47 +2055,43 @@ JERRDIVZER:
 ; In:  EXPH:EXPL = signed value
 ; Out: decimal digits written to COUT
 ; Clobbers: R0, R1, R3, TMPH, TMPL, NEGFLG, SC0, SC1
+MSG_MIN:
+        db "32768",0
 PRINT_S16:
-        STRA,R3 R3SAVE                   ; save caller R3
-        LODI,R3 $FF                      ; fresh SW stack
-        LODA,R0 EXPH
-        ANDI,R0 $80
-        BCTR,EQ PS_POS
-        LODI,R0 A'-'
-        ZBSR *VCOUT  
-        LODA,R0 EXPH
-        COMI,R0 $80
-        BCTR,EQ PS_CHKMIN
-PS_NEGNORM:
-        BSTA,UN NEG_EXP_BODY
-        BCTR,UN PS_POS
-PS_CHKMIN:
-        LODA,R0 EXPL
-        BCTR,EQ PS_MIN
-        BCTR,UN PS_NEGNORM
-PS_MIN: ; character print to avoid RAS usage
-        LODI,R0 A'3'
-        ZBSR *VCOUT  
-        LODI,R0 A'2'
-        ZBSR *VCOUT  
-        LODI,R0 A'7'
-        ZBSR *VCOUT  
-        LODI,R0 A'6'
-        ZBSR *VCOUT  
-        LODI,R0 A'8'
-        ZBRR *VCOUT 
-PS_POS:
-        LODA,R0 EXPH
-        BCTR,GT PS_NZ
-        BCTR,LT PS_NZ
-        LODA,R0 EXPL
-        BCTR,EQ PS_ZERO
-        BCTR,UN PS_NZ
-PS_ZERO:
-        LODI,R0 A'0'
-        ZBRR *VCOUT 
+        LODA,R1 EXPH            ; get high byte
+        BCTR,LT IS_NEG          ; If negative, jump to handle '-'
+
+        ; Check for ZERO
+        LODA,R0 EXPL            ; get low byte
+        IORZ R1                 ; R0 = EXPL | EXPH
+        BCFR,EQ PS_NZ           ; >0, flow into PS_NZ (Digit Parser)
+
+        LODI,R0 A'0'            ; Handle Zero
+        ZBRR *VCOUT             ; Print '0' and tail call return
+IS_NEG:
+        LODI,R0 A'-'            ; Its negative so print minus but neg what?
+        ZBSR *VCOUT
+        
+        ; Check for -32768
+        LODA,R0 EXPL            ; check if EXPL is zero
+        BCFR,EQ DO_NEG          ; nope its a real neg number
+        COMI,R1 $80             ; from before, check if its exactly 0x80
+        BCFR,EQ DO_NEG          ; nope again real neg number
+        ; otherwise it is the 32768 magic number
+        LODI,R1 0               ; string offset
+MIN_LP:                         ; BDRR no advantage as still need a RETC
+        LODA,R0 MSG_MIN-1,R1+   ; Load char from table
+        RETC,EQ                 ; return on null
+        ZBSR *VCOUT             ; Print
+        BCTR,UN MIN_LP
+
+DO_NEG:
+        BSTA,UN NEG_EXP_BODY    ; Negate and fall into PS_NZ
 PS_NZ:
-        LODI,R0 >PS_DONE
+        STRA,R3 R3SAVE          ; setup SW stack
+        LODI,R3, $FF
+        ; 
+        LODI,R0 >PS_DONE        ; outer return
         STRA,R0 SWBASE,R3+
         LODI,R0 <PS_DONE
         STRA,R0 SWBASE,R3+
@@ -2198,8 +2194,7 @@ SWRETURN:
         BCTA,UN *TEMPRETH
 
 PS_DONE:
-        LODZ,R3
-        LODA,R3 R3SAVE
+        LODA,R3 R3SAVE  ; restore R3
         RETC,UN
 
 ; =============================================================================
