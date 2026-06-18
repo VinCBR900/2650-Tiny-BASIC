@@ -2,6 +2,10 @@
 
 This folder contains an assembler and simulator for Signetics 2650 CPU.
 
+For Claude, run `Bundle.cmd` to generate `bundle.txt` file that you can tell upload along with `unbundle.sh`.  Tell Claude `Do no Parse the bundle.txt file as it wastes tokens, but unbundle with the Shell file`.  Calude should then have a development environment it can build and test autonimously.
+
+CODEX pulls everything from Github but its strengths lie in modern Assembly and 8086 type coding.
+
 The assembler is home built but cross referenced with
 
 https://ztpe.nl/2650/development/as2650-a-2650-assembler/
@@ -44,7 +48,7 @@ Common options:
 --chin 0xADDR   CHIN intercept address (default 0x0286)
 --cout 0xADDR   COUT intercept address (default 0x02B4)
 --crlf 0xADDR   CRLF intercept address (default 0x008A)
---entry 0xADDR  Program entry address (default 0x0440)
+--entry 0xADDR  Program entry address (default 0x0440, if not used to to 0x7fff to render harmless so it doesnt trigger unwantedly)
 ```
 
 For the Simulator, we (Claude and I) spent a long time trying to build our own, archived in the 'Old' folder in the root.  However we kept running into bugs when cross checking in Winarcadia, a **validated** emulator.
