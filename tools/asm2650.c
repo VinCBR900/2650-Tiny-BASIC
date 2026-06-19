@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.14
+ * Version: 1.15
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -14,10 +14,28 @@
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
  *
+ * Changes v1.14 -> v1.15:
+ *   write_hex() previously walked the full [rom_lo, rom_hi] "tide mark" range
+ *   in fixed 16-byte records, including any never-emitted bytes within that
+ *   span (e.g. the gap between two separately-ORG'd blocks, or RES regions
+ *   that were reserved but never written). Those bytes were emitted as
+ *   whatever rom[] happened to hold (0xFF from the initial memset). Now uses
+ *   rom_emitted[] (added in v1.14) to split output into records that only
+ *   cover genuinely emitted bytes, splitting/starting a new record at any
+ *   gap. Pure output-size improvement; does not affect emitted byte values
+ *   for addresses that were actually written.
+ *
  * Changes v1.13 -> v1.14:
- *   BUG-ORG-01 FIXED: ORG mid code coudl silently overwrite previosuly emitted
- *     code.  Now checks for overwrite on Pass 2.  LST file creation modified
- *     To be generated vene with errors for improved debugging - no HEX on error.   
+ *   BUG-ASM-07 FIXED: ORG moving pc backward over addresses already written
+ *     by emit() in the same pass silently overwrote that code with no
+ *     diagnostic. Added rom_emitted[MAX_ROM], checked/set in emit() during
+ *     pass 2 only; re-emitting an already-emitted address is now reported as
+ *     "ERROR line N: addr $XXXX already emitted (ORG moved backward over
+ *     existing code?)" (one error per clobbered byte). This is an ERROR, not
+ *     a warning, but the .LST sidecar is still written even when errors are
+ *     present (moved ahead of the error-gate in main()) since the listing is
+ *     often the fastest way to see both the original and overlapping code
+ *     side by side; only the .hex/binary output is withheld on error.
  *
  * Changes v1.12 -> v1.13:
  *   BUG-ASM-06 FIXED: DW with an unresolved forward reference emitted 0 bytes
@@ -86,7 +104,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.14"
+#define ASM2650_VERSION "1.15"
 
 typedef struct { char name[32]; int value; int referenced; } Label;
 static Label labels[MAX_LABELS];
@@ -614,12 +632,16 @@ static void assemble_line(char *line){
 
 static void write_hex(FILE *f){
     if(rom_hi<rom_lo){ fprintf(f,":00000001FF\n"); return; }
-    for(int addr=rom_lo;addr<=rom_hi;){
-        int n=rom_hi-addr+1; if(n>16) n=16;
+    int addr=rom_lo;
+    while(addr<=rom_hi){
+        if(!rom_emitted[addr]){ addr++; continue; }              /* skip un-emitted gap bytes */
+        int n=0;
+        while(n<16 && addr+n<=rom_hi && rom_emitted[addr+n]) n++; /* contiguous emitted run, max 16 */
         unsigned char sum=(unsigned char)(n+(addr>>8)+(addr&0xFF));
         fprintf(f,":%02X%04X00",n,addr);
         for(int i=0;i<n;i++){ fprintf(f,"%02X",rom[addr+i]); sum+=rom[addr+i]; }
-        fprintf(f,"%02X\n",(unsigned char)(-sum)); addr+=n;
+        fprintf(f,"%02X\n",(unsigned char)(-sum));
+        addr+=n;
     }
     fprintf(f,":00000001FF\n");
 }
