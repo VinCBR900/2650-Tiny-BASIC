@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.13
+ * Version: 1.14
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -13,6 +13,11 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * Changes v1.13 -> v1.14:
+ *   BUG-ORG-01 FIXED: ORG mid code coudl silently overwrite previosuly emitted
+ *     code.  Now checks for overwrite on Pass 2.  LST file creation modified
+ *     To be generated vene with errors for improved debugging - no HEX on error.   
  *
  * Changes v1.12 -> v1.13:
  *   BUG-ASM-06 FIXED: DW with an unresolved forward reference emitted 0 bytes
@@ -81,7 +86,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.13"
+#define ASM2650_VERSION "1.14"
 
 typedef struct { char name[32]; int value; int referenced; } Label;
 static Label labels[MAX_LABELS];
@@ -103,6 +108,7 @@ static int list_line_nbytes = 0;
 static unsigned char list_line_bytes[MAX_ROM];
 
 static unsigned char rom[MAX_ROM];
+static unsigned char rom_emitted[MAX_ROM];  /* tracks which addresses pass 2 has written, for ORG-overwrite detection */
 static int rom_lo = MAX_ROM, rom_hi = -1;
 
 static int  pc     = 0;
@@ -145,6 +151,13 @@ static char *skip_ws(char *s){ while(*s==' '||*s=='\t') s++; return s; }
 
 static void emit(int addr, unsigned char b){
     if(addr<0||addr>=MAX_ROM){ if(pass==2){fprintf(stderr,"ERROR line %d: addr $%04X out of range\n",lineno,addr); errors++;} return; }
+    if(pass==2){
+        if(rom_emitted[addr]){
+            fprintf(stderr,"ERROR line %d: addr $%04X already emitted (ORG moved backward over existing code?)\n",lineno,addr);
+            errors++;
+        }
+        rom_emitted[addr]=1;
+    }
     rom[addr]=b;
     if(addr<rom_lo) rom_lo=addr;
     if(addr>rom_hi) rom_hi=addr;
@@ -792,6 +805,7 @@ int main(int argc,char *argv[]){
 
     memset(rom,0xFF,sizeof(rom));
     for(pass=1;pass<=2;pass++){
+        if(pass==2) memset(rom_emitted,0,sizeof(rom_emitted));
         FILE *f=fopen(src_file,"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",src_file);return 1;}
         pc=0; lineno=0; char line[MAX_LINE];
         while(fgets(line,MAX_LINE,f)){
@@ -806,9 +820,13 @@ int main(int argc,char *argv[]){
     }
     fprintf(stderr,"Pass complete: %d error(s), %d label(s)\n",errors,nlabels);
     if(dump_syms){ for(int i=0;i<nlabels;i++) fprintf(stderr,"  %-20s $%04X\n",labels[i].name,labels[i].value); }
-    if(errors){ free_listing(); return 1; }
     if(rom_hi>=rom_lo) fprintf(stderr,"Code: $%04X-$%04X (%d bytes)\n",rom_lo,rom_hi,rom_hi-rom_lo+1);
+    /* Write the .LST sidecar even on error -- it's a debugging aid, and an ORG-overwrite
+     * or other error is often easiest to diagnose by reading the listing itself. Only the
+     * hex/binary machine-code output is withheld on error, since writing it out would
+     * present unreliable bytes (overlapping emits, partial assembly) as a finished artifact. */
     if(list_enabled && !write_listing(src_file)){ free_listing(); return 1; }
+    if(errors){ free_listing(); return 1; }
     FILE *out=stdout;
     if(binary_mode){
         if(bin_file){
