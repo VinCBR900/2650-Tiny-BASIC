@@ -1,11 +1,10 @@
-# 2650-Tiny-BASIC - Intended for 2732 EPROM
+# 2650-Tiny-BASIC - Intended for 2732 4kByte EPROM
 
 Signetics 2650 Tiny BASIC - core functionality present
 
 You can play with this Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
 
 This minimal integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below.  
-No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 2 character keyword matching. This costs RAM and speed but keeps the interpreter small. Will fit into a 2732 EPROM (4096 bytes).
 
 If you just want a proper BASIC for your Signetics 2650 system then the vintage [MicroWorld BASIC interpreter](https://binnie.id.au/MicroByte/BASIC%20Manual.pdf) is significantly more capable with floating point and string support. It is scattered around on the internet but I found a version at [https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main](https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main).
 
@@ -13,9 +12,10 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 ## Functionality
 
 **Statements:** `PRINT [TAB(spaces)] [CHR$(expr)] [;]` `IF`/`THEN` `GOTO` [`LET`] `INPUT` `REM` `END` `POKE` `RUN` `LIST` `NEW`   
-(Parser accepts 2-letter prefixes: `PR` `IF` `GO` `LE` `IN` `RE` `EN` `RU` `LI` `NE` .)
 
 **Expressions:** `+` `-` `*` `/` `% (Mod)` `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` variables `A`–`Z`
+
+**Functions:** `RND(val)` `USR(addr)` `PEEK(addr)` `NEG(val)` `ABS(val)`
 
 **Numbers:** signed 16-bit integers, −32768 to 32767
 
@@ -28,12 +28,18 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 | ?2 OV | Division or modulo by zero |
 | ?3 OM | Out of memory |
 | ?4 UK | Bad variable assignment |
+| ?5 RT | `RETURN` without `GOSUB` |
+| ?6 FR | Too many `FOR`s |
+| ?7 FR | `NEXT` without `FOR` |
+| ?8 FR | Nesting too deep |
 
 **Note Multi-statement lines** with `:` separator(e.g. `10 A=1 : B=2 : PRINT A+B`) **Not Supported** Unikley to be be due to Stack limitations as below. 
 
 Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `CTRL-]` aborts running program. 
 
 ##  Notes
+
+No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 3 character keyword matching - you must leave spaces between keyword e.g. `FOR A=1 TO 5` is good, `FORA+1TO5` is not. 
 
 So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
 
