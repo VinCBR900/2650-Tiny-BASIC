@@ -11,7 +11,7 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 ---
 ## Functionality
 
-**Statements:** `PRINT [TAB(spaces)] [CHR$(expr)] [;]` `IF`/`THEN` `GOTO` [`LET`] `INPUT` `REM` `END` `POKE` `RUN` `LIST` `NEW`   
+**Statements:** `PRINT [TAB(spaces)] [CHR$(expr)] [;]` `IF`/`THEN` `GOTO` [`LET`] `INPUT` `REM` `END` `POKE` `RUN` `LIST [start,end]` `NEW`   
 
 **Expressions:** `+` `-` `*` `/` `% (Mod)` `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` variables `A`–`Z`
 
@@ -39,13 +39,13 @@ Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing
 
 ##  Notes
 
-No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 3 character keyword matching - you must leave spaces between keyword e.g. `FOR A=1 TO 5` is good, `FORA+1TO5` is not. 
+No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 3 character keyword matching.  You must leave spaces between keyword e.g. `FOR A=1 TO 5` will work, `FORA+1TO5` will not. 
 
 So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
 
 - 8 level hardware Return Address Stack (RAS). Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
   - One of the tricks for reduced size (sometimes called _Code Golf_) is for any code used twice or more, make it a subroutine.  That's Not possible here due to the small RAS, so we have lots of duplicate inline code.
-  - I'm experimenting with SW stack, but that has about a dozen bytes overhead for each call, so best be worth it.  Interestingly the return address does not have to be the immediate next instruction...   
+  - I have immplemneted a  SW stack, but that has about a dozen bytes overhead for each call.  Interestingly the return address does not have to be the immediate next instruction...   
 - Although it has nice features like auto-increment and decrement, heavy indirection and return on condition code, these are not size optimized
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
 - From a programmers perspective, the instruction set was clearly designed by an engineer and instructions are dense
