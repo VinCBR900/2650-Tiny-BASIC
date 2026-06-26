@@ -11,11 +11,13 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 ---
 ## Functionality
 
-**Statements:** `PRINT [TAB(spaces)] [CHR$(expr)] [;]` `IF`/`THEN` `GOTO` [`LET`] `INPUT` `REM` `END` `POKE` `RUN` `LIST [start,end]` `NEW`   
+**Statements:** 
+  * `END` `GOTO` `IF`/`THEN` `INPUT` [`LET`] `POKE` `PRINT [TAB(spaces)] [CHR$(expr)] [;]` `REM`  
+  * `LIST [start,end]` `NEW` `RUN`   
 
 **Expressions:** `+` `-` `*` `/` `% (Mod)` `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` variables `A`–`Z`
 
-**Functions:** `RND(val)` `USR(addr)` `PEEK(addr)` `NEG(val)` `ABS(val)`
+**Functions:** `ABS(val)` `NEG(val)` `PEEK(addr)` `RND(val)` `USR(addr)`   
 
 **Numbers:** signed 16-bit integers, −32768 to 32767
 
@@ -33,7 +35,7 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 | ?7 FR | `NEXT` without `FOR` |
 | ?8 FR | Nesting too deep |
 
-**Note Multi-statement lines** with `:` separator(e.g. `10 A=1 : B=2 : PRINT A+B`) **Not Supported** Unikley to be be due to Stack limitations as below. 
+**Note Multi-statement lines** with `:` separator(e.g. `10 A=1 : B=2 : PRINT A+B`) **Not Supported** Unlikley to be due to Stack limitations as below. 
 
 Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing `CTRL-]` aborts running program. 
 
