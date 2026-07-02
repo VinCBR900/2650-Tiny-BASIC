@@ -1,5 +1,5 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v4.3
+; Version: v4.5
 ; By Vincent Crabtree, 2026.  MIT License
 ; Date:    2026-06-26
 ;
@@ -52,143 +52,58 @@
 ;   OPT-16:   MUL16/DIV16 uses O(N) loop for size - O(16) bit-serial deferred.
 ;   FOR-01:   NEXT variable not checked against frame var (smallest code, by spec).
 ;   FOR-02:   Body always executes at least once (no skip-if-false-at-entry, by spec).
-;   FUNCATOM-01: FUNC_TAB names (ABS/NEG/AND/OR/XOR/NOT/RND/PEEK/USR) are only
-;       recognized as the LEADING token of a fresh PARSE_EXPR call (right
-;       after a statement keyword or an open paren). EAM_ATOM does not
-;       re-check FUNC_TAB for an atom following an operator, so it falls
-;       through to PARSE_FACTOR and misreads the function name as a bare
-;       variable: "PRINT 10+ABS(A)" silently parses as "10+A" (works fine
-;       as "PRINT ABS(A)+10" - leading position only). Confirmed present in
-;       v4.2 already, not a v4.3 regression. Fix belongs in EAM_ATOM (teach
-;       it to FUNC_TAB-match before falling to PARSE_FACTOR); deferred -
-;       bigger structural change than a golf pass, needs its own RAS/byte
-;       budget review.
+;   FUNCATOM-01: Functions (ABS/NEG/AND/OR/XOR/NOT/RND/PEEK/USR) only recognised
+;       as the LEADING atom of a fresh PARSE_EXPR call. "PRINT ABS(A)+10"
+;       works (FUNCCONT-01 fixed in v4.5, so trailing +10 is now evaluated);
+;       "PRINT 10+ABS(A)" misparses ABS as variable A. A fix was attempted:
+;       re-run the FUNC_TAB scan from EAM_ATOM too, using a RAM flag (FT_CTX)
+;       so PE_NOFUNC could tell a miss here apart from a genuine top-level
+;       PARSE_EXPR miss. The miss/hit SIGNALING worked correctly (confirmed
+;       via simulator -w watchpoint) but the FUNC_TAB scan itself failed to
+;       match known function names when invoked from EAM_ATOM's call context,
+;       despite using the same setup code as the working leading-position case.
+;       Root cause not isolated; reverted. Next debugging step: instrument
+;       MATCH_KW's SE_SCAN compare loop directly to see which comparison
+;       fails and why from EAM_ATOM vs PARSE_EXPR's top.
+;       Workaround: write expressions with functions in leading position.
 ;
-;        CHANGE HISTORY
-;   V4.3  2026-06-25 - 3672 bytes to ROMEND
-;         PAREN-NEST-01 FIXED: EAM_PLUS/EAM_MINUS/EAM_MUL/EAM_DIV/EAM_MOD now
-;         push the left operand onto SWBASE instead of a flat SAVEH/SAVEL or
-;         E1SAVH/E1SAVL cell, so nested same-precedence ops (e.g. "2*(3*4)")
-;         can no longer clobber a pending operand. ADD16_SAVE_EXP pops
-;         SAVEH:SAVEL from SWBASE just before use; new shared POP_SAVE_TO_TMP
-;         does the same for EAM_MUL/DIV/MOD into TMPH:TMPL. E1SAVH/E1SAVL
-;         RAM cells and the EXP16_TO_E1SAV/EXP16_TO_SAVE vectors+chain
-;         entries removed as dead code (net -1 zero-page vector slot vs v4.2).
-;         BUG-RND-01 FIXED: DO_RND_FUNC now shuffles the LFSR 8x per call
-;         (was 1x), fixing correlated draws in tight RND() loops.
-;         RAS_DEPTH / PE_RAS_LIMIT EQUs added; PARSE_EXPR guard literal '5'
-;         replaced with PE_RAS_LIMIT.
-;         IP_TO_TMP helper added (new VIP_TO_TMP vector), consolidating 3
-;         inline IPH:IPL->TMPH:TMPL copies (DLS_NL, STORE_LINE x2).
-;         Added AND(a,b)/OR(a,b)/XOR(a,b)/NOT(a) bitwise functions via
-;         shared PARSE_2ARGS helper and new FUNC_TAB entries.
-;         Showcase (PROG default) rewritten: wider Mandelbrot finale, now
-;         exercises ABS/NEG/PEEK/USR/RND(n)/AND/OR/XOR/NOT/LIST range.
-;   V4.2  2026-06-24 - 3485 bytes to ROMEND
-;         RDLINE rewritten to use R3 as an IBUF offset (pre-increment/$FF-
-;         empty convention, matching SWBASE) instead of full IPH:IPL pointer
-;         chasing for bounds-check and backspace. IPH:IPL no longer valid
-;         during/after RDLINE; both callers already re-set it immediately.
-;         EAM_PLUS/EAM_MINUS WC add/sub tails merged into shared
-;         ADD16_SAVE_EXP; EAM_MINUS now negates EXP via existing
-;         NEG_EXP_BODY and falls into the same add path as EAM_PLUS.
-;         Added LIST [start,end] optional filter.
-;         Replaced replaced with PARSE_S16 for RAS.
+; RECENT CHANGE HISTORY
 ;
-;   V4.1  2026-06-23 - 3581 interpreter bytes
-;         Refactored STMT_EXEC to extract MATCH_KW for general use with no-match vector.
-;         Function table match added to PARSE_EXPR as Highest precidence.
-;         Added ABS, NEG, PEEK, USR, RND(range) functions. Refactor DO_RETURN for size. 
+; V4.5 (2026-06-30) - 3705 bytes
+;   - FIXED: Function parser tracking for trailing operators (e.g., ABS(-5)+10).
+;   - Relocated PEEK/USR/EXPH functions to optimize space post-COUT.
+;   - Integrated emulator SP-reset override fix in pipbug_wrap.c.
 ;
-;   V4.0  2026-06-22 - 3486 ROM bytes
-;         BUG-SL-02: STORE_LINE / SL_SHLOOP lo-byte termination comparison.
-;         SUBA,R0 EXPL sets CC by signed subtraction; when LNUML has bit7 set
-;         and EXPL is small (e.g. LNUML=$FF, EXPL=$04), result $FB is negative
-;         (CC=LT), causing the shift loop to exit up to 131 bytes early.
-;         Implemented DF_PUSH loop-based frame write after VARS reorg.
-;         Added POKE addr,val, refactor STMT_EXEC for size.
-; 
-;   V3.9  2026-06-16 
-;         BUG-SL-01 (complete fix): STORE_LINE / SL_SHLOOP GOTOH carry detection.
-;         v3.7b attempted SUBA,R0 PEL to detect carry after ADDA,R0 SC1, but
-;         two problems remained: (1) LODA,R0 PEH between SUBA and BCFR,LT
-;         clobbered CC; (2) even without the LODA, SUBA,R0 PEL gives wrong
-;         result when carry has occurred -- (PEL+SC1)_lo - PEL = SC1 (positive,
-;         CC=GT) even though carry fired, because the wrapped sum minus the
-;         addend gives SC1 not a negative value.
-;         Correct test: SUBA,R0 SC1 after STRA,R0 GOTOL. sum_lo - SC1 = PEL
-;         (positive/zero, no carry) or negative/LT (sum wrapped below SC1,
-;         carry occurred). Branch BCFR,LT to no-carry path before any LODA.
-;         Verified by trace: GOTOH correctly set to PEH+1 for PEL=$F8, SC1=$13.
-;         TSL inline EXP->LNUM: TRY_STORE_LINE had one inline EXPH:EXPL->LNUMH:LNUML
-;         copy not converted to EXP16_TO_LNUM helper. Now uses BSTA,UN EXP16_TO_LNUM.
+; V4.4 (2026-06-30) - 3636 bytes
+;   - FIXED: RND 16-bit seed rotation bug by correctly setting PSL WC bit.
+;   - FIXED: Subtraction left-operand dropping bug in EAM_MH_RET.
+;   - Unified 2-argument parsing for AND/OR/XOR/POKE/LIST to save ~25 bytes.
+;   - Deduplicated bare assignments (LET-less statements).
 ;
-;   V3.7b 2026-06-15  3543 rom bytes
-;         BUG-DEC-01: DEC_ET borrow detection used BCFR,LT (sign test)
-;         not carry. Any lo-byte in $80-$FF range sets CC=LT after SUBI,R0 1
-;         even without borrow, causing spurious hi-byte decrement.
-;         Fix: TPSL $01 / BCTR,EQ ET_RET (C=1=no borrow -> CC=EQ -> skip hi--).
-;         Root cause: latent since v3.6c; exposed when PROG moved from $1703
-;         to $10E0, putting lo-bytes in $E0+ range on first decrement.
-;         BUG-DL-01: DELETE_LINE / DL2_LP early exit.
-;         TPSL $01 / BCTR,EQ DL2_DONE exited when TMPL > PEL
-;         (TPSL maps GT->EQ same as EQ, causing early loop exit).
-;         Fix: BCFR,LT DL2_DONE (branch if TMPL >= PEL, i.e. no borrow).
-;         BUG-SL-01 (partial): STORE_LINE / SL_SHLOOP GOTOH carry detection.
-;         STRA,R0 GOTOL between ADDA,R0 SC1 and TPSL $01 described as clobbering
-;         carry; fix attempted via SUBA,R0 PEL but LODA,R0 PEH before branch
-;         still clobbered CC. See V3.9 for complete fix.
+; V4.3 (2026-06-25) - 3672 bytes
+;   - FIXED: Nested operator precedence clobbering bug using SWBASE stack.
+;   - Added bitwise functions: AND(a,b), OR(a,b), XOR(a,b), NOT(a).
+;   - Rewrote default showcase program with an expanded Mandelbrot finale.
 ;
-;   V3.7  2026-06-14  Interpreter: 3567 bytes
-;         Page-zero vector table + Zxxx size optimisation. 
-;         DO_NEW memory clear. Refactor PRINT_S16 intro for size.
-;         SWSTK RES 1->2: fixed SWSTK+1/RELOP aliasing bug (v36d fix).
+; V4.2 (2026-06-24) - 3485 bytes
+;   - Rewrote RDLINE using R3 as an IBUF offset optimization.
+;   - Merged sign-handling and addition paths into shared ADD16_SAVE_EXP.
+;   - Added optional line-range filtering to LIST [start,end].
 ;
-;   V3.6G 2026-06-12  Interpreter: 3700 bytes
-;         Code ORG now 0x0, added CHIN/COUT routines from Pipbug M20 App note,
-;           hand-optimized placement to $286/$2B4 for PIPBUG 1 compatibility.
-;         Refactor DO_ERROR to use DO_END.  Refactor DO_FOR for size.
-;         Helpers: FI_ADV, SETUP_MULDIV, PARSE_VAR_SAVE.
-;         VARS moved to $1000+, RAMTOP $1FFF.
+; V4.0 - V4.1 (2026-06)
+;   - Implemented function evaluation table (ABS, NEG, PEEK, USR, RND).
+;   - FIXED: Signed subtraction boundary bug in line storage shift logic.
+;   - Added POKE statement support.
 ;
-;   V3.6c  2026-06-10  - 3748 Interpreter bytes
-;         Helpers - SET_IP_IBUF, EXP16_TO_GOTO, EXP16_TO_LNUM, ERRFLG eliminated.
-;         DEC_ET family: mirrors INC_ET, Refactor DL2_SCAN to use 2x INC_TMP.
-;         FREE memory keyword added.
+; V3.0 - V3.9 (2026-06)
+;   - Implemented recursive descent expression parser via software stack.
+;   - Added full FOR/NEXT (4-level stack) and GOSUB/RETURN (8-level stack).
+;   - Fixed critical memory layout aliasing and carry detection bugs.
 ;
-;   V3.5  2026-06-09  Merged v3.3+v3.4 FOR/NEXT into v3.2 optimised baseline.
-;         DO_FOR:  v3.3 parse GETCI_UC for '=', LNUMH/LNUML for limit,
-;         DO_NEXT: v3.4 VARS access (direct VARS,R1 indexed -- VARS_FP dropped).
-;         DO_RETURN: v3.3 GOTOFLG=$03 (direct NLP). v3.4 regressed to $01.
-;         DR_EXEC:   v3.3 three-way GOTOFLG dispatch (inline COMI $03).
-;         STORE_LINE: v3.4 BUG-LE fix (BCTR,LT SL_NOSHIFT both paths).
-;         PARSE_EXPR: v3.3 body + v3.2 + RAS guard .
+; V2.3 - V2.8 (2026-05)
+;   - Initial optimization baseline with TAB(), CHR$(), and Mandelbrot demo.
 ;
-;   V3.4  2026-06-09  FOR/NEXT variant 2 (v3.3 parallel branch).
-;         BUG-SE-01, BUG-DN-01..04, BUG-LE fixes.
-;         DF_PUSH R1-indexed frame write (smaller than INC_TMP chain).
-;         DO_NEXT VARS,R1 indexed (drops VARS_FP subroutine).
-;
-;   V3.3  2026-06-07  FOR/NEXT and GOSUB/RETURN complete. ROMEND=$13AC.
-;         FORBASE=$1670: 4-level FOR stack, 7 bytes/frame.
-;         FOR_FP inlined into DO_NEXT (OPT-FP1).
-;         GOTOFLG=$03 = DR_FORNLP direct address branch.
-;         BUG-RET-01 fixed (GOTOFLG=$03 for RETURN).
-;
-;   V3.2  2026-06-04  GOSUB/RETURN added.  ROMEND=$0D5E (2590 interp bytes)
-;         KW_TAB 3-char matching [c1][c2][c3][hi][lo], stride 5.
-;         GSBASE=$1660 8-frame GOSUB stack. SWSP=$162D.
-;
-;   V3.1  2026-06-04  ROMEND=$0CF2 (2482 interp bytes)
-;         Fix: PARSE_U16 multiply-by-10 clobbered R3 (SW stack ptr).
-;
-;   V3.0  2026-06-04  SW-stack recursive descent PARSE_EXPR.
-;   V2.8  2026-05-30  3576 total bytes. Code size refactor.
-;   V2.7  2026-05-29  TAB() in PRINT. OPT-15 sign-handling subroutines.
-;   V2.6  2026-05-23  CHR$(). Bug fixes. OPT-2..10.
-;   V2.5  2026-05-22  BUG-FL-02, BUG-CHR-01.
-;   V2.4  2026-05-19  Showcase + Mandelbrot appended.
-;   V2.3  BUG-FL-01/RAS-01/MAND-01/FI-01/DIV-ZCHK-01 fixed.
+; =============================================================================
 
 ;  ASCII Defines
 CR      EQU     $0D
@@ -292,6 +207,14 @@ VSET_TMP_PROG:
         DW SET_TMP_PROG
 VIP_TO_TMP:
         DW IP_TO_TMP            ; 3 sites (v4.3 TMP-copy consolidation)
+VCHECK_LPAREN:
+        DW CHECK_LPAREN          ; 7 sites (v4.5 FUNCCONT-01: ABS/NEG/NOT/
+                                  ; PEEK/USR/RND + PARSE_2ARGS golf-down)
+VCHECK_RPAREN:
+        DW CHECK_RPAREN          ; 6 sites (ABS/NEG/NOT/PEEK/USR/RND)
+VFUNC_CONT:
+        DW FUNC_CONT             ; 5 sites (ABS/NEG/RND + P2A_RET shared by
+                                  ; AND/OR/XOR/NOT + EXPH_Z shared by PEEK/USR)
 MAIN:
         ; Pre-load SHOWCASE_END as program so RUN executes the showcase.
         ; Delete for ROM 
@@ -330,7 +253,9 @@ CLRV:
 ; Out: loops forever
 ; Clobbers: all
 REPL:
-        CPSL PSW_RS + 7             ; ensure primary reg bank, Clear stack so SP=0
+        CPSL PSW_RS + 7             ; primary reg bank; clear PSL CC/flag bits
+        CPSU $07                    ; clear PSU SP field (bits 2:0 = HW RAS depth)
+                                     ; MUST be separate from CPSL: SP is in PSU not PSL
         LODI,R0 '>'                    ; print prompt only used here
         ZBSR *VCOUT  
         ZBSR *VPRT_SPACE  
@@ -411,25 +336,23 @@ SE_FAIL_3:
         ZBSR *VINC_TMP                    ; 
         BCTA,UN SE_SCAN                   ; Loop back
 
-KWSYNERR:
-        ZBRR *VJSYNERR 
 SE_NOTKW:
-        ; Keyword table exhausted. Check for bare variable assignment:
-        ;   SC0 = first char (A-Z), SC1 = second char ('=').
-        ; If SC0 is A-Z and SC1 is '=': jump straight to DL_EX.
-        LODA,R0 SC0
-        COMI,R0 A'A'
-        BCTR,LT KWSYNERR ; - surrogate for JSYNERR
-        COMI,R0 A'Z'+1
-        BCTR,GT KWSYNERR ; surrogate for JSYNERR
-        LODA,R0 SC1
+        ; Keyword table exhausted. Check for bare variable assignment
+        ; ("X=expr" with no LET). MATCH_KW's two GETCI_UC calls already
+        ; consumed SC0 (letter) and SC1 ('=') from the buffer, so rewind IP
+        ; by 2 and fully delegate the letter-validate-and-store step to
+        ; PARSE_VAR_SAVE (v4.4.3: was a duplicated inline A-Z range check -
+        ; one source of truth now, and net smaller: 22 bytes here + 0 for
+        ; the now-dead KWSYNERR trampoline, vs 25+2 before).
+        ZBSR *VDEC_IP
+        ZBSR *VDEC_IP
+        BSTA,UN PARSE_VAR_SAVE            ; validates A-Z, SC0/R2 = letter, IP -> past it
+        ZBSR *VWSKIP
+        LODA,R0 *IPH
         COMI,R0 A'='
-        BCFR,EQ KWSYNERR ; surrogate for JSYNERR
-
-; Bare assignment no LET
-        LODA,R0 SC0
-        STRZ,R2                          ; save letter in R2 (survives PARSE_EXPR)
-        BCTA,UN DL_EX                    ; IP already past '=', expression follows
+        BCFA,EQ JSYNERR
+        ZBSR *VINC_IP
+        BCTA,UN DL_EX                    ; expression follows
 
 ; =============================================================================
 ;  DO_NEW -- Clear program store
@@ -729,21 +652,10 @@ DRT_GO:
         RETC,UN                 ; Return                                [1B]
 
 ; =============================================================================
-DO_PEEK_FUNC:
-        ZBSR *VPARSE_EXPR
-        LODA,R0 *EXPH
-        BCTR,UN EXPH_Z                   ; clear top byte
-
-; =============================================================================
-; Calling function retval in R0
-DO_USR_FUNC:
-        ZBSR *VPARSE_EXPR
-        BSTA,UN *EXPH   
-EXPH_Z:        
-        STRA,R0 EXPL
-        EORZ,R0          ; clear top byte
-        STRA,R0 EXPH
-        RETC,UN
+; (DO_PEEK_FUNC/DO_USR_FUNC relocated post-COUT in v4.5, alongside
+;  DO_RND_FUNC - see that routine's header for why this constrained
+;  pre-CHIN zone is the wrong place for functions needing more bytes for
+;  the FUNCCONT-01 paren-bounding fix.)
 
 ; =============================================================================
 ;  SET_TMP_PROG -- Set TMPH:TMPL = PROG base address
@@ -823,19 +735,31 @@ ONE:
 ; RND_SHUFFLE  Advance 16-bit Galois LFSR (Little-Endian)
 ; =============================================================================
 RND_SHUFFLE:
-        LODA,R0 RNDSEED         ; Load seed high byte (0xAC)    
-        LODA,R1 RNDSEED+1       ; Load seed low byte  (0xE1)    
-        CPSL    1               ; Clear Carry for logical shift 
-        RRR,R0                  ; Shift high byte right         
-        RRR,R1                  ; Shift low byte right          
-        TPSL    1               ; Test Carry bit (PSL bit 0)    
-        BCTR,EQ RND_SKIP        ; If Carry clear, skip XOR taps 
-        EORI,R0 $AC             ; XOR high byte with 0xA0       
-        EORI,R1 $E1             ; XOR low byte with 0x01        
+        ; 16-bit Galois LFSR. R0=high byte, R1=low byte.
+        ; CRITICAL: WC (PSL bit 3) must be SET for RRR to chain carry between
+        ; registers. Without it, RRR is a per-register circular rotation (bit0
+        ; wraps into bit7 of the SAME register) - the 16-bit shift breaks.
+        ; Confirmed via -w watchpoint: seed cycled back to start after 8 steps.
+        ; Sequence: shift R0 right (bit0 -> Carry), then R1 right (Carry ->
+        ; bit7 of R1, R1's bit0 -> Carry as the feedback bit). TPSL 1 captures
+        ; that feedback: CC=EQ if C=1 (apply XOR), CC=LT if C=0 (skip).
+        ; Taps 0xB400 = x^16+x^14+x^13+x^11+1, standard maximal-length
+        ; polynomial (period 65535).
+        LODA,R0 RNDSEED         ; Load seed high byte
+        LODA,R1 RNDSEED+1       ; Load seed low byte
+        CPSL    1               ; Clear Carry (C=0 shifts into bit7 of R0)
+        PPSL    PSW_WC          ; Enable WC: RRR now chains carry between regs
+        RRR,R0                  ; Shift R0 right: bit0 of R0 -> Carry; 0 -> bit7
+        RRR,R1                  ; Shift R1 right: Carry (bit0 of R0) -> bit7 of R1
+                                 ;                 bit0 of R1 -> Carry (feedback)
+        CPSL    PSW_WC          ; Disable WC (restore normal mode)
+        TPSL    1               ; Test Carry: CC=EQ if C=1, CC=LT if C=0
+        BCTR,LT RND_SKIP        ; C=0 (CC=LT): feedback bit was 0, skip XOR
+        EORI,R0 $B4             ; Apply taps high byte (0xB400)
 RND_SKIP:
-        STRA,R0 RNDSEED+1      ; Save seed Hi  byte           
-        STRA,R1 RNDSEED        ; Save seed Lo byte            
-        RETC,UN                ; Return     
+        STRA,R0 RNDSEED        ; Save seed high byte
+        STRA,R1 RNDSEED+1      ; Save seed low byte
+        RETC,UN
 
 ; =============================================================================
 ; DO_RND_FUNC  RND(n) -> pseudo-random value in [0,n)
@@ -853,7 +777,9 @@ RND_SKIP:
 ; header note on register lifetimes) - 6 bytes vs the unroll's 16.
 ; =============================================================================
 DO_RND_FUNC:
+        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR       ; get range in EXP 
+        ZBSR *VCHECK_RPAREN
         LODI,R2 8               ; shuffle a full byte's worth of taps
 RNDF_MIX:
         ZBSR *VRND_SHUFFLE
@@ -863,7 +789,34 @@ RNDF_MIX:
         LODA,R0 RNDSEED+1       ; 
         STRA,R0 TMPL
         BSTA,UN DIV16          ; Divivide
-        ZBRR *VTMP_TO_EXP16            ; Get remainder
+        ZBSR *VTMP_TO_EXP16    ; Get remainder (v4.5: real call now, was
+                                 ; tail-call - need control back for FUNC_CONT)
+        ZBRR *VFUNC_CONT
+
+; =============================================================================
+;  DO_PEEK_FUNC / DO_USR_FUNC -- relocated here in v4.5 (see header note at
+;  their old pre-CHIN location): both paren-bounded now (CHECK_LPAREN/
+;  CHECK_RPAREN) and resume via FUNC_CONT (shared EXPH_Z tail), part of the
+;  FUNCCONT-01 fix.
+DO_PEEK_FUNC:
+        ZBSR *VCHECK_LPAREN
+        ZBSR *VPARSE_EXPR
+        ZBSR *VCHECK_RPAREN
+        LODA,R0 *EXPH
+        BCTR,UN EXPH_Z                   ; clear top byte
+
+; =============================================================================
+; Calling function retval in R0
+DO_USR_FUNC:
+        ZBSR *VCHECK_LPAREN
+        ZBSR *VPARSE_EXPR
+        ZBSR *VCHECK_RPAREN
+        BSTA,UN *EXPH   
+EXPH_Z:        
+        STRA,R0 EXPL
+        EORZ,R0          ; clear top byte
+        STRA,R0 EXPH
+        ZBRR *VFUNC_CONT
 
 ; =============================================================================
 ; PARSE_VAR_SAVE -- skip whitespace, read+upcase var letter, range-check,
@@ -1590,11 +1543,8 @@ EAM_PLUS:
         ; flat SAVEH:SAVEL. A flat cell gets clobbered by a same-precedence
         ; op at a deeper recursion (e.g. "2*(3*4)"); the SW stack frame can't
         ; be, since it's LIFO and balanced with every push/pop in this loop.
-        LODA,R0 EXPL
-        STRA,R0 SWBASE,R3+               ; push left lo
-        LODA,R0 EXPH
-        STRA,R0 SWBASE,R3+               ; push left hi
-        ZBSR *VINC_IP  
+        ; v4.4.3: PUSH_EXP shared with EAM_MINUS/MUL/DIV/MOD below.
+        BSTR,UN PUSH_EXP
         LODI,R0 >EAM_P_RET
         STRA,R0 SWBASE,R3+
         LODI,R0 <EAM_P_RET
@@ -1609,11 +1559,7 @@ EAM_P_RET:
 ;EAM_PH_RET:
 ;        BCTR,UN ADD16_SAVE_EXP            ; EXP = SAVE + EXP (V4.2: shared)
 EAM_MINUS:
-        LODA,R0 EXPL
-        STRA,R0 SWBASE,R3+               ; push left lo
-        LODA,R0 EXPH
-        STRA,R0 SWBASE,R3+               ; push left hi
-        ZBSR *VINC_IP  
+        BSTR,UN PUSH_EXP
         LODI,R0 >EAM_M_RET
         STRA,R0 SWBASE,R3+
         LODI,R0 <EAM_M_RET
@@ -1627,8 +1573,33 @@ EAM_M_RET:
         ZBRR *VEAM_HI 
 EAM_MH_RET:
         BSTA,UN NEG_EXP_BODY              ; EXP = -EXP (V4.2: shared, was SUBA)
-;        BCTR,UN ADD16_SAVE_EXP            ; EXP = SAVE + (-EXP) = SAVE - EXP
-        ; drop through
+        BCTR,UN ADD16_SAVE_EXP            ; EXP = SAVE + (-EXP) = SAVE - EXP
+        ; v4.4.3 BUG-PUSHEXP-01 fix: this MUST be an explicit jump, not a
+        ; comment-only "drop through" - PUSH_EXP's body now sits physically
+        ; between here and ADD16_SAVE_EXP (see below), so falling through
+        ; would run PUSH_EXP's code (spurious SWBASE push + stray INC_IP)
+        ; instead of the actual add. Confirmed via simulator: "10-3" gave
+        ; -3 (the negated RHS alone, LHS never added) before this fix.
+; =============================================================================
+;  PUSH_EXP -- push EXPH:EXPL onto SWBASE (lo,hi) and consume the operator
+;  char at IP (v4.4.3). Shared by EAM_PLUS/EAM_MINUS/EAM_MUL/EAM_DIV/EAM_MOD,
+;  replacing 5 copies of the same 5-instruction block. INC_IP is tail-called
+;  (ZBRR, not ZBSR) so it doesn't cost PUSH_EXP its own extra RAS frame; and
+;  PUSH_EXP itself fully resolves and returns *before* its caller's
+;  recursive ZBRR *VEAM_ATOM, so - like the INC_IP calls already at every
+;  one of these sites - it doesn't accumulate hardware RAS depth across
+;  expression nesting levels (verified empirically: 14 levels of "(((1+1)
+;  +1)...)" nesting still runs clean after this change).
+; In:  EXPH:EXPL = operand to push; IP -> the operator char ('+','-','*', etc)
+; Out: SWBASE top = pushed EXPH:EXPL (lo,hi); IP advanced past the operator
+; Clobbers: R0, R3
+PUSH_EXP:
+        LODA,R0 EXPL
+        STRA,R0 SWBASE,R3+
+        LODA,R0 EXPH
+        STRA,R0 SWBASE,R3+
+        ZBRR *VINC_IP
+
 ; =============================================================================
 ;  ADD16_SAVE_EXP -- EXP = SAVE + EXP (16-bit, WC carry chain); resumes EAM loop
 ;  Shared tail for EAM_PLUS and EAM_MINUS (V4.2). EAM_MINUS negates EXP first.
@@ -1663,30 +1634,22 @@ EAM_HI:
         COMI,R0 A'/'
         BCTR,EQ EAM_DIV
         COMI,R0 A'%'
-        BCTA,EQ EAM_MOD
+        BCTR,EQ EAM_MOD
         BCTA,UN PARSER_RET
 EAM_MUL:
         ; PAREN-NEST-01 fix (v4.3): push, not flat E1SAVH:E1SAVL (see EAM_PLUS)
-        LODA,R0 EXPL
-        STRA,R0 SWBASE,R3+
-        LODA,R0 EXPH
-        STRA,R0 SWBASE,R3+
-        ZBSR *VINC_IP  
+        BSTA,UN PUSH_EXP
         LODI,R0 >MU_AT_RET
         STRA,R0 SWBASE,R3+
         LODI,R0 <MU_AT_RET
         STRA,R0 SWBASE,R3+
         ZBRR *VEAM_ATOM 
 MU_AT_RET:
-        BSTA,UN POP_SAVE_TO_TMP           ; TMPH:TMPL = popped left operand
+        BSTR,UN POP_SAVE_TO_TMP           ; TMPH:TMPL = popped left operand
         BSTA,UN MUL16
         ZBRR *VEAM_HI 
 EAM_DIV:
-        LODA,R0 EXPL
-        STRA,R0 SWBASE,R3+
-        LODA,R0 EXPH
-        STRA,R0 SWBASE,R3+
-        ZBSR *VINC_IP  
+        BSTA,UN PUSH_EXP
         LODI,R0 >DV_AT_RET
         STRA,R0 SWBASE,R3+
         LODI,R0 <DV_AT_RET
@@ -1697,11 +1660,7 @@ DV_AT_RET:
         BSTA,UN DIV16
         ZBRR *VEAM_HI 
 EAM_MOD:
-        LODA,R0 EXPL
-        STRA,R0 SWBASE,R3+
-        LODA,R0 EXPH
-        STRA,R0 SWBASE,R3+
-        ZBSR *VINC_IP  
+        BSTA,UN PUSH_EXP
         LODI,R0 >MD_AT_RET
         STRA,R0 SWBASE,R3+
         LODI,R0 <MD_AT_RET
@@ -1735,7 +1694,14 @@ EAM_ATOM:
         BCTR,EQ EAM_POS
         COMI,R0 A'('
         BCTR,EQ EAM_PAREN
-        BSTR,UN PARSE_FACTOR
+        ; FUNCATOM-01: functions not recognised as non-leading atoms.
+        ; "PRINT ABS(A)+10" works; "PRINT 10+ABS(A)" misparses ABS as
+        ; variable A. An EAM_ATOM FUNC_TAB scan was attempted (v4.4.4/5):
+        ; the miss/hit signaling back to PE_NOFUNC worked correctly, but
+        ; the scan itself then failed to match a known function name in
+        ; this call context for reasons not isolated. Deferred - see
+        ; FUNCATOM-01 in KNOWN OPEN ITEMS for the full diagnosis.
+        BSTA,UN PARSE_FACTOR
         BCTR,UN PARSER_RET
 EAM_NEG:
         ZBSR *VINC_IP  
@@ -1778,6 +1744,56 @@ PARSER_RET:
         EORI,R0 $FF                      ; $FF -> $00 (EQ): use RAS
         RETC,EQ
         BCTA,UN SWRETURN
+
+; =============================================================================
+;  CHECK_LPAREN -- require and consume '(' at IP (v4.5, FUNCCONT-01 fix)
+; Out: IP advanced past '('; tail-jumps to JSYNERR (no return) if missing
+; Clobbers: R0
+CHECK_LPAREN:
+        ZBSR *VWSKIP
+        LODA,R0 *IPH
+        COMI,R0 A'('
+        BCFA,EQ JSYNERR
+        ZBRR *VINC_IP            ; tail call: consumes '(' and returns to caller
+
+; =============================================================================
+;  CHECK_RPAREN -- require and consume ')' at IP (v4.5, FUNCCONT-01 fix)
+; Out: IP advanced past ')'; tail-jumps to JSYNERR (no return) if missing
+; Clobbers: R0
+CHECK_RPAREN:
+        ZBSR *VWSKIP
+        LODA,R0 *IPH
+        COMI,R0 A')'
+        BCFA,EQ JSYNERR
+        ZBRR *VINC_IP            ; tail call: consumes ')' and returns to caller
+
+; =============================================================================
+;  FUNC_CONT -- resume normal */,%/+,- continuation after a function call's
+;  result is computed (v4.5, FUNCCONT-01 fix). Reuses the SAME machinery
+;  every ordinary atom (number/variable/paren-group) already uses for its
+;  own trailing-operator continuation (EAM0_RET/EAM_HI/EAM_LO_LOOP) - no new
+;  continuation logic, just resuming at the right entry point with EXP
+;  already holding the "atom" value.
+; In:  EXPH:EXPL = function's result; IP -> char immediately following the
+;      function's own closing ')'
+; Out: EXPH:EXPL = result combined with any trailing */,%/+,- operators;
+;      eventually returns via PARSER_RET's RAS-based RETC,EQ to whichever
+;      caller's ZBSR/BSTA got us into the ORIGINAL PARSE_EXPR call that
+;      dispatched to this function (the dispatch itself never opened a
+;      fresh RAS frame - see PARSE_2ARGS's register-lifetime note above)
+; Clobbers: R0, R3, and whatever EAM_HI/EAM_LO_LOOP/PUSH_EXP clobber for any
+;           trailing operator's right-hand side
+; ALWAYS entered via a JUMP (ZBRR *VFUNC_CONT or BCTA,UN), never a call -
+; there is no "return point within FUNC_CONT" to come back to.
+; CAUTION for a future FUNCATOM-01 fix: the LODI,R3 $FF below assumes this
+; is ALWAYS reached via the "fresh top-level PARSE_EXPR dispatch" path (the
+; only way a FUNC_TAB handler is reached today). If FUNCATOM-01 is ever
+; fixed by making functions a proper EAM_ATOM atom type (reachable from
+; mid-expression too, with a real pending R3 context), this reset would
+; need reworking - it would silently discard a live outer SW-stack frame.
+FUNC_CONT:
+        LODI,R3 $FF
+        BCTA,UN EAM0_RET
 
 ; =============================================================================
 ;  PARSE_FACTOR -- Parse a single value (variable or literal)
@@ -1945,9 +1961,14 @@ NEG_EXP_BODY:
         BCTR,UN NEG_SHARED
 
 ; =============================================================================
+;  DO_NEG_FUNC -- NEG(a), arithmetic negation (v4.5: paren-bounded, see
+;  CHECK_LPAREN/CHECK_RPAREN/FUNC_CONT for the FUNCCONT-01 fix)
 DO_NEG_FUNC:
+        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
-        BCTR,UN NEG_EXP_BODY
+        ZBSR *VCHECK_RPAREN
+        BSTR,UN NEG_EXP_BODY              ; real call now (was tail-jump) so
+        ZBRR *VFUNC_CONT                  ; control returns here for FUNC_CONT
 
 ; =============================================================================
 ;  ABS_TMP -- Absolute value of TMPH:TMPL; set NEGFLG=1 if was negative
@@ -1979,9 +2000,14 @@ NEG_SHARED:
         BCTA,UN INC_ET                   ; tail call: adds 1 (INC_ET uses alt bank R1)
 
 ; =============================================================================
+;  DO_ABS_FUNC -- ABS(a), absolute value (v4.5: paren-bounded, see
+;  CHECK_LPAREN/CHECK_RPAREN/FUNC_CONT for the FUNCCONT-01 fix)
 DO_ABS_FUNC:
+        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
-        ; drop through
+        ZBSR *VCHECK_RPAREN
+        BSTR,UN ABS_EXP                    ; real call now (was fall-through)
+        ZBRR *VFUNC_CONT                   ; control returns here for FUNC_CONT
 
 ; =============================================================================
 ;  ABS_EXP -- Absolute value of EXPH:EXPL; toggle NEGFLG if was negative
@@ -2066,14 +2092,11 @@ DLS_ARG:
 ;  FUNC_TAB's dispatch out of PARSE_EXPR (MATCH_KW tail-jumps to the
 ;  handler, which RETC,UN's straight back to whatever called PARSE_EXPR -
 ;  it never passes through PARSER_RET's R3-based SW-stack logic). Nothing
-;  downstream depends on R1/R2/R3 surviving a function call. Note this
-;  also means FUNC_TAB names are only recognized as the LEADING token of a
-;  fresh PARSE_EXPR call (right after a statement keyword, or right after
-;  a paren) - EAM_ATOM does not re-check FUNC_TAB for atoms after an
-;  operator, so e.g. "PRINT 1+ABS(-5)" misparses ABS as the bare variable
-;  A (giving 1+A, not 1+5). This is a pre-existing limitation (confirmed
-;  present in v4.2 too, not a v4.3 regression) - see FUNCATOM-01 in the
-;  KNOWN OPEN ITEMS at the top of this file.
+;  downstream depends on R1/R2/R3 surviving a function call. (This is also
+;  why FUNCATOM-01 - functions only matching as the LEADING atom, see
+;  KNOWN OPEN ITEMS - remains unfixed rather than a quirk of this dispatch
+;  scheme specifically: a fix would need EAM_ATOM to run this exact same
+;  dispatch for non-leading atoms too, which was attempted and reverted.)
 ; FUNCOP = assembly-time literal offset into P2A_ANDOP (see DO_AND_FUNC etc
 ;          and DO_POKE/DO_LIST below) - no runtime multiply needed.
 DO_AND_FUNC:
@@ -2105,11 +2128,10 @@ DO_XOR_FUNC:
 ; Out: per-handler (see P2A_ANDOP/OROP/XOROP/POKEOP/LISTOP below)
 ; Clobbers: R0, R3, SAVEH, SAVEL, NEGFLG, SC0, SC1, TMPH, TMPL, ARGAH, ARGAL
 PARSE_2ARGS:
-        ZBSR *VWSKIP
-        LODA,R0 *IPH
-        COMI,R0 A'('
-        BCFA,EQ JSYNERR                 ; require opening paren
-        ZBSR *VINC_IP
+        ZBSR *VCHECK_LPAREN              ; require+consume '(' (v4.5: was
+                                          ; inline WSKIP/COMI/BCFA/INC_IP,
+                                          ; now shared with the single-arg
+                                          ; functions' FUNCCONT-01 fix)
 P2A_NOPAREN:
         ZBSR *VPARSE_EXPR               ; a -> EXP
         LODA,R0 EXPH                     ; ARGAH:ARGAL = a (NOT TMPH:TMPL -
@@ -2144,7 +2166,9 @@ P2A_OROP:
         IORA,R0 EXPL
 P2A_RET:        
         STRA,R0 EXPL
-        RETC,UN
+        ZBRR *VFUNC_CONT      ; v4.5 FUNCCONT-01 fix: was RETC,UN. Fixes
+                               ; AND/OR/XOR/NOT continuation simultaneously
+                               ; (all 4 share this tail).
 P2A_XOROP:
         EORA,R0 EXPH
         STRA,R0 EXPH
@@ -2157,8 +2181,13 @@ P2A_POKEOP:
         RETC,UN
 ; =============================================================================
 ;  DO_NOT_FUNC -- bitwise NOT(a), one's complement (no Boolean truth tables)
+;  v4.5: paren-bounded (previously had none - same FUNCCONT-01 absorption
+;  bug as ABS/NEG before their fix: "NOT(0)+1" computed NOT(0+1) instead of
+;  NOT(0)+1). Continuation handled by the shared P2A_RET tail below.
 DO_NOT_FUNC:
+        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
+        ZBSR *VCHECK_RPAREN
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
@@ -2746,7 +2775,7 @@ DO_ERROR:
 DE_NL:
         BSTR,UN PRT_CRLF
         BSTA,UN DO_END                   ; [+1] clears SWSP, FORSP, GOTOFLG, RUNFLG
-        BCTA,UN REPL                     ; Resets RAS
+        BCTA,UN REPL                     ; REPL resets RAS (PSU SP bits) on entry
 
 ; =============================================================================
 ; DO_FREE
@@ -2819,7 +2848,7 @@ CLR_EXP:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V4.3", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V4.5", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword dispatch table
 ; Format: [c1][c2][c3][hi][lo]  NUL-terminated on c1, followed by no match handler
@@ -2889,7 +2918,7 @@ SC1     RES 1       ; Scratch byte 1
 PEH     RES 1       ; Program end pointer hi
 PEL     RES 1       ; Program end pointer lo
 SAVEH   RES 1       ; ADD16_SAVE_EXP: popped left operand scratch (hi)
-FUNCOP  RES 1       ; PARSE_2ARGS: AND/OR/XOR op selector (0/1/2); RAM not a
+FUNCOP  RES 1       ; PARSE_2ARGS: AND/OR/XOR op selector
                      ; register since R1 is clobbered inside PARSE_EXPR
 ARGAH   RES 1       ; PARSE_2ARGS: arg 'a' scratch (hi); NOT TMPH - PARSE_EXPR
 ARGAL   RES 1       ; itself clobbers TMPH:TMPL while parsing arg 'b'
@@ -2937,8 +2966,8 @@ VARS    RES 52      ; A-Z variables 2 bytes each
 ;  $22=DQ $3B=semicolon  in-string chars that need escaping.
 ; =============================================================================
 PROG:
-        DB 0,10,"REM uBASIC 2650 - SHOWCASE V4.3",$0D
-        DB 0,20,"PRINT ",$22,"-- uBASIC 2650 V4.3 Showcase --",$22,$0D
+        DB 0,10,"REM uBASIC 2650 - SHOWCASE V4.5",$0D
+        DB 0,20,"PRINT ",$22,"-- uBASIC 2650 V4.5 Showcase --",$22,$0D
         DB 0,30,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,$0D                    ; 30  PRINT "--- PRINT / CHR$ ---"
         DB 0,40,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",$0D             ; 40  PRINT CHR$(65);CHR$(66);CHR$(67)
         DB 0,50,"PRINT ",$22,"--- ARITHMETIC ---",$22,$0D                      ; 50  PRINT "--- ARITHMETIC ---"
