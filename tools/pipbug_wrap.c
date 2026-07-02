@@ -668,7 +668,7 @@ static void print_usage(const char *prog)
  */
 static void print_version(void)
 {
-    fprintf(stderr, "pipbug_wrap v2.1\n");
+    fprintf(stderr, "pipbug_wrap v2.2\n");
 }
 
 /* ── Minimal PIPBUG stubs ─────────────────────────────────────────────────
