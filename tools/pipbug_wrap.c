@@ -1,6 +1,6 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
- * Version: 2.1
- * Date:    2026-06-12
+ * Version: 2.2
+ * Date:    2026-06-30
  *
  * Purpose:
  *   Wraps 2650.c (the WinArcadia CPU core, compiled -DGAMER to strip all UI
@@ -36,6 +36,14 @@
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
+ *   v2.2  2026-06-30  CPSU SP-field intercept: The Sim protects
+ *         PSU bits 2:0 (RAS stack pointer) from software writes; CPSU masks
+ *         against PSU_WRITABLE which excludes 0x07. uBASIC2650
+ *         REPL uses "CPSU $07" to drain orphaned RAS frames after error-path
+ *         JSYNERR BCTA jumps bypass normal RETC unwinding. We honour the
+ *         intent by forcibly clearing PSU SP bits after any CPSU instruction
+ *         whose mask includes SP bits. Avoids ERR_NEST cascade on valid code
+ *         following a syntax error.
  *   v2.1  Added write watchpoints (-w log, -W halt-on-first), multiple -m
  *         dumps (up to 4), enhanced trace showing alternate register bank
  *         (r[4]-r[6]) when PSL RS is active, and decoded PSU flags
@@ -999,11 +1007,23 @@ EMSCRIPTEN_KEEPALIVE int pipbug_run_chunk(int instruction_budget)
 
         oldcycles = cycles_2650;
         opcode = memory[iar];
+        int pw_operand = memory[(iar + 1) & AMSK];   /* needed for CPSU intercept */
         /* Snapshot watched bytes before the instruction */
         for (int wi = 0; wi < pw_wcount; wi++)
             pw_wprev[wi] = memory[pw_waddr[wi] & AMSK];
         one_instruction();
         cpu_emu();
+
+        /* CPSU $xx SP-field intercept (v2.2): the 2650 hardware protects
+         * PSU bits 2:0 (the RAS stack pointer) from software writes — CPSU
+         * masks against PSU_WRITABLE_A/B which intentionally excludes 0x07.
+         * uBASIC2650 REPL uses "CPSU $07" to drain orphaned RAS frames left
+         * by the error handler's BCTA tail-jump, which bypasses normal
+         * RETC unwinding.  We honour the intent here rather than the
+         * hardware restriction: if a CPSU instruction included any SP bits
+         * in its mask, forcibly clear those bits now. */
+        if (opcode == 0x74 && (pw_operand & PSU_SP))
+            psu &= ~PSU_SP;
         instruction_count++;
         executed++;
 
