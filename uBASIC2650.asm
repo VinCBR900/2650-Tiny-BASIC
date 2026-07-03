@@ -1,7 +1,7 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v4.5
+; Version: v4.6
 ; By Vincent Crabtree, 2026.  MIT License
-; Date:    2026-06-26
+; Date:    2026-07-03
 ;
 ; Target:  Standalone (no PIPBUG ROM). Code ORG 0. I/O routines embedded.
 ;          Single 8192-byte address space (2650 bits 15:13 always 0).
@@ -52,23 +52,16 @@
 ;   OPT-16:   MUL16/DIV16 uses O(N) loop for size - O(16) bit-serial deferred.
 ;   FOR-01:   NEXT variable not checked against frame var (smallest code, by spec).
 ;   FOR-02:   Body always executes at least once (no skip-if-false-at-entry, by spec).
-;   FUNCATOM-01: Functions (ABS/NEG/AND/OR/XOR/NOT/RND/PEEK/USR) only recognised
-;       as the LEADING atom of a fresh PARSE_EXPR call. "PRINT ABS(A)+10"
-;       works (FUNCCONT-01 fixed in v4.5, so trailing +10 is now evaluated);
-;       "PRINT 10+ABS(A)" misparses ABS as variable A. A fix was attempted:
-;       re-run the FUNC_TAB scan from EAM_ATOM too, using a RAM flag (FT_CTX)
-;       so PE_NOFUNC could tell a miss here apart from a genuine top-level
-;       PARSE_EXPR miss. The miss/hit SIGNALING worked correctly (confirmed
-;       via simulator -w watchpoint) but the FUNC_TAB scan itself failed to
-;       match known function names when invoked from EAM_ATOM's call context,
-;       despite using the same setup code as the working leading-position case.
-;       Root cause not isolated; reverted. Next debugging step: instrument
-;       MATCH_KW's SE_SCAN compare loop directly to see which comparison
-;       fails and why from EAM_ATOM vs PARSE_EXPR's top.
-;       Workaround: write expressions with functions in leading position.
+;   REC-01:   Triple-nested atom-dispatch (1+ABS(NEG(AND(...)))) hits
+;     the existing PE_RAS_LIMIT=5 guard (?8 ERR_NEST).
 ;
 ; RECENT CHANGE HISTORY
 ;
+; V4.6 (2026-07-03) - 3879 bytes (ROMEND $0F27)
+;   - FIXED: FUNCATOM-01 - functions now work as non-leading atoms, e.g.
+;     "PRINT 10+ABS(A)" (previously only "PRINT ABS(A)+10" worked).
+;   - Added FT_SP/FT_STK/FT_SAVE_SP/FT_SAVE/FT_N/FT_R2SAVE (72 RAM bytes)
+;     and FUNC_EPILOG; PE_SAFE/EAM_ATOM/PE_NOFUNC/DO_END updated. 
 ; V4.5 (2026-06-30) - 3705 bytes
 ;   - FIXED: Function parser tracking for trailing operators (e.g., ABS(-5)+10).
 ;   - Relocated PEEK/USR/EXPH functions to optimize space post-COUT.
@@ -213,8 +206,10 @@ VCHECK_LPAREN:
 VCHECK_RPAREN:
         DW CHECK_RPAREN          ; 6 sites (ABS/NEG/NOT/PEEK/USR/RND)
 VFUNC_CONT:
-        DW FUNC_CONT             ; 5 sites (ABS/NEG/RND + P2A_RET shared by
+        DW FUNC_EPILOG            ; 5 sites (ABS/NEG/RND + P2A_RET shared by
                                   ; AND/OR/XOR/NOT + EXPH_Z shared by PEEK/USR)
+                                  ; v4.6 FUNCATOM-01: routes to FUNC_CONT
+                                  ; (top-level) or PARSER_RET (mid-expr)
 MAIN:
         ; Pre-load SHOWCASE_END as program so RUN executes the showcase.
         ; Delete for ROM 
@@ -394,6 +389,9 @@ DN_CLR:
 DO_END:
         BSTA,UN DN_POP_EMPTY
         STRA,R0 SWSP                     ; clear GOSUB stack
+        STRA,R0 FT_SP                    ; FUNCATOM-01 (v4.6): clear dispatch-
+                                          ; origin stack (R0 still $FF here)
+        STRA,R0 FT_SAVE_SP               ; ...and its byte-save stack too
         EORZ,R0
         STRA,R0 GOTOFLG
         ZBRR *VCLR_RUNFLG               ; tail call
@@ -1506,6 +1504,22 @@ PARSE_EXPR:
         LODI,R0 ERR_NEST
         ZBRR *VDO_ERROR                  ; abort gracefully
 PE_SAFE:
+        ; FUNCATOM-01 (v4.6): push a $FF "top-level" origin marker onto
+        ; FT_STK before scanning FUNC_TAB. EAM_ATOM's own scan (see below)
+        ; pushes the live R3 instead of $FF; PE_NOFUNC/FUNC_EPILOG pop this
+        ; to learn which completion path a dispatch needs. R3 is provably
+        ; never $FF at the instant EAM_ATOM dispatches (every EAM_ATOM
+        ; caller has already pushed something onto SWBASE first), so $FF
+        ; is a safe, unambiguous top-level sentinel - no separate flag
+        ; byte needed. This correctly nests through recursive PARSE_EXPR
+        ; calls (e.g. a function's own argument, itself containing another
+        ; function call) since FT_STK/FT_SP mirrors true call nesting.
+        LODA,R0 FT_SP
+        ADDI,R0 1
+        STRZ,R1
+        STRA,R1 FT_SP
+        LODI,R0 $FF
+        STRA,R0 FT_STK,R1
         ; Check for functions and tail call them to return.
         ; Setup at statement FUNC_TAB with TMPH:TMPL as pointer
         LODI,R0 <FUNC_TAB
@@ -1514,6 +1528,30 @@ PE_SAFE:
         STRA,R0 TMPL
         BCTA,UN MATCH_KW                ; resumes at PE_NOFUNC if not match
 PE_NOFUNC:
+        ; FUNCATOM-01: pop the origin marker pushed above (by PE_SAFE or
+        ; EAM_ATOM) to learn which miss-handling path applies.
+        LODA,R1 FT_SP
+        LODA,R0 FT_STK,R1
+        SUBI,R1 1
+        STRA,R1 FT_SP
+        COMI,R0 $FF
+        BCTR,EQ PE_NOFUNC_TOP            ; PE_SAFE origin: existing behaviour
+        ; EAM_ATOM origin: not a function name. R3/SWBASE were never
+        ; modified by the scan attempt itself (untouched on a miss), so
+        ; just fall to ordinary atom parsing exactly as EAM_ATOM's pre-fix
+        ; fallthrough did. But EAM_ATOM saved a speculative SWBASE copy
+        ; onto FT_SAVE before it knew hit/miss - discard it here (R0=N)
+        ; so FT_SAVE_SP stays correctly paired for the next dispatch.
+        STRZ,R1                          ; R1 = N
+        LODA,R0 FT_SAVE_SP
+        SUBZ,R1                          ; R0 -= N
+        SUBI,R0 1                        ; R0 -= 1  (drop N+1 bytes total)
+        STRA,R0 FT_SAVE_SP
+        ZBSR *VDEC_IP
+        ZBSR *VDEC_IP
+        BSTA,UN PARSE_FACTOR
+        BCTA,UN PARSER_RET
+PE_NOFUNC_TOP:
         ZBSR *VDEC_IP                   ; backup IP 2 slots from KW Match
         ZBSR *VDEC_IP
         LODI,R3 $FF                     ; SW stack empty sentinel
@@ -1689,20 +1727,76 @@ EAM_ATOM:
         ZBSR *VWSKIP  
         LODA,R0 *IPH
         COMI,R0 A'-'
-        BCTR,EQ EAM_NEG
+        BCTA,EQ EAM_NEG
         COMI,R0 A'+'
-        BCTR,EQ EAM_POS
+        BCTA,EQ EAM_POS
         COMI,R0 A'('
-        BCTR,EQ EAM_PAREN
-        ; FUNCATOM-01: functions not recognised as non-leading atoms.
-        ; "PRINT ABS(A)+10" works; "PRINT 10+ABS(A)" misparses ABS as
-        ; variable A. An EAM_ATOM FUNC_TAB scan was attempted (v4.4.4/5):
-        ; the miss/hit signaling back to PE_NOFUNC worked correctly, but
-        ; the scan itself then failed to match a known function name in
-        ; this call context for reasons not isolated. Deferred - see
-        ; FUNCATOM-01 in KNOWN OPEN ITEMS for the full diagnosis.
-        BSTA,UN PARSE_FACTOR
-        BCTR,UN PARSER_RET
+        BCTA,EQ EAM_PAREN
+        ; FUNCATOM-01 fix (v4.6): also scan FUNC_TAB here so functions are
+        ; recognised as non-leading atoms too (e.g. "10+ABS(A)"). Push the
+        ; live R3 (SWBASE pointer - the pending outer operator context)
+        ; onto FT_STK, then byte-copy the live SWBASE[0..R3] region onto
+        ; FT_SAVE. The copy is required: R3 alone isn't enough to protect
+        ; the outer context, because on a HIT the handler's own argument
+        ; parse (ZBSR *VPARSE_EXPR) resets R3=$FF and regrows SWBASE from
+        ; index 0 upward, physically overwriting the very bytes R3 points
+        ; at. FUNC_EPILOG copies them back. On a MISS, PE_NOFUNC discards
+        ; this save unread (R3/SWBASE were never touched by a plain scan
+        ; attempt) - see PE_NOFUNC. No HW call/RETC used anywhere in this
+        ; block: it's all inline, staying in the SW-stack domain like the
+        ; rest of the expression parser (the HW RAS is scarce - 8 slots,
+        ; 3 already spoken for by the main loop/char IO).
+        ; Clobbers: R0, R1, R2 (saved/restored - reserved for DO_LET et al
+        ; across PARSE_EXPR, see header). R3 is read but never written here.
+        LODA,R0 FT_SP
+        ADDI,R0 1
+        STRZ,R1
+        STRA,R1 FT_SP
+        LODZ,R3
+        STRA,R0 FT_STK,R1                ; FT_STK[level] = R3 (=N)
+        LODZ,R2
+        STRA,R0 FT_R2SAVE                ; stash caller's R2
+        LODA,R0 FT_STK,R1                ; reload N (R0 was clobbered above)
+        STRA,R0 FT_N                      ; stash N (R1 gets repurposed below)
+        STRZ,R3                          ; R3 = N (SWBASE src idx, explicit
+                                          ; SUBI each pass - see note below)
+        ADDI,R0 1
+        STRZ,R1                          ; R1 = N+1 (BDRR loop count ONLY -
+                                          ; confirmed via 2650.c: BDRR,rn
+                                          ; decrements once then loops while
+                                          ; the RESULT IS NONZERO, i.e. an
+                                          ; initial value of V gives exactly
+                                          ; V passes, not V+1 - so R1 must
+                                          ; NOT double as the data index or
+                                          ; the last element (index 0) is
+                                          ; silently dropped. R3/R2 below
+                                          ; are stepped explicitly instead.)
+        LODA,R2 FT_SAVE_SP                ; R2 = FT_SAVE top ($FF=empty)
+EAMS_SAVE_LP:
+        ADDI,R2 1                        ; pre-increment to next free slot
+        LODA,R0 SWBASE,R3                ; R0 = SWBASE[R3]   (R3=N,N-1,...,0)
+        STRA,R0 FT_SAVE,R2               ; FT_SAVE[R2] = R0
+        SUBI,R3 1
+        BDRR,R1 EAMS_SAVE_LP             ; R1--; loop while R1!=0 (N+1 passes)
+        LODZ,R2
+        STRA,R0 FT_SAVE_SP                ; FT_SAVE_SP = R2 (new top=SWBASE[0])
+        LODA,R0 FT_R2SAVE
+        STRZ,R2                          ; restore caller's R2
+        LODA,R0 FT_N                      ; reload N (stashed above - R1 no
+                                          ; longer holds the level index,
+                                          ; it was repurposed as BDRR count)
+        STRZ,R3                          ; restore R3=N (the loop above used
+                                          ; R3 as its working SWBASE index and
+                                          ; left it at -1/$FF - R3 is the LIVE
+                                          ; SWBASE pointer everything past
+                                          ; this point depends on, so it MUST
+                                          ; come back to N here)
+        LODI,R0 <FUNC_TAB
+        STRA,R0 TMPH
+        LODI,R0 >FUNC_TAB
+        STRA,R0 TMPL
+        BCTA,UN MATCH_KW                 ; hit -> handler -> FUNC_EPILOG
+                                          ; miss -> PE_NOFUNC
 EAM_NEG:
         ZBSR *VINC_IP  
         LODI,R0 >NEG_AT_RET
@@ -1768,29 +1862,63 @@ CHECK_RPAREN:
         ZBRR *VINC_IP            ; tail call: consumes ')' and returns to caller
 
 ; =============================================================================
-;  FUNC_CONT -- resume normal */,%/+,- continuation after a function call's
-;  result is computed (v4.5, FUNCCONT-01 fix). Reuses the SAME machinery
-;  every ordinary atom (number/variable/paren-group) already uses for its
-;  own trailing-operator continuation (EAM0_RET/EAM_HI/EAM_LO_LOOP) - no new
-;  continuation logic, just resuming at the right entry point with EXP
-;  already holding the "atom" value.
-; In:  EXPH:EXPL = function's result; IP -> char immediately following the
-;      function's own closing ')'
-; Out: EXPH:EXPL = result combined with any trailing */,%/+,- operators;
-;      eventually returns via PARSER_RET's RAS-based RETC,EQ to whichever
-;      caller's ZBSR/BSTA got us into the ORIGINAL PARSE_EXPR call that
-;      dispatched to this function (the dispatch itself never opened a
-;      fresh RAS frame - see PARSE_2ARGS's register-lifetime note above)
-; Clobbers: R0, R3, and whatever EAM_HI/EAM_LO_LOOP/PUSH_EXP clobber for any
-;           trailing operator's right-hand side
-; ALWAYS entered via a JUMP (ZBRR *VFUNC_CONT or BCTA,UN), never a call -
-; there is no "return point within FUNC_CONT" to come back to.
-; CAUTION for a future FUNCATOM-01 fix: the LODI,R3 $FF below assumes this
-; is ALWAYS reached via the "fresh top-level PARSE_EXPR dispatch" path (the
-; only way a FUNC_TAB handler is reached today). If FUNCATOM-01 is ever
-; fixed by making functions a proper EAM_ATOM atom type (reachable from
-; mid-expression too, with a real pending R3 context), this reset would
-; need reworking - it would silently discard a live outer SW-stack frame.
+;  FUNC_EPILOG -- shared exit for all function handlers (FUNCATOM-01 fix,
+;  v4.6). VFUNC_CONT now points here so none of the 5 ZBRR *VFUNC_CONT call
+;  sites need to change. Pops the origin marker pushed by PE_SAFE/EAM_ATOM
+;  (see their headers) to pick the correct completion:
+;    $FF (PE_SAFE / top-level)  -> FUNC_CONT below (unchanged: R3 reset,
+;                                  resumes EAM0_RET/EAM_HI/EAM_LO_LOOP as a
+;                                  fresh atom - reuses the SAME machinery
+;                                  every ordinary atom already uses for its
+;                                  trailing */,%/+,- continuation)
+;    else (EAM_ATOM / mid-expr) -> byte-restore SWBASE[0..N] from FT_SAVE
+;                                  (the handler's own argument-parse reset
+;                                  R3=$FF and regrew SWBASE from 0, so the
+;                                  pointer alone isn't enough - the data
+;                                  underneath must come back too), restore
+;                                  R3=N, and tail-jump to PARSER_RET -
+;                                  exactly how an ordinary PARSE_FACTOR
+;                                  atom exits EAM_ATOM.
+; In:  EXPH:EXPL = function's result; FT_SP/FT_STK/FT_SAVE_SP/FT_SAVE =
+;      origin stack (top entry belongs to THIS dispatch - see PE_SAFE
+;      header for why this is always true even through nested
+;      function-argument calls)
+; Out: control passes to FUNC_CONT or PARSER_RET
+; Clobbers: R0, R1, R2 (saved/restored), R3
+; No HW call/RETC used - inline, SW-stack domain only (see EAM_ATOM header)
+FUNC_EPILOG:
+        LODA,R1 FT_SP
+        LODA,R0 FT_STK,R1
+        SUBI,R1 1
+        STRA,R1 FT_SP
+        COMI,R0 $FF
+        BCTR,EQ FUNC_CONT
+        STRA,R0 FT_N                      ; stash N (=R3 to restore)
+        LODZ,R2
+        STRA,R0 FT_R2SAVE                 ; stash caller's R2
+        LODA,R0 FT_N
+        ADDI,R0 1
+        STRZ,R1                           ; R1 = N+1 (BDRR loop count ONLY -
+                                           ; see EAM_ATOM's note on BDRR's
+                                           ; confirmed decrement-then-loop-
+                                           ; while-nonzero semantics)
+        EORZ,R0
+        STRZ,R3                           ; R3 = 0 (SWBASE dest idx, explicit
+                                           ; ADDI each pass)
+        LODA,R2 FT_SAVE_SP                 ; R2 = FT_SAVE top (points at SWBASE[0])
+FE_REST_LP:
+        LODA,R0 FT_SAVE,R2                ; R0 = FT_SAVE[R2]  (R2 = top,top-1,...)
+        STRA,R0 SWBASE,R3                 ; SWBASE[R3] = R0   (R3 = 0,1,...,N)
+        ADDI,R3 1
+        SUBI,R2 1
+        BDRR,R1 FE_REST_LP                ; R1--; loop while R1!=0 (N+1 passes)
+        LODZ,R2
+        STRA,R0 FT_SAVE_SP                 ; FT_SAVE_SP = R2 (shrunk by N+1)
+        LODA,R0 FT_R2SAVE
+        STRZ,R2                           ; restore caller's R2
+        LODA,R0 FT_N
+        STRZ,R3                           ; restore outer SW-stack pointer
+        BCTA,UN PARSER_RET
 FUNC_CONT:
         LODI,R3 $FF
         BCTA,UN EAM0_RET
@@ -2848,7 +2976,7 @@ CLR_EXP:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V4.5", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V4.6", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword dispatch table
 ; Format: [c1][c2][c3][hi][lo]  NUL-terminated on c1, followed by no match handler
@@ -2919,7 +3047,22 @@ PEH     RES 1       ; Program end pointer hi
 PEL     RES 1       ; Program end pointer lo
 SAVEH   RES 1       ; ADD16_SAVE_EXP: popped left operand scratch (hi)
 FUNCOP  RES 1       ; PARSE_2ARGS: AND/OR/XOR op selector
-                     ; register since R1 is clobbered inside PARSE_EXPR
+FT_SP   RES 1       ; FUNCATOM-01 (v4.6): FT_STK pointer ($FF=empty)
+FT_STK  RES 4       ; FUNCATOM-01: per-level dispatch-origin marker, pushed
+                     ; by PE_SAFE ($FF=top-level) or EAM_ATOM (live R3
+                     ; snapshot N), popped by PE_NOFUNC/FUNC_EPILOG. 4
+                     ; levels = 4 nested function-call arguments deep - see
+                     ; PE_SAFE/EAM_ATOM/FUNC_EPILOG headers for the scheme.
+FT_SAVE_SP RES 1    ; FUNCATOM-01: FT_SAVE byte-stack pointer ($FF=empty)
+FT_SAVE RES 64      ; FUNCATOM-01: saved SWBASE[0..N] bytes, one contiguous
+                     ; LIFO byte-stack shared across nesting levels (not
+                     ; fixed per-level slots - see EAM_ATOM/FUNC_EPILOG).
+                     ; 64 bytes is generous headroom over SWBASE's own 32.
+FT_N    RES 1       ; FUNCATOM-01: scratch - N handed within FUNC_EPILOG
+FT_R2SAVE RES 1     ; FUNCATOM-01: scratch - caller's R2 preserved across
+                     ; the EAM_ATOM save / FUNC_EPILOG restore byte-copy
+                     ; (R2 is reserved for DO_LET/DO_FOR/DO_INPUT across
+                     ; PARSE_EXPR - see header - so must never leak here)
 ARGAH   RES 1       ; PARSE_2ARGS: arg 'a' scratch (hi); NOT TMPH - PARSE_EXPR
 ARGAL   RES 1       ; itself clobbers TMPH:TMPL while parsing arg 'b'
 SAVEL   RES 1       ; ADD16_SAVE_EXP: popped left operand scratch (lo)
@@ -2966,8 +3109,8 @@ VARS    RES 52      ; A-Z variables 2 bytes each
 ;  $22=DQ $3B=semicolon  in-string chars that need escaping.
 ; =============================================================================
 PROG:
-        DB 0,10,"REM uBASIC 2650 - SHOWCASE V4.5",$0D
-        DB 0,20,"PRINT ",$22,"-- uBASIC 2650 V4.5 Showcase --",$22,$0D
+        DB 0,10,"REM uBASIC 2650 - SHOWCASE V4.6",$0D
+        DB 0,20,"PRINT ",$22,"-- uBASIC 2650 V4.6 Showcase --",$22,$0D
         DB 0,30,"PRINT ",$22,"--- PRINT / CHR$ ---",$22,$0D                    ; 30  PRINT "--- PRINT / CHR$ ---"
         DB 0,40,"PRINT CHR$(65)",$3B,"CHR$(66)",$3B,"CHR$(67)",$0D             ; 40  PRINT CHR$(65);CHR$(66);CHR$(67)
         DB 0,50,"PRINT ",$22,"--- ARITHMETIC ---",$22,$0D                      ; 50  PRINT "--- ARITHMETIC ---"
