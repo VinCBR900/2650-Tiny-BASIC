@@ -12,7 +12,7 @@ If you just want a proper BASIC for your Signetics 2650 system then the vintage 
 ## Functionality
 
 **Statements:** 
-  * `END` `GOTO` `IF`/`THEN` `INPUT` [`LET`] `POKE` `PRINT [TAB(spaces)] [CHR$(expr)] [;]` `REM`  
+  * `END` `FOR [STEP]`/`NEXT`  `GOSUB`/`RETURN` `GOTO` `IF`/`THEN` `INPUT` [`LET`] `POKE` `PRINT [TAB(spaces)] [CHR$(expr)] [;]` `REM`  
   * `LIST [start,end]` `NEW` `RUN`   
 
 **Expressions:** `+` `-` `*` `/` `% (Mod)` `=` `<` `>` `<=` `>=` `<>` unary `-` `(` `)` variables `A`–`Z`
