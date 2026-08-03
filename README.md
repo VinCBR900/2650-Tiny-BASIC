@@ -1,7 +1,13 @@
 # 2650-Tiny-BASIC - Intended for 2732 4kByte EPROM
 
-Signetics 2650 Tiny BASIC - core functionality present
-
+> **AI Disclosure**: This code was developed with the assistance of AI (Claude by Anthropic, and Gemini by Google). The architecture, code, tests, and documentation were produced collaboratively between a human developer and an AI assistant. All code has been reviewed by the author.
+>Specifically:
+> - I architected, reviewed, hand optimized.
+> - Claude created boilerplate code that was subsequentyl hand optimized, ran regression tests,bugfixed and helped with documentation.
+> - Gemini created code fragments that were usually wrong but inspired `code golf` techniques.  
+>
+> To be frank, without these agents this work would not have been possible.
+> 
 You can play with this Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
 
 This minimal integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below.  
@@ -47,7 +53,7 @@ So far, this has been much more difficult than writing the [6502 Tiny BASIC](htt
 
 - 8 level hardware Return Address Stack (RAS). Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
   - One of the tricks for reduced size (sometimes called _Code Golf_) is for any code used twice or more, make it a subroutine.  That's Not possible here due to the small RAS, so we have lots of duplicate inline code.
-  - I have immplemneted a  SW stack, but that has about a dozen bytes overhead for each call.  Interestingly the return address does not have to be the immediate next instruction...   
+  - I implemneted a SW stack for key subroutines, which has about a dozen bytes overhead for each call.  Interestingly the return address does not have to be the immediate next instruction...   
 - Although it has nice features like auto-increment and decrement, heavy indirection and return on condition code, these are not size optimized
   - e.g. Relative Jumps limited to +/- 63 bytes and still take 2 bytes due to condition codes.  So most jumps take 3 bytes  
 - From a programmers perspective, the instruction set was clearly designed by an engineer and instructions are dense
@@ -98,12 +104,6 @@ Meanwhile newer processors such as the MOS 6502, Zilog Z80 and Motorola 6809 off
 ### Prologue
 
 Although it never achieved the commercial success of its rivals, the 2650 developed a loyal following among hobbyists and industrial users. It appeared in systems published by Elektor, Electronics Australia and numerous arcade and pinball machines.
-
----
-
-## Technical Notes
-
-TBD - Howie did-it.
 
 ---
 
