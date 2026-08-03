@@ -13,7 +13,8 @@ You can play with this Interpreter online at [https://vincbr900.github.io/2650-T
 This minimal integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below.  
 
 If you just want a proper BASIC for your Signetics 2650 system then the vintage [MicroWorld BASIC interpreter](https://binnie.id.au/MicroByte/BASIC%20Manual.pdf) is significantly more capable with floating point and string support. It is scattered around on the internet but I found a version at [https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main](https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main).
-
+> If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
+> [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
 ---
 ## Functionality
 
