@@ -263,7 +263,7 @@ CLRV:
         LODI,R0 $E1
         BSTA,UN RND_SKIP
 
-        ; print sign-on 
+        ; print sign-on banner
         LODI,R0 <BANNER
         STRA,R0 IPH
         LODI,R0 >BANNER
@@ -3037,7 +3037,7 @@ CLR_EXP:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V4.8", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V4.7", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword dispatch table
 ; Format: [c1][c2][c3][hi][lo]  NUL-terminated on c1, followed by no match handler
