@@ -1,7 +1,7 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v4.6
+; Version: v4.7
 ; By Vincent Crabtree, 2026.  MIT License
-; Date:    2026-07-03
+; Date:    2026-08-10
 ;
 ; Target:  Standalone (no PIPBUG ROM). Code ORG 0. I/O routines embedded.
 ;          Single 8192-byte address space (2650 bits 15:13 always 0).
@@ -57,11 +57,32 @@
 ;
 ; RECENT CHANGE HISTORY
 ;
+; V4.7 (2026-08-10) - ROMEND $0F98 
+;   - PUSH_RET helper: R0=lo,R1=hi 16-bit return-address push onto SWBASE,
+;     replacing the repeated LODI/STRA x2 idiom used before every ZBRR.
+;   - BUG: indexed autoincrement STRA (abs,R3+) only exists for R0 on
+;     the 2650 -- STRA,R1 abs,R3+ silently assembles identical to STRA,R0
+;     (same opcode byte) and does NOT store R1. PUSH_RET uses LODZ,R1
+;     (R0=R1) before the second store to work around this.
+;   - Added ^ (power) operator: CHECK_POW hook, called after every atom-
+;     fetch returns (8 sites: EAM0_RET/EAM_P_RET/EAM_M_RET/MU_AT_RET/
+;     DV_AT_RET/MD_AT_RET/NEG_AT_RET/POS_AT_RET -- the last needed its own
+;     landing label, previously EAM_POS just reused PARSER_RET directly
+;     since unary + is a no-op). Left-associative (2^3^2 == (2^3)^2),
+;     binds tighter than */÷/% and looser than atoms; unary - binds
+;     tighter than ^ (-2^2 == (-2)^2 == 4). 0^0==1. Negative exponent ->
+;     ERR_OV ('9', new error code). 
+;   - FIXED print variable -32768 (e.g. 2^15), would hang. Root cause
+;     (BUG-MINLP-01): the -32768 special-case string-print loop (MIN_LP)
+;     used LODR,R0 MSG_MIN-1,R1+ to walk the "32768" literal -- but LODR
+;     has no indexed addressing on this CPU 
+;
 ; V4.6 (2026-07-03) - 3879 bytes (ROMEND $0F27)
 ;   - FIXED: FUNCATOM-01 - functions now work as non-leading atoms, e.g.
 ;     "PRINT 10+ABS(A)" (previously only "PRINT ABS(A)+10" worked).
 ;   - Added FT_SP/FT_STK/FT_SAVE_SP/FT_SAVE/FT_N/FT_R2SAVE (72 RAM bytes)
 ;     and FUNC_EPILOG; PE_SAFE/EAM_ATOM/PE_NOFUNC/DO_END updated. 
+;
 ; V4.5 (2026-06-30) - 3705 bytes
 ;   - FIXED: Function parser tracking for trailing operators (e.g., ABS(-5)+10).
 ;   - Relocated PEEK/USR/EXPH functions to optimize space post-COUT.
@@ -116,6 +137,7 @@ ERR_RET         EQU '5'         ; RETURN without GOSUB (GOSUB stack underflow)
 ERR_FOR         EQU '6'         ; Too many nested FORs (FORBASE stack overflow)
 ERR_NXT         EQU '7'         ; NEXT without FOR (FORBASE stack underflow)
 ERR_NEST        EQU '8'         ; Expression nesting too deep (RAS guard, v3.2 had '5')
+ERR_OV          EQU '9'         ; ^ (power): negative exponent, or result overflows 16-bit
 
 ; RAS (hardware Return Address Stack) Defines
 RAS_DEPTH       EQU 8           ; 2650 HW RAS depth (SPSU field is 3 bits, 0-7)
@@ -210,6 +232,14 @@ VFUNC_CONT:
                                   ; AND/OR/XOR/NOT + EXPH_Z shared by PEEK/USR)
                                   ; v4.6 FUNCATOM-01: routes to FUNC_CONT
                                   ; (top-level) or PARSER_RET (mid-expr)
+VPUSH_RET:
+        DW PUSH_RET              ; 13 sites (v4.7 PUSHRET-01: replaces the
+                                  ; LODI/STRA x2 literal-return-address push
+                                  ; idiom in front of ZBRR *VEAM_ATOM/VEAM_HI)
+VCHECK_POW:
+        DW CHECK_POW             ; 8 sites (v4.7 POW-01: power-operator (^)
+                                  ; hook, called after every atom-fetch
+                                  ; returns, before the caller's next step)
 MAIN:
         ; Pre-load SHOWCASE_END as program so RUN executes the showcase.
         ; Delete for ROM 
@@ -1557,15 +1587,14 @@ PE_NOFUNC_TOP:
         LODI,R3 $FF                     ; SW stack empty sentinel
 EXPR_AM:
         LODI,R0 >EAM0_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <EAM0_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <EAM0_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
 EAM0_RET:
+        ZBSR *VCHECK_POW
         LODI,R0 >EAM_HI0_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <EAM_HI0_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <EAM_HI0_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_HI 
 EAM_HI0_RET:
 EAM_LO_LOOP:
@@ -1584,30 +1613,28 @@ EAM_PLUS:
         ; v4.4.3: PUSH_EXP shared with EAM_MINUS/MUL/DIV/MOD below.
         BSTR,UN PUSH_EXP
         LODI,R0 >EAM_P_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <EAM_P_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <EAM_P_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
 EAM_P_RET:
+        ZBSR *VCHECK_POW
         LODI,R0 >ADD16_SAVE_EXP ; >EAM_PH_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <ADD16_SAVE_EXP ; <EAM_PH_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <ADD16_SAVE_EXP ; <EAM_PH_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_HI 
 ;EAM_PH_RET:
 ;        BCTR,UN ADD16_SAVE_EXP            ; EXP = SAVE + EXP (V4.2: shared)
 EAM_MINUS:
         BSTR,UN PUSH_EXP
         LODI,R0 >EAM_M_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <EAM_M_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <EAM_M_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
 EAM_M_RET:
+        ZBSR *VCHECK_POW
         LODI,R0 >EAM_MH_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <EAM_MH_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <EAM_MH_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_HI 
 EAM_MH_RET:
         BSTA,UN NEG_EXP_BODY              ; EXP = -EXP (V4.2: shared, was SUBA)
@@ -1637,6 +1664,27 @@ PUSH_EXP:
         LODA,R0 EXPH
         STRA,R0 SWBASE,R3+
         ZBRR *VINC_IP
+
+; =============================================================================
+;  PUSH_RET -- push a 16-bit literal return address onto SWBASE (v4.7,
+;  PUSHRET-01). Replaces the 4-instruction LODI/STRA x2 idiom that preceded
+;  every ZBRR *VEAM_ATOM/*VEAM_HI dispatch with a 2-instruction load + one
+;  shared call. Caller loads R0=lo, R1=hi of the target label, ZBSR's here,
+;  then falls through to its own ZBRR *VTARGET. Push order (lo then hi)
+;  matches SWRETURN's pop order (hi popped first, top of stack).
+;  NOTE: indexed STRA abs,R3+ only exists for R0 (2650 addressing constraint,
+;  confirmed against the ISA doc) -- STRA,R1 SWBASE,R3+ silently assembles
+;  identically to STRA,R0 and does NOT store R1. LODZ,R1 (R0=R1) is used to
+;  bring the high byte into R0 before the second store.
+;  Net: 12 bytes/site inline -> 8 bytes/site + this 8-byte routine once.
+; In:  R0 = low byte, R1 = high byte of the return address; R3 = SW SP
+; Out: SWBASE[R3-1]=lo, SWBASE[R3]=hi (pushed); R3 += 2; R1 unchanged, R0 clobbered
+; Clobbers: R0
+PUSH_RET:
+        STRA,R0 SWBASE,R3+
+        LODZ,R1
+        STRA,R0 SWBASE,R3+
+        RETC,UN
 
 ; =============================================================================
 ;  ADD16_SAVE_EXP -- EXP = SAVE + EXP (16-bit, WC carry chain); resumes EAM loop
@@ -1678,33 +1726,33 @@ EAM_MUL:
         ; PAREN-NEST-01 fix (v4.3): push, not flat E1SAVH:E1SAVL (see EAM_PLUS)
         BSTA,UN PUSH_EXP
         LODI,R0 >MU_AT_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <MU_AT_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <MU_AT_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
 MU_AT_RET:
+        ZBSR *VCHECK_POW
         BSTR,UN POP_SAVE_TO_TMP           ; TMPH:TMPL = popped left operand
         BSTA,UN MUL16
         ZBRR *VEAM_HI 
 EAM_DIV:
         BSTA,UN PUSH_EXP
         LODI,R0 >DV_AT_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <DV_AT_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <DV_AT_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
 DV_AT_RET:
+        ZBSR *VCHECK_POW
         BSTR,UN POP_SAVE_TO_TMP
         BSTA,UN DIV16
         ZBRR *VEAM_HI 
 EAM_MOD:
         BSTA,UN PUSH_EXP
         LODI,R0 >MD_AT_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <MD_AT_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <MD_AT_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
 MD_AT_RET:
+        ZBSR *VCHECK_POW
         BSTR,UN POP_SAVE_TO_TMP
         BSTA,UN DIV16
         ZBSR *VTMP_TO_EXP16              ; EXPH:EXPL = TMPH:TMPL (remainder)
@@ -1800,28 +1848,27 @@ EAMS_SAVE_LP:
 EAM_NEG:
         ZBSR *VINC_IP  
         LODI,R0 >NEG_AT_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <NEG_AT_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <NEG_AT_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
 NEG_AT_RET:
         BSTA,UN NEG_EXP_BODY
+        ZBSR *VCHECK_POW
         BCTR,UN PARSER_RET
 EAM_POS:
         ZBSR *VINC_IP  
-        LODI,R0 >PARSER_RET ; >POS_AT_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <PARSER_RET; <POS_AT_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R0 >POS_AT_RET
+        LODI,R1 <POS_AT_RET
+        ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM 
-;POS_AT_RET:
-;        BCTR,UN PARSER_RET
+POS_AT_RET:
+        ZBSR *VCHECK_POW
+        BCTR,UN PARSER_RET
 EAM_PAREN:
         ZBSR *VINC_IP  
         LODI,R0 >EP_RET
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <EP_RET
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <EP_RET
+        ZBSR *VPUSH_RET
         BCTA,UN EXPR_AM
 EP_RET:
         ZBSR *VWSKIP  
@@ -2513,9 +2560,24 @@ IS_NEG:
         COMI,R1 $80             ; from before, check if its exactly 0x80
         BCFR,EQ DO_NEG          ; nope again real neg number
         ; otherwise it is the 32768 magic number
-        LODI,R1 0               ; string offset
-MIN_LP:                         ; BDRR no advantage as still need a RETC
-        LODR,R0 MSG_MIN-1,R1+   ; Load char from table
+        ; v4.7 BUG-MINLP-01 fix: was LODR,R0 MSG_MIN-1,R1+ -- LODR has no
+        ; indexed addressing on this CPU (oracle: "LODR,rn rel ; rn=*(rel)",
+        ; a bare PC-relative single-byte load, no register-index form at
+        ; all). The ,R1+ was silently accepted by the assembler and
+        ; discarded (assembled to LODR's normal 2-byte encoding, nothing
+        ; more), so R1 never advanced and the loop re-read the same fixed
+        ; byte forever -- an infinite ZBSR *VCOUT loop whenever this path
+        ; was reached. LODA,r0 abs,x+ is the correct indexed-with-
+        ; autoincrement form (r0 is mandatory for the data register in
+        ; this mode -- same restriction found earlier for STRA's indexed
+        ; form in PUSH_RET). It's pre-increment (x++ happens BEFORE
+        ; addressing, confirmed against the oracle and against how
+        ; SWBASE push/pop already uses R3=$FF for the same reason), so
+        ; R1 starts at $FF here too, landing on MSG_MIN+0 on the first
+        ; actual read -- no "-1" address adjustment needed.
+        LODI,R1 $FF              ; string offset (pre-increment convention)
+MIN_LP:
+        LODA,R0 MSG_MIN,R1+     ; Load char from table
         RETC,EQ                 ; return on null
         ZBSR *VCOUT             ; Print
         BCTR,UN MIN_LP
@@ -2599,9 +2661,8 @@ PR_NOQBIT:
         BCTR,EQ PR_PRINT
 PR_REC:
         LODI,R0 >PR_PRINT
-        STRA,R0 SWBASE,R3+
-        LODI,R0 <PR_PRINT
-        STRA,R0 SWBASE,R3+
+        LODI,R1 <PR_PRINT
+        ZBSR *VPUSH_RET
         BCTA,UN PREC
 PR_PRINT:
         LODA,R0 SWBASE,R3
@@ -3015,6 +3076,86 @@ FUNC_TAB:
         DB "USR", <DO_USR_FUNC, >DO_USR_FUNC
         DB "XOR", <DO_XOR_FUNC, >DO_XOR_FUNC
         DB NUL,   <PE_NOFUNC,   >PE_NOFUNC        ; No match handler
+
+; =============================================================================
+;  CHECK_POW -- power operator (^) precedence hook (v4.7, POW-01/POW-02)
+; In:  EXPH:EXPL = just-parsed atom value; IPH:IPL = current parse position
+; Out: EXPH:EXPL = base^exponent if '^' found and consumed, else unchanged
+; Clobbers: R0, R1, R3, TMPH, TMPL, SAVEH, SAVEL, POWCNTH, POWCNTL
+CHECK_POW:
+        LODA,R0 *IPH
+        COMI,R0 A'^'
+        BCTR,EQ CP_HIT
+        RETC,UN
+CP_HIT:
+        BSTA,UN PUSH_EXP           ; push base(EXPH:EXPL) onto SWBASE; tail
+                                    ; branch inside also advances IP past '^'
+        LODI,R0 >CP_EXP_RET
+        LODI,R1 <CP_EXP_RET
+        ZBSR *VPUSH_RET
+        ZBRR *VEAM_ATOM             ; parse exponent atom -> EXPH:EXPL
+CP_EXP_RET:
+        LODA,R0 SWBASE,R3          ; base hi (top, no dec)
+        STRA,R0 SAVEH
+        LODA,R0 SWBASE,R3-         ; base lo
+        STRA,R0 SAVEL
+        SUBI,R3 1
+        ; SAVEH:SAVEL = base; EXPH:EXPL = exponent; SW stack balanced
+
+        LODA,R0 EXPH               ; negative exponent -> error (undefined
+        ANDI,R0 $80                 ; for an integer-only result)
+        BCTR,EQ CP_EXP_OK
+        LODI,R0 ERR_OV
+        ZBRR *VDO_ERROR 
+CP_EXP_OK:
+        LODA,R1 EXPH                ; exponent == 0 -> result = 1
+        LODA,R0 EXPL                 ; (standard convention, incl. 0^0 == 1)
+        IORZ R1
+        BCFR,EQ CP_POW_LOOP
+        EORZ,R0
+        STRA,R0 EXPH
+        LODI,R0 1
+        STRA,R0 EXPL
+        BCTA,UN CP_CHAIN
+
+CP_POW_LOOP:
+        LODA,R0 EXPH                ; move exponent into the down-counter
+        STRA,R0 POWCNTH             ; (EXPH:EXPL becomes the result accum
+        LODA,R0 EXPL                 ; below, needs the exponent out of it)
+        STRA,R0 POWCNTL
+
+        LODI,R0 0                    ; result accumulator = 1
+        STRA,R0 EXPH
+        LODI,R0 1
+        STRA,R0 EXPL
+
+CP_MUL_LOOP:
+        LODA,R0 SAVEH
+        STRA,R0 TMPH
+        LODA,R0 SAVEL
+        STRA,R0 TMPL
+        BSTA,UN MUL16
+
+        LODA,R0 POWCNTL                ; exponent counter -= 1 (16-bit)
+        SUBI,R0 1
+        STRA,R0 POWCNTL
+        BCFR,LT CP_CNT_NB
+        LODA,R0 POWCNTH
+        SUBI,R0 1
+        STRA,R0 POWCNTH
+CP_CNT_NB:
+        LODA,R1 POWCNTH
+        LODA,R0 POWCNTL
+        IORZ R1
+        BCFR,EQ CP_MUL_LOOP
+        ; fall through: loop done
+
+CP_CHAIN:
+        LODA,R0 *IPH                   ; chained ^ is left-associative:
+        COMI,R0 A'^'                    ; (2^3^2) == (2^3)^2, so loop back
+        BCTA,EQ CP_HIT                  ; to CP_HIT with the current result
+        RETC,UN                          ; as the new base instead of recursing
+
 ROMEND: 
 
 ;  RAM variables -- sequential RES block 
@@ -3046,6 +3187,8 @@ SC1     RES 1       ; Scratch byte 1
 PEH     RES 1       ; Program end pointer hi
 PEL     RES 1       ; Program end pointer lo
 SAVEH   RES 1       ; ADD16_SAVE_EXP: popped left operand scratch (hi)
+POWCNTH RES 1       ; CHECK_POW: exponent down-counter (hi/lo); accessed by
+POWCNTL RES 1       ; name throughout, not indexed, so adjacency doesn't matter
 FUNCOP  RES 1       ; PARSE_2ARGS: AND/OR/XOR op selector
 FT_SP   RES 1       ; FUNCATOM-01 (v4.6): FT_STK pointer ($FF=empty)
 FT_STK  RES 4       ; FUNCATOM-01: per-level dispatch-origin marker, pushed
