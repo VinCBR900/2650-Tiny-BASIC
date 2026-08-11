@@ -264,9 +264,9 @@ CLRV:
         BSTA,UN RND_SKIP
 
         ; print sign-on 
-        LODI,R0 <
+        LODI,R0 <BANNER
         STRA,R0 IPH
-        LODI,R0 >
+        LODI,R0 >BANNER
         STRA,R0 IPL
         BSTA,UN PRTSTR
         BSTA,UN DO_FREE
