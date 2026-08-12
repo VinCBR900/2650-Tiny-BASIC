@@ -1,6 +1,6 @@
 /* pipbug_wrap.c — PIPBUG 1 simulator using the WinArcadia 2650 CPU core
  * Version: 2.2
- * Date:    2026-06-30
+ * Date:    2026-08-11
  *
  * Purpose:
  *   Wraps 2650.c (the WinArcadia CPU core, compiled -DGAMER to strip all UI
@@ -36,19 +36,11 @@
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
  *
  * Change history:
- *   v2.2  2026-06-30  CPSU SP-field intercept: The Sim protects
- *         PSU bits 2:0 (RAS stack pointer) from software writes; CPSU masks
- *         against PSU_WRITABLE which excludes 0x07. uBASIC2650
- *         REPL uses "CPSU $07" to drain orphaned RAS frames after error-path
- *         JSYNERR BCTA jumps bypass normal RETC unwinding. We honour the
- *         intent by forcibly clearing PSU SP bits after any CPSU instruction
- *         whose mask includes SP bits. Avoids ERR_NEST cascade on valid code
- *         following a syntax error.
+ *   v2.2  BUG-PSUWRITE-01: PSU was no t writeable - fixed.
  *   v2.1  Added write watchpoints (-w log, -W halt-on-first), multiple -m
  *         dumps (up to 4), enhanced trace showing alternate register bank
  *         (r[4]-r[6]) when PSL RS is active, and decoded PSU flags
- *         (SP/RS/OVF/C). Watchpoints use per-instruction memory polling
- *         after cpu_emu() so no 2650.c modification is required.
+ *         (SP/RS/OVF/C), no 2650.c modification required.
  *   v2.0  Added cross-platform interactive terminal mode (-i) with raw
  *         byte input/output and Ctrl-] graceful exit. Browser builds use
  *         non-blocking FIFO polling so WASM never blocks the event loop.
@@ -134,8 +126,16 @@ typedef unsigned char   ASCREEN;    /* unused in GAMER mode */
 #define PSU_F           0x40    /* bit 6 — FLAG output                      */
 #define PSU_II          0x20    /* bit 5 — interrupt inhibit                */
 #define PSU_SP          0x07    /* bits 2:0 — stack pointer                 */
-#define PSU_WRITABLE_A  0x60    /* F + II are software-writable via PPSU    */
-#define PSU_WRITABLE_B  0x60
+/* v2.2 BUG-PSUWRITE-01 fix: was 0x60 (F+II only), excluding PSU_SP. Per the
+ * Signetics 2650 User Manual, CPSU's actual mask is %01100111 ($67) — F,
+ * II, AND the SP field are all software-clearable via CPSU/settable via
+ * PPSU/loadable via LPSU. The old 0x60 mask silently no-op'd on the SP
+ * bits for all three instructions (LPSU's implementation reuses this same
+ * mask), so 2650 code trying to reset the RAS depth via CPSU or LPSU had
+ * no effect here even though it's correct, documented behavior on real
+ * hardware. See change history below for how this was found. */
+#define PSU_WRITABLE_A  0x67    /* F + II + SP are software-writable        */
+#define PSU_WRITABLE_B  0x67
 
 /* memflags bit masks (only the ones 2650.c tests internally) */
 #define ASIC            0x01
@@ -1007,23 +1007,11 @@ EMSCRIPTEN_KEEPALIVE int pipbug_run_chunk(int instruction_budget)
 
         oldcycles = cycles_2650;
         opcode = memory[iar];
-        int pw_operand = memory[(iar + 1) & AMSK];   /* needed for CPSU intercept */
         /* Snapshot watched bytes before the instruction */
         for (int wi = 0; wi < pw_wcount; wi++)
             pw_wprev[wi] = memory[pw_waddr[wi] & AMSK];
         one_instruction();
         cpu_emu();
-
-        /* CPSU $xx SP-field intercept (v2.2): the 2650 hardware protects
-         * PSU bits 2:0 (the RAS stack pointer) from software writes — CPSU
-         * masks against PSU_WRITABLE_A/B which intentionally excludes 0x07.
-         * uBASIC2650 REPL uses "CPSU $07" to drain orphaned RAS frames left
-         * by the error handler's BCTA tail-jump, which bypasses normal
-         * RETC unwinding.  We honour the intent here rather than the
-         * hardware restriction: if a CPSU instruction included any SP bits
-         * in its mask, forcibly clear those bits now. */
-        if (opcode == 0x74 && (pw_operand & PSU_SP))
-            psu &= ~PSU_SP;
         instruction_count++;
         executed++;
 
