@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.15
+ * Version: 1.16
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -13,6 +13,82 @@
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
  *   >ADDR = LOW  byte  (bits  7:0)   e.g. >$1584 = $84
+ *
+ * BARE '$' TOKEN:
+ *   '$' alone (not followed by a hex digit) = address of the current source
+ *   line, i.e. the classic assembler "here" token. E.g. "BDRR,R0 $" decrements
+ *   R0 and branches back to itself — a busy-wait delay loop timed by R0.
+ *
+ * Changes v1.15 -> v1.16:
+ *   BUG-ASM-08 FIXED: register-indexed addressing (,Rn[+/-]) detection in the
+ *     alu[] family (LOD/EOR/AND/IOR/ADD/SUB/COM/STR) ran unconditionally for
+ *     all four modes (Z/I/R/A) instead of only mode A, the only mode that
+ *     architecturally supports it. For Z/I/R this silently overwrote the
+ *     opcode's register field with the index register and then discarded the
+ *     index info entirely (modes 0/1/2 never honoured idxctl). E.g. LODR,R0
+ *     MSG_MIN-1,R1+ assembled as a valid-looking LODR with a wrong register
+ *     field and no error. Fixed: ,Rn[+/-] is now only accepted when mode==3;
+ *     any other mode is a hard error.
+ *   BUG-ASM-09 FIXED: eval_expr()'s catch-all failure path (malformed/empty
+ *     expression, e.g. "LODI,R0 <" with nothing after the operator) set
+ *     *ok=0 with no diagnostic, unlike the undefined-label path which does
+ *     report. Every call site that didn't check ok either emitted a garbage
+ *     byte (CPSU/CPSL/PPSU/PPSL/TPSU/TPSL, alu[] immediate mode) or a $00
+ *     placeholder with no diagnostic (ZBRR/ZBSR, alu[] relative/absolute,
+ *     br[]/bra[] branch families, BRNA/BIRA/BDRA/BSNA, BXA/BSXA) — "0
+ *     error(s)" while silently emitting wrong code. Fixed: every site now
+ *     checks ok and reports "ERROR line %d: bad %s operand '%s'" on pass 2
+ *     while still emitting the same placeholder byte(s) it did before (so
+ *     addresses stay aligned for further error detection in the same run).
+ *   BUG-ASM-10 FIXED: two related silent-emission gaps found while auditing
+ *     DS/RES/ORG: (1) "DS -5" / "RES -5" with a negative count fell through
+ *     the emit loop's "i<n" test with n<0, silently reserving 0 bytes instead
+ *     of erroring, throwing off every later label address with no diagnostic.
+ *     (2) "ORG" to a negative or >MAX_ROM address had no bounds check at all;
+ *     it only ever surfaced later via emit()'s pass-2-only range check, and
+ *     only if something was actually emitted afterward — a bad ORG followed
+ *     only by labels or EOF was completely silent. Both now report an error
+ *     on pass 2 (DS/RES: "count must be non-negative"; ORG: "address $XXXX
+ *     out of range").
+ *   BUG-ASM-11 FIXED: label_define() had no duplicate-name detection at all —
+ *     redefining an existing label or EQU constant on a different source line
+ *     silently overwrote its value with zero diagnostic (confirmed empirically:
+ *     two "FOO:" labels or two "BAR EQU" lines resolved to the last one seen,
+ *     "0 error(s)"). Added a def_line field to Label; a name redefined on the
+ *     SAME source line (EQU legitimately re-evaluating across pass 1/2 as
+ *     forward refs resolve) is still allowed silently, but a name defined on
+ *     a DIFFERENT line is now "ERROR line %d: '%s' already defined at line %d"
+ *     and the original value is kept.
+ *   BUG-ASM-12 FIXED: several fixed-size buffers truncated their input with
+ *     no diagnostic: label names (32 chars), mnemonics (16 chars), and
+ *     operand text (64 chars) — e.g. a 40-char label name would silently
+ *     collide with any other name sharing the same first 31 characters.
+ *     Buffers enlarged (label names/mnemonics to 64 chars, operands to 128)
+ *     and each now reports "ERROR line %d: ... too long" on pass 2 if the
+ *     input still doesn't fit, rather than truncating silently.
+ *   Version string (ASM2650_VERSION) was stale at "1.13" despite the header
+ *     already documenting v1.14/v1.15 changes — corrected, now matches the
+ *     header version on every release.
+ *
+ * Changes v1.15 -> v1.16 (BUG-ASM-13 folded into same version per request):
+ *   BUG-ASM-13 FIXED: bare '$' (e.g. "BDRR,R0 $") was never supported as a
+ *     "current address" token — eval_expr required a hex digit after '$' and
+ *     silently failed otherwise (*ok=0, no diagnostic pre-BUG-ASM-09; a hard
+ *     error post-BUG-ASM-09). Confirmed against uBASIC2650_v47.asm: its 110-
+ *     baud serial delay routine uses "BDRR,R0 $" x4 as a decrement-and-branch-
+ *     to-self busy-wait loop. The OLD assembler (pre-1.16) emitted a literal
+ *     $00 displacement byte for the failed expression, which resolves to an
+ *     offset of 0 — i.e. branches to the byte immediately after the
+ *     instruction, NOT back to itself. Every one of those "delay loops" has
+ *     silently never looped; R0 was decremented once and execution fell
+ *     straight through. Fixed: '$' with no following hex digit now resolves
+ *     to line_start_pc, a new global capturing pc at the start of the current
+ *     source line (before anything is emitted for it) — chosen over reading
+ *     the live pc directly because different instruction families emit their
+ *     opcode byte at different points relative to their eval_expr() call, so
+ *     the live pc would make '$' mean different things in different contexts.
+ *     line_start_pc gives '$' one consistent meaning everywhere: "the address
+ *     this source line started at."
  *
  * Changes v1.14 -> v1.15:
  *   write_hex() previously walked the full [rom_lo, rom_hi] "tide mark" range
@@ -104,9 +180,9 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.15"
+#define ASM2650_VERSION "1.16"
 
-typedef struct { char name[32]; int value; int referenced; } Label;
+typedef struct { char name[64]; int value; int referenced; int def_line; } Label;
 static Label labels[MAX_LABELS];
 static int   nlabels = 0;
 
@@ -130,6 +206,13 @@ static unsigned char rom_emitted[MAX_ROM];  /* tracks which addresses pass 2 has
 static int rom_lo = MAX_ROM, rom_hi = -1;
 
 static int  pc     = 0;
+static int  line_start_pc = 0;  /* BUG-ASM-13: pc captured at the start of the current source
+                                  * line, before any bytes are emitted for it — this is what a
+                                  * bare '$' token resolves to. Captured once per line rather
+                                  * than reading the live pc directly, so '$' means the same
+                                  * thing (this statement's address) regardless of how far a
+                                  * given instruction family has already advanced pc internally
+                                  * before calling eval_expr(). */
 static int  pass   = 0;
 static int  errors = 0;
 static int  lineno = 0;
@@ -197,11 +280,29 @@ static void label_mark_referenced(const char *n){
     int i=label_find_index(n);
     if(i>=0) labels[i].referenced=1;
 }
+/* label_define: create or update a label/constant's value.
+ * Inputs:  n = label name, v = value to assign.
+ * Outputs: none (mutates global labels[] / nlabels).
+ * Clobbers: labels[], nlabels, errors (via BUG-ASM-11 duplicate check and table-full check).
+ * BUG-ASM-11: a name already defined on a DIFFERENT source line is a genuine
+ * duplicate (typo/copy-paste) and is now rejected with an error, keeping the
+ * original value. A name redefined on the SAME source line (EQU re-evaluated
+ * on pass 2, possibly to a different value once forward refs resolve) is the
+ * expected two-pass behaviour and is allowed silently. Duplicate errors are
+ * only printed on pass==1, since plain-label/ORG-label definitions only ever
+ * run on pass 1 — printing on pass==2 as well would double-report EQU-based
+ * duplicates (EQU runs on both passes). */
 static void label_define(const char *n, int v){
-    for(int i=0;i<nlabels;i++) if(strcmp(labels[i].name,n)==0){ labels[i].value=v; return; }
+    for(int i=0;i<nlabels;i++) if(strcmp(labels[i].name,n)==0){
+        if(labels[i].def_line!=lineno){
+            if(pass==1){ fprintf(stderr,"ERROR line %d: '%s' already defined at line %d\n",lineno,n,labels[i].def_line); errors++; }
+            return;
+        }
+        labels[i].value=v; return;
+    }
     if(nlabels>=MAX_LABELS){ fprintf(stderr,"ERROR: label table full\n"); errors++; return; }
-    strncpy(labels[nlabels].name,n,31); labels[nlabels].name[31]=0;
-    labels[nlabels].value=v; labels[nlabels].referenced=0; nlabels++;
+    strncpy(labels[nlabels].name,n,63); labels[nlabels].name[63]=0;
+    labels[nlabels].value=v; labels[nlabels].referenced=0; labels[nlabels].def_line=lineno; nlabels++;
 }
 
 static int eval_expr(char *s, int *ok){
@@ -219,8 +320,17 @@ static int eval_expr(char *s, int *ok){
         return hi?((v>>8)&0xFF):(v&0xFF);
     }
     int val=0;
-    if(*s=='$'){ s++; if(!isxdigit((unsigned char)*s)){*ok=0;return 0;}
-        while(isxdigit((unsigned char)*s)) val=val*16+(isdigit((unsigned char)*s)?*s-'0':toupper((unsigned char)*s)-'A'+10), s++; }
+    if(*s=='$'){ s++;
+        if(!isxdigit((unsigned char)*s)){
+            /* BUG-ASM-13: bare '$' (not followed by a hex digit) = address of
+             * the current source line — the classic assembler "here" token.
+             * E.g. "BDRR,R0 $" decrements R0 and branches back to itself: a
+             * busy-wait delay loop timed by the initial R0 value. */
+            val = line_start_pc;
+        } else {
+            while(isxdigit((unsigned char)*s)) val=val*16+(isdigit((unsigned char)*s)?*s-'0':toupper((unsigned char)*s)-'A'+10), s++;
+        }
+    }
     else if(*s=='%'){ s++; while(*s=='0'||*s=='1') val=val*2+(*s++-'0'); }
     else if(isdigit((unsigned char)*s)){ while(isdigit((unsigned char)*s)) val=val*10+(*s++-'0'); }
     else if(isalpha((unsigned char)*s)||*s=='_'){
@@ -231,9 +341,13 @@ static int eval_expr(char *s, int *ok){
             if(*s) s++;
             if(*s=='\'') s++; /* skip closing ' */
         } else {
-            char nm[32]; int i=0;
-            while((isalnum((unsigned char)*s)||*s=='_')&&i<31) nm[i++]=*s++;
+            char nm[64]; int i=0;
+            while((isalnum((unsigned char)*s)||*s=='_')&&i<63) nm[i++]=*s++;
             nm[i]=0;
+            if(isalnum((unsigned char)*s)||*s=='_'){
+                if(pass==2){ fprintf(stderr,"ERROR line %d: label name too long (max 63 chars) near '%s'\n",lineno,nm); errors++; }
+                *ok=0; return 0;
+            }
             int lv=label_find(nm);
             if(lv==UNDEF){ if(pass==2){fprintf(stderr,"ERROR line %d: undefined '%s'\n",lineno,nm); errors++;} *ok=0; return 0; }
             if(pass==2) label_mark_referenced(nm);
@@ -285,12 +399,12 @@ static void strip_comment(char *s)
 /* Split operands on commas and stop at semicolon comments, but only when those
  * delimiter characters are outside quoted text.  This keeps DB strings such as
  * "A,B;C" and character literals such as ';' intact for later evaluation. */
-static int split_ops(char *s, char ops[][64], int maxops){
+static int split_ops(char *s, char ops[][128], int maxops){
     int n=0; s=skip_ws(s);
     while(*s&&n<maxops){
         int i=0;
         int quote=0;
-        while(*s&&i<63){
+        while(*s&&i<127){
             if(quote){
                 ops[n][i++]=*s;
                 if(*s==quote) quote=0;
@@ -304,6 +418,9 @@ static int split_ops(char *s, char ops[][64], int maxops){
             }
             if(*s==','||*s==';') break;
             ops[n][i++]=*s++;
+        }
+        if(i>=127 && *s && *s!=','&&*s!=';'){
+            if(pass==2){ fprintf(stderr,"ERROR line %d: operand too long (max 127 chars)\n",lineno); errors++; }
         }
         ops[n][i]=0;
         for(int j=i-1;j>=0&&(ops[n][j]==' '||ops[n][j]=='\t');j--) ops[n][j]=0;
@@ -352,23 +469,35 @@ static int rel_offset_if_possible(int target, int base_pc, int *off_out){
 }
 
 static void assemble_line(char *line){
+    line_start_pc = pc;  /* BUG-ASM-13: fix '$' to this line's start address before anything emits */
     char buf[MAX_LINE]; strncpy(buf,line,MAX_LINE-1); buf[MAX_LINE-1]=0;
     upcase(buf);
     strip_comment(buf);
     char *p=buf;
     p=skip_ws(buf); if(!*p) return;
-    char lbl[32]="";
+    char lbl[64]="";
     int lbl_has_colon = 0;
     if(!isspace((unsigned char)buf[0])&&buf[0]){
         int i=0;
-        while((isalnum((unsigned char)*p)||*p=='_')&&i<31) lbl[i++]=*p++;
+        while((isalnum((unsigned char)*p)||*p=='_')&&i<63) lbl[i++]=*p++;
         lbl[i]=0;
+        if(isalnum((unsigned char)*p)||*p=='_'){
+            if(pass==2){ fprintf(stderr,"ERROR line %d: label name too long (max 63 chars) near '%s'\n",lineno,lbl); errors++; }
+        }
         if(*p==':'){
             lbl_has_colon = 1;
             p++;
         }
         p=skip_ws(p);
-        if(pass==1) label_define(lbl,pc);
+        /* EQU and ORG each call label_define() themselves (EQU: constant
+         * value; ORG: address AFTER the org change) — skip the generic
+         * pc-based definition here for those two mnemonics so a genuine
+         * duplicate name isn't reported twice (once from here, once from
+         * the mnemonic's own handler). Peek at the upcoming token only;
+         * mnemonic parsing itself still happens normally below. */
+        int is_equ_ahead = (strncmp(p,"EQU",3)==0 && !(isalnum((unsigned char)p[3])||p[3]=='_'));
+        int is_org_ahead = (strncmp(p,"ORG",3)==0 && !(isalnum((unsigned char)p[3])||p[3]=='_'));
+        if(pass==1 && !is_equ_ahead && !is_org_ahead) label_define(lbl,pc);
         if(*lbl && lbl_has_colon && *p && pass==2 && warn_inline_label){
             fprintf(stderr,"WARN line %d: label and instruction on same line\n",lineno);
         }
@@ -377,16 +506,34 @@ static void assemble_line(char *line){
      * After defining the label, continue to assemble any instruction that follows.
      * A colon with nothing after it (label-only line) is handled by the !*p check. */
     if(!*p) return;
-    char mn[16]=""; int mi=0;
-    while((isalpha((unsigned char)*p)||isdigit((unsigned char)*p))&&mi<15) mn[mi++]=*p++;
-    mn[mi]=0; p=skip_ws(p); if(*p==',') p++; p=skip_ws(p);
-    char ops[64][64];
+    char mn[32]=""; int mi=0;
+    while((isalpha((unsigned char)*p)||isdigit((unsigned char)*p))&&mi<31) mn[mi++]=*p++;
+    mn[mi]=0;
+    if(isalpha((unsigned char)*p)||isdigit((unsigned char)*p)){
+        if(pass==2){ fprintf(stderr,"ERROR line %d: mnemonic too long (max 31 chars) near '%s'\n",lineno,mn); errors++; }
+    }
+    p=skip_ws(p); if(*p==',') p++; p=skip_ws(p);
+    char ops[64][128];
     for(int _i=0;_i<64;_i++) ops[_i][0]=0;
     int nops=split_ops(p,ops,64);
 
-    if(strcmp(mn,"ORG")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok){pc=v; if(pass==1&&*lbl) label_define(lbl,pc);} else if(pass==2){fprintf(stderr,"ERROR line %d: bad ORG expression '%s'\n",lineno,ops[0]); errors++;} return; }
+    if(strcmp(mn,"ORG")==0){
+        int ok,v=eval_expr(ops[0],&ok);
+        if(ok){
+            if(v<0||v>=MAX_ROM){ if(pass==2){fprintf(stderr,"ERROR line %d: ORG address $%04X out of range\n",lineno,v); errors++;} }
+            pc=v; if(pass==1&&*lbl) label_define(lbl,pc);
+        } else if(pass==2){fprintf(stderr,"ERROR line %d: bad ORG expression '%s'\n",lineno,ops[0]); errors++;}
+        return;
+    }
     if(strcmp(mn,"EQU")==0){ int ok,v=eval_expr(ops[0],&ok); if(ok) label_define(lbl,v); else if(pass==2){fprintf(stderr,"ERROR line %d: bad EQU expression '%s'\n",lineno,ops[0]); errors++;} return; }
-    if(strcmp(mn,"DS")==0||strcmp(mn,"RES")==0){ int ok,n=eval_expr(ops[0],&ok); if(ok){for(int i=0;i<n;i++){emit(pc,0);pc++;}} else if(pass==2){fprintf(stderr,"ERROR line %d: bad %s expression '%s'\n",lineno,mn,ops[0]); errors++;} return; }
+    if(strcmp(mn,"DS")==0||strcmp(mn,"RES")==0){
+        int ok,n=eval_expr(ops[0],&ok);
+        if(ok){
+            if(n<0){ if(pass==2){fprintf(stderr,"ERROR line %d: %s count %d must be non-negative\n",lineno,mn,n); errors++;} }
+            else { for(int i=0;i<n;i++){emit(pc,0);pc++;} }
+        } else if(pass==2){fprintf(stderr,"ERROR line %d: bad %s expression '%s'\n",lineno,mn,ops[0]); errors++;}
+        return;
+    }
     if(strcmp(mn,"DB" )==0){
         for(int i=0;i<nops;i++){
             char *s=skip_ws(ops[i]);
@@ -446,6 +593,7 @@ static void assemble_line(char *line){
         char *a=ops[0]; int ind=0;
         if(*a=='*'){ind=1;a++;}
         int ok,v=eval_expr(a,&ok);
+        if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,a); errors++;}
         if(pass==2&&ok&&(v<-64||v>63)){
             fprintf(stderr,"ERROR line %d: %s displacement %d out of range (-64..+63)\n",lineno,mn,v);
             errors++;
@@ -457,12 +605,12 @@ static void assemble_line(char *line){
     }
     if(strcmp(mn,"RETC")==0){ int cc=cc_val(ops[0]); if(cc<0){fprintf(stderr,"ERROR line %d: RETC needs EQ/GT/LT/UN\n",lineno);errors++;return;} emit(pc,(unsigned char)(0x14|cc));pc++;return; }
     if(strcmp(mn,"RETE")==0){ int cc=cc_val(ops[0]); if(cc<0){fprintf(stderr,"ERROR line %d: RETE needs EQ/GT/LT/UN\n",lineno);errors++;return;} emit(pc,(unsigned char)(0x34|cc));pc++;return; }
-    if(strcmp(mn,"CPSU")==0){ emit(pc,0x74);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
-    if(strcmp(mn,"CPSL")==0){ emit(pc,0x75);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
-    if(strcmp(mn,"PPSU")==0){ emit(pc,0x76);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
-    if(strcmp(mn,"PPSL")==0){ emit(pc,0x77);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
-    if(strcmp(mn,"TPSU")==0){ emit(pc,0xB4);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
-    if(strcmp(mn,"TPSL")==0){ emit(pc,0xB5);pc++; int ok,v=eval_expr(ops[0],&ok); emit(pc,(unsigned char)(v&0xFF));pc++; return; }
+    if(strcmp(mn,"CPSU")==0){ emit(pc,0x74);pc++; int ok,v=eval_expr(ops[0],&ok); if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,ops[0]);errors++;} emit(pc,(unsigned char)(v&0xFF));pc++; return; }
+    if(strcmp(mn,"CPSL")==0){ emit(pc,0x75);pc++; int ok,v=eval_expr(ops[0],&ok); if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,ops[0]);errors++;} emit(pc,(unsigned char)(v&0xFF));pc++; return; }
+    if(strcmp(mn,"PPSU")==0){ emit(pc,0x76);pc++; int ok,v=eval_expr(ops[0],&ok); if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,ops[0]);errors++;} emit(pc,(unsigned char)(v&0xFF));pc++; return; }
+    if(strcmp(mn,"PPSL")==0){ emit(pc,0x77);pc++; int ok,v=eval_expr(ops[0],&ok); if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,ops[0]);errors++;} emit(pc,(unsigned char)(v&0xFF));pc++; return; }
+    if(strcmp(mn,"TPSU")==0){ emit(pc,0xB4);pc++; int ok,v=eval_expr(ops[0],&ok); if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,ops[0]);errors++;} emit(pc,(unsigned char)(v&0xFF));pc++; return; }
+    if(strcmp(mn,"TPSL")==0){ emit(pc,0xB5);pc++; int ok,v=eval_expr(ops[0],&ok); if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,ops[0]);errors++;} emit(pc,(unsigned char)(v&0xFF));pc++; return; }
     if(strcmp(mn,"DAR")==0){ int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: DAR needs Rn\n",lineno);errors++;return;} emit(pc,(unsigned char)(0x94|r));pc++;return; }
     if(strcmp(mn,"TMI")==0){
         int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: TMI needs Rn\n",lineno);errors++;return;}
@@ -491,6 +639,7 @@ static void assemble_line(char *line){
             if(br[i].uses_cc){ field=cc_val(field_str); if(field<0){fprintf(stderr,"ERROR line %d: %s needs EQ/GT/LT/UN\n",lineno,mn);errors++;return;} }
             else { field=reg_val(field_str); if(field<0){fprintf(stderr,"ERROR line %d: %s needs Rn\n",lineno,mn);errors++;return;} }
             int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
+            if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,addr_s); errors++;}
             if(is_rel){ emit(pc,(unsigned char)(br[i].base_r|field));pc++; if(ok) emit_rel(v,ind); else{emit(pc,0);pc++;} }
             else {
                 if(pass==2 && warn_local_abs_branch && ok){
@@ -511,6 +660,7 @@ static void assemble_line(char *line){
             char *cc_s, *addr_s; PARSE_FIELD(ops, nops, cc_s, addr_s);
             int cc=cc_val(cc_s); if(cc<0){fprintf(stderr,"ERROR line %d: %s needs EQ/GT/LT/UN\n",lineno,mn);errors++;return;}
             int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
+            if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,addr_s); errors++;}
             if(pass==2 && warn_local_abs_branch && ok){
                 int off=0;
                 if(rel_offset_if_possible(v,pc,&off)){
@@ -526,6 +676,7 @@ static void assemble_line(char *line){
         int base=(strcmp(mn,"BRNA")==0)?0x5C:(strcmp(mn,"BIRA")==0)?0xDC:(strcmp(mn,"BDRA")==0)?0xFC:0x7C;
         int r=reg_val(ops[0]); if(r<0){fprintf(stderr,"ERROR line %d: %s needs Rn\n",lineno,mn);errors++;return;}
         char *addr_s=ops[1]; int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
+        if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,addr_s); errors++;}
         if(pass==2 && warn_local_abs_branch && ok){
             int off=0;
             if(rel_offset_if_possible(v,pc,&off)){
@@ -565,6 +716,7 @@ static void assemble_line(char *line){
 
         if(*addr_s=='*'){ind=1;addr_s++;}
         v=eval_expr(addr_s,&ok);
+        if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,addr_s); errors++;}
         emit(pc,is_bsx?0xBF:0x9F);pc++;
         if(ok) emit_abs(v,ind,0); else{emit(pc,0);pc++;emit(pc,0);pc++;}
         return;
@@ -606,6 +758,15 @@ static void assemble_line(char *line){
             int idxctl=0;
             char *addr_s=ops0_after_reg(ops[0]);
             if(nops>=2 && ops[1][0]=='R' && ops[1][1]>='0' && ops[1][1]<='3') {
+                /* BUG-ASM-08: register-indexed addressing (,Rn[+/-]) is only
+                 * architecturally valid in mode A (absolute). Detecting it for
+                 * Z/I/R modes previously clobbered the register field silently
+                 * (r got overwritten with the index register) and the index
+                 * info was then discarded by the mode 0/1/2 emission cases. */
+                if(mode!=3){
+                    if(pass==2){ fprintf(stderr,"ERROR line %d: %s does not support indexed addressing (,Rn) — only A-mode does\n",lineno,mn); errors++; }
+                    return;
+                }
                 r=ops[1][1]-'0';  /* register field = index register */
                 if     (ops[1][2]=='+') idxctl=1;
                 else if(ops[1][2]=='-') idxctl=2;
@@ -618,6 +779,10 @@ static void assemble_line(char *line){
             /* Emit opcode with correct register field (index reg if indexed) */
             unsigned char ob=(unsigned char)(alu[i].base+(mode<<2)+r); emit(pc,ob); pc++;
             int ind=0; if(*addr_s=='*'){ind=1;addr_s++;} int ok,v=eval_expr(addr_s,&ok);
+            /* BUG-ASM-09: eval_expr's failure path was silently ignored for
+             * modes I/R/A (mode Z has no address operand). This one check
+             * covers all three cases below. */
+            if(mode!=0 && !ok && pass==2){ fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,addr_s); errors++; }
             switch(mode){
                 case 0: break;
                 case 1: emit(pc,(unsigned char)(v&0xFF));pc++; break;
