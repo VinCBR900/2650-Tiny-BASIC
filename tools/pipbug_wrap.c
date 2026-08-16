@@ -22,15 +22,14 @@
  *   -n N            Instruction limit (default 5000000, 0=unlimited)
  *   --chin 0xADDR   CHIN intercept address (default 0x0286)
  *   --cout 0xADDR   COUT intercept address (default 0x02B4)
- *   --crlf 0xADDR   CRLF intercept address (default 0x008A)
- *   --entry 0xADDR  Program entry address (default 0x0440)
+ *   --crlf 0xADDR   CRLF intercept address (Pipbug defaults to 0x008A, we use 0x7fff)
+ *   --entry 0xADDR  Program entry address (Pipbug defaults to 0x0440, we use 0x0000)
  *   -h, --help      Show usage help
  *   -v, --version   Show version number
  *
  * PIPBUG 1 intercepts (entry points match Oracle / uBASIC2650 EQUs):
  *   COUT  $02B4  putchar(R0)
  *   CHIN  $0286  R0 = host input byte
- *   CRLF  $008A  putchar('\r'); putchar('\n')
  *
  * Build:
  *   gcc -Wall -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
@@ -382,11 +381,11 @@ static int           pw_waddr[PW_MAX_WATCH];  /* watched address            */
 static int           pw_whalt[PW_MAX_WATCH];  /* 1=-W halt, 0=-w log        */
 static unsigned char pw_wprev[PW_MAX_WATCH];  /* value before last insn     */
 static int           pw_wcount       = 0;
-static int           pw_halt_pending = 0;     /* set when -W fires          */
+static int           pw_halt_pending = 0;     /* set when -W fires         */
 static int           pw_halt_addr    = 0;
 static unsigned char pw_halt_newval  = 0;
 static long inst_limit    = 5000000;
-static int  inst_limit_set = 0;      /* explicit -n was supplied             */
+static int  inst_limit_set = 0;      /* explicit -n was supplied           */
 static int  step_mode     = 0;      /* -s step mode                        */
 static int  trace_mode    = 0;      /* -t trace mode                       */
 static int  interactive_mode = 0;   /* -i raw terminal mode                */
@@ -395,10 +394,10 @@ static int  interactive_exit = 0;
 static int  run_finished = 0;       /* emulator has reached a terminal state */
 static int  final_report_printed = 0;
 static long instruction_count = 0;
-static UWORD chin_addr    = 0x0286; /* --chin                              */
-static UWORD cout_addr    = 0x02B4; /* --cout                              */
-static UWORD crlf_addr    = 0x008A; /* --crlf                              */
-static UWORD entry_addr   = 0x0440; /* --entry                             */
+static UWORD chin_addr    = 0x0286; /* --chin, Pipbug Default              */
+static UWORD cout_addr    = 0x02B4; /* --cout, Pipbug Default              */
+static UWORD crlf_addr    = 0x7fff; /* --crlf, Pipbug defaults to 0x008A   */
+static UWORD entry_addr   = 0x0;    /* --entry, Pipbuig defaults to 0x0440 */
 
 #if PIPBUG_WRAP_EMSCRIPTEN
 static int terminal_restore_needed = 0;
@@ -649,13 +648,13 @@ static void print_usage(const char *prog)
         "  -W 0xADDR       Write watchpoint: log and halt on first write\n"
         "  -m 0xADDR LEN   Dump LEN bytes from address at halt (up to 4)\n"
         "  -n LIMIT        Instruction limit (default 5000000, 0=unlimited)\n"
-        "  --chin 0xADDR   CHIN intercept address (default 0x0286)\n"
-        "  --cout 0xADDR   COUT intercept address (default 0x02B4)\n"
-        "  --crlf 0xADDR   CRLF intercept address (default 0x008A)\n"
-        "  --entry 0xADDR  Program entry address (default 0x0440)\n"
+        "  --chin 0xADDR   CHIN intercept address (default 0x%04X)\n"
+        "  --cout 0xADDR   COUT intercept address (default 0x%04X)\n"
+        "  --crlf 0xADDR   CRLF intercept address (default 0x%04X)\n"
+        "  --entry 0xADDR  Program entry address (default 0x%04X)\n"
         "  -h, --help      Show this help message\n"
         "  -v, --version   Show version\n",
-        prog);
+        prog, chin_addr, cout_addr, crlf_addr, entry_addr);
 }
 
 /*
