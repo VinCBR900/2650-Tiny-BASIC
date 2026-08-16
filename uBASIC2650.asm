@@ -1,7 +1,7 @@
 ; uBASIC2650.asm       Tiny BASIC interpreter for Signetics 2650
-; Version: v4.7
+; Version: v4.9
 ; By Vincent Crabtree, 2026.  MIT License
-; Date:    2026-08-10
+; Date:    2026-08-16
 ;
 ; Target:  Standalone (no PIPBUG ROM). Code ORG 0. I/O routines embedded.
 ;          Single 8192-byte address space (2650 bits 15:13 always 0).
@@ -56,6 +56,41 @@
 ;     the existing PE_RAS_LIMIT=5 guard (?8 ERR_NEST).
 ;
 ; RECENT CHANGE HISTORY
+;
+; V4.9 (2026-08-16) - ROMEND $0FDB
+;   - FIXED BUG-DL2-01: DELETE_LINE's shift-copy loop (DL2_LP) could exit up
+;     to ~128+ bytes early, corrupting the program store, whenever a delete
+;     forced the copy to cross a $xx00 address boundary while TMPL was still
+;     numerically far below PEL. Root cause: the loop's lo-byte end check did
+;     "SUBA,R0 PEL / BCFR,LT DL2_DONE", branching on the SIGNED condition
+;     code from the subtraction. TMPL/PEL are unsigned address bytes, so a
+;     case like TMPL=$00, PEL=$9F (difference > 127) wraps the signed result
+;     positive (CC=GT), tripping the exit early instead of continuing the
+;     copy. FIND_LINE/FIND_INS/STORE_LINE already use the correct pattern
+;     (TPSL $01 testing the carry flag) for equivalent unsigned pointer
+;     compares; DL2_LP alone used the raw signed CC. Fixed by matching the
+;     TPSL $01 pattern. Confirmed via memory-dump diffing: pre-fix, deleting
+;     a line in a >255-byte program whose shift crossed a page boundary
+;     left stale bytes from the deleted line's old content and silently
+;     dropped the program's last line; post-fix, verified correct across
+;     delete/replace/insert stress tests spanning the boundary, and full
+;     showcase run (incl. Mandelbrot) is byte-for-byte identical to V4.8.
+;
+; V4.8 (2026-08-15) - ROMEND $0FD9
+;   - Added PRINT HEX$(n): unsigned 4-digit hex of n truncated to 16 bits.
+;     Dispatch hook is a single instruction in DP_ITEM (BCFR,EQ DP_TAB ->
+;     BCFA,EQ DP_NOTC, +1 byte); DP_NOTC/DP_HEXITEM/PRINT_HEX_BYTE live in
+;     the free ROM slack between COUT and the ORG 4096 RAM boundary (was
+;     104 bytes free, 65 used) -- the 18-byte gap before the hard ORG $286
+;     CHIN boundary was too small, same constraint as the V4.5 PEEK/USR
+;     relocation below. Nibble->ASCII done inline in PRINT_HEX_BYTE
+;     (not a shared sub-call) to keep RAS depth equal to DP_CHAR's
+;     (PRINT_HEX_BYTE -> COUT -> DLAY, 2 deep) rather than adding a third
+;     nested level. Verified in simulator: HEX$(255/0/4660/65535/-1/-32768)
+;     all correct; HEX$ nested in IF-THEN and FOR-NEXT; bare variable H
+;     still parses correctly (DP_BACKUP fallback); full showcase run
+;     (unlimited instructions) byte-for-byte identical to V4.7 pre-Mandelbrot
+;     and through the full Mandelbrot render.
 ;
 ; V4.7 (2026-08-10) - ROMEND $0F98 
 ;   - PUSH_RET helper: R0=lo,R1=hi 16-bit return-address push onto SWBASE,
@@ -427,93 +462,6 @@ DO_END:
         ZBRR *VCLR_RUNFLG               ; tail call
 
 ; =============================================================================
-;  DO_PRINT / PRTSTR -- Print statement and NUL-terminated string helper
-; Syntax: PRINT [item {; item}]
-;   item = "string" | expr | TAB(n) | CHR$(n)
-;   Trailing ; suppresses newline.
-; In:  IP -> first char after PRINT keyword
-; Out: text written to COUT; IP advanced past statement
-; Clobbers: R0, R1, EXPH, EXPL, TMPH, TMPL, NEGFLG, LNUMH, LNUML, SC0, SC1
-DO_PRINT:
-        ZBSR *VWSKIP  
-        LODA,R0 *IPH
-        BCTA,EQ DP_NL
-
-DP_ITEM:
-        ZBSR *VWSKIP  
-        LODA,R0 *IPH
-        COMI,R0 DQ
-        BCTA,EQ DP_STRING
-        COMI,R0 'C'
-        BCFR,EQ DP_TAB          ; not 'C': forward to DP_TAB
-
-        ZBSR *VINC_IP  
-        LODA,R0 *IPH
-        COMI,R0 'H'
-        BCTR,EQ DP_CHAR
-
-DP_BACKUP:
-        ZBSR *VDEC_IP
-DP_EXPR:
-        ZBSR *VPARSE_EXPR  
-        BSTA,UN PRINT_S16
-        BCTR,UN DP_SEP
-
-DP_CHAR:
-        ZBSR *VEATWORD  
-        ZBSR *VPARSE_EXPR  
-        LODA,R0 EXPL
-        ZBSR *VCOUT  
-        BCTR,UN DP_SEP
-
-DP_TAB:
-        COMI,R0 'T'
-        BCFR,EQ DP_EXPR         ; not 'T': fall back to DP_EXPR
-        ZBSR *VINC_IP  
-        LODA,R0 *IPH
-        COMI,R0 'A'
-        BCFR,EQ DP_BACKUP
-        ZBSR *VEATWORD  
-        ZBSR *VPARSE_EXPR  
-        LODA,R1 EXPL
-        BCTR,EQ DP_SEP          ; TAB(0): skip
-TAB_LOOP:
-        ZBSR *VPRT_SPACE  
-        BDRR,R1 TAB_LOOP
-        ; fall through to DP_SEP
-
-DP_SEP:
-        ZBSR *VWSKIP  
-        LODA,R0 *IPH
-        COMI,R0 $3B             ; semicolon
-        BCTR,EQ DP_SEMI
-        ; fall through to DP_NL
-DP_NL:
-        BCTA,UN PRT_CRLF          ; tail call: return from DO_PRINT
-
-DP_SEMI:
-        ZBSR *VINC_IP  
-        ZBSR *VWSKIP  
-        LODA,R0 *IPH
-        RETC,EQ                 ; bail if NUL
-        BCTA,UN DP_ITEM
-
-DP_STRING:
-        ZBSR *VINC_IP  
-PRTSTR:
-        LODA,R0 *IPH
-        RETC,EQ                 ; NUL before closing ": bail
-        COMI,R0 DQ
-        BCTR,EQ DP_SCLS
-        ZBSR *VCOUT  
-        ZBSR *VINC_IP  
-        BCTR,UN PRTSTR
-
-DP_SCLS:
-        ZBSR *VINC_IP  
-        BCTR,UN DP_SEP
-
-; =============================================================================
 ;  DO_LET -- Variable assignment
 ; Syntax: LET V = expr   (also handles bare "V = expr" via SE_BAREASS)
 ; In:  IP -> variable letter
@@ -680,12 +628,6 @@ DRT_GO:
         RETC,UN                 ; Return                                [1B]
 
 ; =============================================================================
-; (DO_PEEK_FUNC/DO_USR_FUNC relocated post-COUT in v4.5, alongside
-;  DO_RND_FUNC - see that routine's header for why this constrained
-;  pre-CHIN zone is the wrong place for functions needing more bytes for
-;  the FUNCCONT-01 paren-bounding fix.)
-
-; =============================================================================
 ;  SET_TMP_PROG -- Set TMPH:TMPL = PROG base address
 ; Clobbers: R0
 SET_TMP_PROG:
@@ -693,70 +635,6 @@ SET_TMP_PROG:
         STRA,R0 TMPH
         LODI,R0 >PROG
         STRA,R0 TMPL
-        RETC,UN
-
-; =============================================================================
-; Character IO
-; 110 Baud teletype from PIPBUG V1 as per Signetics M20 application note
-; CHIN must be at $286, COUt must be at $2B4 for Pipbug 1 compatability
-        ORG $286
-CHIN:
-        ZBSR *VRND_SHUFFLE
-        PPSL PSW_RS
-        LODI,R0 $80
-;        WRTC,R0        ; make space for shuffle
-        LODI,R1 0
-        LODI,R2 8
-;ACHI:   
-        SPSU
-        BCTR,LT CHIN
-        EORZ,R0
-;        WRTC,R0        ; make space for shuffle
-        BSTR,UN DLY
-BCHI:
-        BSTR,UN DLAY
-        SPSU
-        ANDI,R0 $80
-        RRR,R1
-        IORZ,R1
-        STRZ,R1
-        BDRR,R2 BCHI
-        BSTR,UN DLAY
-        ANDI,R1 $7f
-        LODZ,R1
-        CPSL PSW_RS + PSW_WC
-        RETC,UN
-; Delay for 1 bit time
-DLAY:
-        EORZ,R0
-        BDRR,R0 $
-        BDRR,R0 $
-DLY:
-        BDRR,R0 $
-        LODI,R0 $e5
-        BDRR,R0 $
-        RETC,UN
-
-COUT:
-        PPSL PSW_RS
-        PPSU PSW_FLAG
-        STRZ,R2
-        LODI,R1 8
-        BSTR,UN DLAY
-        BSTR,UN DLAY
-        CPSU PSW_FLAG
-ACOU:
-        BSTR,UN DLAY
-        RRR,R2
-        BCTR,LT ONE
-        CPSU PSW_FLAG
-ONE:
-        PPSU PSW_FLAG
-;ZERO:
-        BDRR,R1 ACOU
-        BSTR,UN DLAY
-        PPSU PSW_FLAG
-        CPSL PSW_RS
         RETC,UN
 
 ; =============================================================================
@@ -878,6 +756,232 @@ DO_INPUT:
         ZBSR *VSET_IP_IBUF                ; IPH:IPL = IBUF
         BSTA,UN PARSE_S16                ; [+1]
         BCTA,UN DL_STORE
+
+; filler and exception text for for PRINT_S16
+MSG_MIN:
+        db "32768",0
+
+; =============================================================================
+; Character IO
+; 110 Baud teletype from PIPBUG V1 as per Signetics M20 application note
+; CHIN must be at $286, COUt must be at $2B4 for Pipbug 1 compatability
+        ORG $286
+CHIN:
+        ZBSR *VRND_SHUFFLE
+        PPSL PSW_RS
+        LODI,R0 $80
+;        WRTC,R0        ; make space for shuffle
+        LODI,R1 0
+        LODI,R2 8
+;ACHI:   
+        SPSU
+        BCTR,LT CHIN
+        EORZ,R0
+;        WRTC,R0        ; make space for shuffle
+        BSTR,UN DLY
+BCHI:
+        BSTR,UN DLAY
+        SPSU
+        ANDI,R0 $80
+        RRR,R1
+        IORZ,R1
+        STRZ,R1
+        BDRR,R2 BCHI
+        BSTR,UN DLAY
+        ANDI,R1 $7f
+        LODZ,R1
+        CPSL PSW_RS + PSW_WC
+        RETC,UN
+; Delay for 1 bit time
+DLAY:
+        EORZ,R0
+        BDRR,R0 $
+        BDRR,R0 $
+DLY:
+        BDRR,R0 $
+        LODI,R0 $e5
+        BDRR,R0 $
+        RETC,UN
+
+COUT:
+        PPSL PSW_RS
+        PPSU PSW_FLAG
+        STRZ,R2
+        LODI,R1 8
+        BSTR,UN DLAY
+        BSTR,UN DLAY
+        CPSU PSW_FLAG
+ACOU:
+        BSTR,UN DLAY
+        RRR,R2
+        BCTR,LT ONE
+        CPSU PSW_FLAG
+ONE:
+        PPSU PSW_FLAG
+;ZERO:
+        BDRR,R1 ACOU
+        BSTR,UN DLAY
+        PPSU PSW_FLAG
+        CPSL PSW_RS
+        RETC,UN
+
+; =============================================================================
+;  DO_PRINT / PRTSTR -- Print statement and NUL-terminated string helper
+; Syntax: PRINT [item {; item}]
+;   item = "string" | expr | TAB(n) | CHR$(n) | HEX$(n)
+;   Trailing ; suppresses newline. HEX$: see DP_NOTC (post-COUT zone).
+; In:  IP -> first char after PRINT keyword
+; Out: text written to COUT; IP advanced past statement
+; Clobbers: R0, R1, EXPH, EXPL, TMPH, TMPL, NEGFLG, LNUMH, LNUML, SC0, SC1
+DO_PRINT:
+        ZBSR *VWSKIP  
+        LODA,R0 *IPH
+        BCTA,EQ DP_NL
+
+DP_ITEM:
+        ZBSR *VWSKIP  
+        LODA,R0 *IPH
+        COMI,R0 DQ
+        BCTA,EQ DP_STRING
+        COMI,R0 'C'
+        BCFA,EQ DP_NOTC         ; not 'C': relay to DP_NOTC (post-COUT zone)
+
+        ZBSR *VINC_IP  
+        LODA,R0 *IPH
+        COMI,R0 'H'
+        BCTR,EQ DP_CHAR
+
+DP_BACKUP:
+        ZBSR *VDEC_IP
+DP_EXPR:
+        ZBSR *VPARSE_EXPR  
+        BSTA,UN PRINT_S16
+        BCTR,UN DP_SEP
+
+DP_CHAR:
+        ZBSR *VEATWORD  
+        ZBSR *VPARSE_EXPR  
+        LODA,R0 EXPL
+        ZBSR *VCOUT  
+        BCTR,UN DP_SEP
+
+DP_TAB:
+        COMI,R0 'T'
+        BCFR,EQ DP_EXPR         ; not 'T': fall back to DP_EXPR
+        ZBSR *VINC_IP  
+        LODA,R0 *IPH
+        COMI,R0 'A'
+        BCFR,EQ DP_BACKUP
+        ZBSR *VEATWORD  
+        ZBSR *VPARSE_EXPR  
+        LODA,R1 EXPL
+        BCTR,EQ DP_SEP          ; TAB(0): skip
+TAB_LOOP:
+        ZBSR *VPRT_SPACE  
+        BDRR,R1 TAB_LOOP
+        ; fall through to DP_SEP
+
+DP_SEP:
+        ZBSR *VWSKIP  
+        LODA,R0 *IPH
+        COMI,R0 $3B             ; semicolon
+        BCTR,EQ DP_SEMI
+        ; fall through to DP_NL
+DP_NL:
+        BCTA,UN PRT_CRLF          ; tail call: return from DO_PRINT
+
+DP_SEMI:
+        ZBSR *VINC_IP  
+        ZBSR *VWSKIP  
+        LODA,R0 *IPH
+        RETC,EQ                 ; bail if NUL
+        BCTA,UN DP_ITEM
+
+DP_STRING:
+        ZBSR *VINC_IP  
+PRTSTR:
+        LODA,R0 *IPH
+        RETC,EQ                 ; NUL before closing ": bail
+        COMI,R0 DQ
+        BCTR,EQ DP_SCLS
+        ZBSR *VCOUT  
+        ZBSR *VINC_IP  
+        BCTR,UN PRTSTR
+
+DP_SCLS:
+        ZBSR *VINC_IP  
+        BCTR,UN DP_SEP
+
+; =============================================================================
+;  DP_NOTC / DP_HEXITEM / PRINT_HEX_BYTE -- HEX$(n) support for DO_PRINT
+; Relocated here (post-COUT free zone) because the pre-CHIN gap before
+; ORG $286 (18 bytes) is too small to hold this inline, same constraint
+; noted in the V4.5 PEEK/USR relocation above. Reached from DP_ITEM via
+; BCFA,EQ DP_NOTC (was BCFR,EQ DP_TAB); falls back out to the original
+; DP_TAB/DP_BACKUP/DP_SEP labels via absolute branches since they're now
+; far away. ZBSR/ZBRR through the page-zero vector table work identically
+; regardless of caller address, so no vector-table changes were needed.
+; Syntax: HEX$(n) -- prints n truncated to 16 bits as 4 unsigned hex digits.
+;
+; DP_NOTC
+; In:  R0 = peeked char (already known != 'C'), IP -> that char (unconsumed)
+; Out: dispatches to DP_HEXITEM ("HE" prefix), or falls back to DP_TAB
+; Clobbers: R0
+DP_NOTC:
+        COMI,R0 'H'
+        BCFA,EQ DP_TAB          ; not 'H' either: back to original TAB/expr check
+        ZBSR *VINC_IP  
+        LODA,R0 *IPH
+        COMI,R0 'E'
+        BCTR,EQ DP_HEXITEM      ; "HE" -> HEX$
+        BCTA,UN DP_BACKUP       ; 'H' but not "HE": back up, treat as expr (e.g. var H)
+
+; DP_HEXITEM
+; In:  IP -> "X$(...)" remainder of HEX$ keyword
+; Out: 4 hex digits written to COUT; IP advanced past ")"; jumps to DP_SEP
+; Clobbers: R0, R1, EXPH, EXPL, TMPH, TMPL, SC0, SC1 (via VPARSE_EXPR)
+DP_HEXITEM:
+        ZBSR *VEATWORD           ; eat rest of "X$"
+        ZBSR *VPARSE_EXPR  
+        LODI,R0 '$'                    ; print dollar
+        ZBSR *VCOUT  
+        LODA,R0 EXPH
+        BSTR,UN PRINT_HEX_BYTE
+        LODA,R0 EXPL
+        BSTR,UN PRINT_HEX_BYTE
+        BCTA,UN DP_SEP
+
+; PRINT_HEX_BYTE
+; Prints R0 as two ASCII hex digits, high nibble first.
+; In:  R0 = byte value
+; Out: two hex chars written to COUT
+; Clobbers: R0, R1, CC
+; Note: nibble->ASCII done inline (not a shared sub-call) to keep this at the
+; same RAS depth as DP_CHAR (PRINT_HEX_BYTE -> COUT -> DLAY, 2 deep) rather
+; than adding a third nested level.
+PRINT_HEX_BYTE:
+        STRZ,R1                  ; R1 = R0 (save original byte)
+        RRR,R0
+        RRR,R0
+        RRR,R0
+        RRR,R0                   ; nibble-swap: hi nibble now in low 4 bits
+        ANDI,R0 $0F
+        ADDI,R0 $30
+        COMI,R0 $3A
+        BCTR,LT PHB_OUT1
+        ADDI,R0 7
+PHB_OUT1:
+        ZBSR *VCOUT
+        LODZ,R1                  ; R0 = R1 (original byte back)
+        ANDI,R0 $0F
+        ADDI,R0 $30
+        COMI,R0 $3A
+        BCTR,LT PHB_OUT2
+        ADDI,R0 7
+PHB_OUT2:
+;        ZBSR *VCOUT
+;        RETC,UN
+        ZBRR *VCOUT
 
 ; =============================================================================
 ;  DO_GOSUB -- Subroutine call
@@ -1404,7 +1508,8 @@ DL2_LP:
         BCTR,LT DL2_MOV
         LODA,R0 TMPL
         SUBA,R0 PEL
-        BCFR,LT DL2_DONE                 ; TMPL >= PEL (no borrow): at or past end
+        TPSL $01                         ; BUG-DL2-01 FIX: unsigned compare via carry,
+        BCTR,EQ DL2_DONE                 ; not signed CC (carry set = no borrow = TMPL >= PEL)
 DL2_MOV:
         BSTA,UN MEMCPY
         BCTR,UN DL2_LP
@@ -2581,8 +2686,7 @@ MIN_LP:
         RETC,EQ                 ; return on null
         ZBSR *VCOUT             ; Print
         BCTR,UN MIN_LP
-MSG_MIN:
-        db "32768",0
+
 DO_NEG:
         BSTA,UN NEG_EXP_BODY    ; Negate and fall into PS_NZ
 PS_NZ:
@@ -3037,7 +3141,7 @@ CLR_EXP:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V4.7", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V4.6", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword dispatch table
 ; Format: [c1][c2][c3][hi][lo]  NUL-terminated on c1, followed by no match handler
