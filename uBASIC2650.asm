@@ -3141,7 +3141,7 @@ CLR_EXP:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V4.6", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V4.9", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword dispatch table
 ; Format: [c1][c2][c3][hi][lo]  NUL-terminated on c1, followed by no match handler
@@ -3395,7 +3395,7 @@ PROG:
         DB 0,224,"PRINT ",$22,"AND(12,10)=",$22,$3B,"AND(12,10)",$3B,$22,"  OR(12,10)=",$22,$3B,"OR(12,10)",$0D  ; 224 PRINT "AND(12,10)=";AND(12,10);"  OR(12,10)=";OR(12,10)
         DB 0,226,"PRINT ",$22,"XOR(12,10)=",$22,$3B,"XOR(12,10)",$3B,$22,"  NOT(0)=",$22,$3B,"NOT(0)",$0D  ; 226 PRINT "XOR(12,10)=";XOR(12,10);"  NOT(0)=";NOT(0)
         DB 0,228,"POKE 8000,42",$0D                                             ; 228 POKE 8000,42
-        DB 0,230,"PRINT ",$22,"PEEK(8000)=",$22,$3B,"PEEK(8000)",$0D            ; 230 PRINT "PEEK(8000)=";PEEK(8000)
+        DB 0,230,"PRINT ",$22,"PEEK(8000)=",$22,$3B,"HEX$(PEEK(8000))",$0D            ; 230 PRINT "PEEK(8000)=";PEEK(8000)
         DB 0,232,"PRINT ",$22,"RND(100)=",$22,$3B,"RND(100)",$3B,$22,"  RND(100)=",$22,$3B,"RND(100)",$0D  ; 232 PRINT "RND(100)=";RND(100);"  RND(100)=";RND(100)
         DB 0,234,"PRINT ",$22,"",$22,$0D                                        ; 234 PRINT ""
         DB 0,236,"PRINT ",$22,"--- LIST 40,60 ---",$22,$0D                      ; 236 PRINT "--- LIST 40,60 ---"
