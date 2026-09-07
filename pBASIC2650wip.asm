@@ -1,22 +1,11 @@
 ; pBASIC2650.asm       Minimal PoC Tiny BASIC interpreter for Signetics 2650
-; Version: v0.11
-; Forked from: uBASIC2650.asm v4.9 (full pre-fork history kept below)
+; Version: v1.0
 ; By Vincent Crabtree, 2026.  MIT License
-; Date:    2026-09-07
 ;
 ; Target:  Standalone (no PIPBUG ROM). Code ORG 0. I/O routines embedded.
 ;          Single 8192-byte address space (2650 bits 15:13 always 0).
-;          CHIN/COUT logic copied verbatim from PIPBUG, but v0.5 removed
-;          the ORG $286 pin that kept them at PIPBUG's own addresses -
-;          it cost 168 bytes of pure padding once enough code was cut
-;          that the gap grew that large. Their real addresses now float
-;          and must be read from the assembled .LST file before testing.
 ;
-; Goal:    Strip uBASIC2650 down to pBASIC65c02's bare-minimum PoC feature
-;          set (minimal line entry, flat math precedence, only = and <
-;          relops, 1-char+letter statement dispatch, append-only line
-;          handling). Target under 2KB ROM. See plan.md for the staged
-;          approach.
+; Goal:    Minimal Tiny BASIC for Signetics 2650 target <2kbyte
 ;
 ; Assembler: asm2650.c v1.16  Simulator: pipbug_wrap.c
 ; Build:
@@ -25,9 +14,6 @@
 ;   ./asm2650 pBASIC2650.asm pBASIC2650.hex
 ;   grep -n "^CHIN \|^COUT " pBASIC2650.LST   -- find their real addresses
 ;   ./pipbug_wrap --entry 0 --chin 0x<real> --cout 0x<real> --crlf 0x7fff pBASIC2650.hex
-;
-; IMPORTANT: --crlf must be harmless NOT old PIPBUG $008A.
-;       Wrong --crlf fires mid-instruction, corrupting RAS and breaking LIST/RUN
 ;
 ;        CC SEMANTICS (2650 ALU)
 ;   ADD/SUB: result<0 -> LT   result>0 -> GT   result=0 -> EQ
@@ -64,21 +50,10 @@
 ;        KNOWN LIMITATIONS
 ; Deliberate size/simplicity tradeoffs from the pBASIC65c02-style minimal
 ; design goal (see "Goal:" above), not oversights, unless marked BUG.
-; Spelled out precisely because several are easy to trip over silently -
-; the interpreter gives a misleading error, or no error at all, rather
-; than explaining the constraint itself.
 ;
-;   PARENTHESES: exactly 1 level of TRUE nesting is safe, verified
-;     empirically and identical in both interactive and mid-RUN contexts
-;     (v0.5). A paren appearing INSIDE another still-open paren's operand
-;     - "((1+2))", "(1+(2+3))" - always triggers ERR_NEST (?8), regardless
-;     of how much RAS budget looks free on paper: the guard checks at
-;     paren-open time, before the cost of evaluating the inner atom is
-;     known. This does NOT limit how many SEPARATE parenthesized groups
-;     one expression can have at the SAME level, joined by operators -
-;     "(A+B)-(C+D)+(E+F)" is unrestricted, since each group opens and
-;     fully closes before the next one starts. Only genuine nesting (one
-;     open paren containing another) is capped at 1 level.
+;   PARENTHESES: exactly 1 level of nestingallowed. A paren appearing INSIDE
+;     another open paren's operand "((1+2))", "(1+(2+3))" triggers ERR_NEST.
+;     SEPARATE parenthesized groups at SAME level allowed "(A+B)-(C+D)+(E+F)"
 ;
 ;   PRECEDENCE: flat, left to right - all six operators (+ - * / = <) sit
 ;     at ONE precedence level, no BODMAS/PEMDAS (v0.5). "1+2*3" evaluates
@@ -92,68 +67,28 @@
 ;   STATEMENT DISPATCH matches ONLY the first character of a line against
 ;     a 9-entry table (A/E/G/I/L/N/P/R/W for ASK/END/GOTO/IF/LIST/NEW/
 ;     PRINT/RUN/WR - see TOK_CHARS, v0.3). It first peeks the 2nd
-;     character and requires it to be A LETTER - not the specific letter
-;     the real keyword has there - to tell a keyword from a bare "V=expr"
-;     assignment. Consequences:
-;       - Single-letter commands never work - typing just "P" doesn't
-;         run PRINT (minimum valid input is 2 letters).
-;       - Any 2+ letter word starting with a keyword's first letter
-;         dispatches to that keyword and consumes the rest of the
-;         contiguous run of letters as if it were that keyword's own
-;         text, discarding whatever follows unread - "GOOD 5" runs GOTO
-;         (eating "GOOD" whole, then choking on "5"), "LOOP" runs LIST.
-;         Accepted tradeoff, not a bug (v0.3).
-;       - 2+ letter ABBREVIATIONS of a real keyword work correctly for
-;         the same reason - "PR" and "GO" dispatch exactly like "PRINT"
-;         and "GOTO", since only the first letter is actually checked.
+;     character and requires it to be any LETTER
 ;
-;   LINE STORAGE IS APPEND-ONLY (v0.2, TRY_STORE_LINE): a typed line
-;     number is accepted only if it's greater than every stored line (a
-;     plain append) or EXACTLY equal to the current highest stored line -
-;     which either replaces that line's body, or deletes it outright if
-;     the typed body is empty (just the number, then Enter). Anything
-;     else - a number before or between existing lines, or an exact match
-;     on a non-last line - is rejected as a syntax error (?0), not
-;     silently ignored. No inserting into the middle, no renumbering, no
-;     deleting an arbitrary (non-last) line; NEW is the only way to clear
-;     the whole program and start fresh.
+;   LINE STORAGE IS APPEND-ONLY - typed line number is accepted only if 
+;     it's greater than every stored line (a plain append) or EXACTLY
+;     equal to the current highest stored line - this replaces or deletes 
+;     it outright if empty.
 ;
-;   NO INPUT LENGTH VALIDATION: GETLINE writes into IBUF (64 bytes) with
-;     no bounds check at all - it keeps accepting characters until
-;     CR/LF/NUL regardless of how many have already been written. A line
-;     longer than 64 characters silently overflows IBUF into whatever RAM
-;     follows it. A real hazard, not just a quirk - keep typed lines well
-;     under 64 characters.
-;
-;   NO FOR/NEXT, NO GOSUB/RETURN: loops are GOTO-only (with IF for
-;     conditional exit); no subroutines. IF itself has no THEN or ELSE -
-;     it's "IF cond stmt", one trailing statement; chaining "IF a IF b
-;     stmt" acts as AND (both must hold to reach stmt); no OR.
-;
-;   NO MULTI-STATEMENT LINES: no ':' separator (COLON-01 below) - always
-;     one statement per line.
+;   NO INPUT LENGTH VALIDATION: GETLINE writes into IBUF without bounds
+;     check, accepting characters until CR/LF/NUL. Long lines will crash.
 ;
 ;   VARIABLES: 26 total, single uppercase letter A-Z only, each a 16-bit
 ;     signed integer. No arrays. No string variables - string LITERALS
 ;     work for PRINT, but can't be stored in or read back from a
 ;     variable.
 ;
-;   NO FUNCTIONS: no ABS/SIN/RND/etc. - FUNC_TAB was removed entirely
-;     (v0.1). No CHR$/HEX$/TAB either (v0.1c); WR writes one raw byte
-;     value in their place.
+;   NO FUNCTIONS: no ABS/SIN/RND/etc.
 ;
-;        KNOWN OPEN ITEMS
-;   COLON-01: ':' multi-statement not supported - likely never due to RAS.
-;   OPT-16:   MUL16/DIV16 uses O(N) loop for size - O(16) bit-serial deferred.
+; VERSION HISTORY (pBASIC2650)
 ;
-;        KNOWN BUGS (genuinely wrong, not a design tradeoff - pending fix)
-; None currently known. The last two entries here (MUL16's wrong-product
-; bug and the -32768 overflow edge case in both MUL16 and DIV16) were
-; fixed in v0.10 and v0.11 respectively - see PORT HISTORY below.
+; V1.0  (Sep 2026) - Code Golf - ROMEND $7FB
 ;
-; PORT HISTORY (pBASIC2650)
-;
-; v0.11 (2026-09-07) - -32768 overflow bug fixed in both MUL16 and DIV16
+; v0.11 (Sep 2026) - -32768 overflow bug fixed in both MUL16 and DIV16
 ;   - Root cause: TMPH:TMPL holds an unsigned MAGNITUDE after ABS_TMP (the
 ;     sign is extracted into NEGFLG separately), so it can legitimately
 ;     range 0-65535 - but ABS_TMP's two's-complement negate can't
@@ -213,7 +148,7 @@
 ;     bytes - a genuine absolute-vs-relative cost, not padding). No
 ;     bugs currently known - see KNOWN BUGS above.
 ;
-; v0.10 (2026-09-07) - MUL16 overflow bug fixed (was in KNOWN BUGS)
+; v0.10 (Sep 2026) - MUL16 overflow bug fixed (was in KNOWN BUGS)
 ;   - Root cause: MU_LP's inline 16-bit decrement of the loop counter
 ;     TMPH:TMPL tested the wrong condition for "did the low byte borrow".
 ;     It branched directly off the CC left by "SUBI,R0 1 / STRA,R0 TMPL"
@@ -262,7 +197,7 @@
 ;     identically on the unmodified v0.9 file).
 ;   - ROMEND $0823 -> $0825 (2083 -> 2085 bytes), +2.
 ;
-; v0.9 (2026-09-05) - PRINT_S16 replaced with a flat power-of-10 loop
+; v0.9 (Sep 2026]) - PRINT_S16 replaced with a flat power-of-10 loop
 ;   - Replaced the SW-stack recursive digit printer (PREC/PR_LP/PR_REC/
 ;     SWRETURN/PS_DONE, plus the MSG_MIN "32768" literal for the -32768
 ;     special case) with a flat repeated-subtraction loop against a
@@ -337,7 +272,7 @@
 ;     landing slightly differently than estimated. 35 bytes still needed
 ;     to clear the under-2KB ($0800) target.
 ;
-; v0.8 (2026-09-05) - Size pass: CMP_TMP_PE extraction, PRT_BS removal
+; v0.8 (Sep 2026) - Size pass: CMP_TMP_PE extraction, PRT_BS removal
 ;   - Found via a duplicate-byte-sequence scan of the assembled ROM:
 ;     six near-identical inlined copies of the same 16-bit "is TMP at or
 ;     past PE" compare (DR_LP, TRY_STORE_LINE x2, FIND_LINE, FIND_INS,
@@ -369,7 +304,7 @@
 ;     smaller, despite the v0.7 correctness fix's own +26-byte cost -
 ;     193 bytes still needed to clear the under-2KB ($0800) target.
 ;
-; v0.7 (2026-09-05) - PAREN-NEST-02: fix wrong-operator bug in EXPR
+; v0.7 (Sep 2026) - PAREN-NEST-02: fix wrong-operator bug in EXPR
 ;   - Root cause: OPS_HIT stashes the matched operator's handler address
 ;     in the flat GOTOH:GOTOL cells, then calls EXPR_ATOM to parse the
 ;     right operand, then jumps through *GOTOH. If that right operand is
@@ -404,7 +339,7 @@
 ;     "(A+B)-(A-B)*2") all compute correctly under flat left-to-right
 ;     precedence.
 ;
-; v0.6 (2026-09-05) - Size pass: dead-code cull, single-caller vector
+; v0.6 (Sep 2026) - Size pass: dead-code cull, single-caller vector
 ;   collapse, and RAS-01 (Mandelbrot parenthesis-crash) fix.
 ;   - Deleted GETCI_UC and TMP_TO_EXP16: both orphaned (zero real call
 ;     sites; their "N sites" vector comments were stale). CUR_TO_EXP16
@@ -435,7 +370,7 @@
 ;   - Corrected two stale comments (top-of-file RAS budget note, REC-01)
 ;     that still said SP>=5/PE_RAS_LIMIT=5; it's been 6 since v0.5.
 ;
-; v0.5 (2026-08-30/31) - Stage 5: flatten precedence (Reading A)
+; v0.5 (Aug 2026) - Stage 5: flatten precedence (Reading A)
 ;   - Replaced the multi-tier PARSE_EXPR/EAM_ATOM/EAM_HI/EAM_LO_LOOP + SW-
 ;     stack return trampolining (PUSH_RET/PARSER_RET/SWRETURN dance) with
 ;     a flat EXPR/EXPR_ATOM/EXPR_LOOP: all six operators (+-*/=<) sit at
@@ -529,7 +464,7 @@
 ;     over) - Stage 6's dedicated golf pass is the next and likely last
 ;     opportunity to close that gap.
 ;
-; v0.4 (2026-08-30) - Stage 4: narrow relops to = and <, plus a golf pass
+; v0.4 (Aug 2026) - Stage 4: narrow relops to = and <, plus a golf pass
 ;   - PARSE_RELOP: was a loop accumulating '<'/'='/'>' into a 3-bit mask
 ;     (6 relops: = < > <= >= <>). Now matches only '=' or '<' directly;
 ;     RELOP is a plain 0/1 flag, no mask or loop needed. Anything else
@@ -569,7 +504,7 @@
 ;     the relop narrowing itself, 11 from the golf pass). Running total
 ;     since baseline: 4048 -> 2790, -1258 bytes (31%).
 ;
-; v0.3 (2026-08-30) - Stage 3: single-char + letter statement dispatch
+; v0.3 (Aug 2026) - Stage 3: single-char + letter statement dispatch
 ;   - Replaced KW_TAB's 2-3 char match (MATCH_KW, stride 5) with TOK_CHARS
 ;     (stride 3, 1-char match) - ported from pBASIC65c02.asm's
 ;     MATCH_DISPATCH/TOK_CHARS/SKIP_KW. Peeks the 2nd character first: if
@@ -614,7 +549,7 @@
 ;   - ROM: ROMEND $0B17 (2839) -> $0B00 (2816 bytes), -23 bytes. Running
 ;     total since baseline: 4048 -> 2816, -1232 bytes (30%).
 ;
-; v0.2 (2026-08-29) - Stage 2: minimal line handling
+; v0.2 (Aug 2026) - Stage 2: minimal line handling
 ;   - TRY_STORE_LINE rewritten append-only (ported from pBASIC65c02.asm's
 ;     EDITLN): a line number is accepted only if greater than every stored
 ;     line (append) or exactly equal to the current LAST line (in-place
@@ -665,7 +600,7 @@
 ;   - ROM: ROMEND $0BD9 (3033) -> $0B18 (2840 bytes), -193 bytes. Running
 ;     total since baseline: 4048 -> 2840, -1208 bytes (30%).
 ;
-; v0.1c (2026-08-29) - Stage 1c: narrow PRINT, add WR (resolves one of the
+; v0.1c (Aug 2026) - Stage 1c: narrow PRINT, add WR (resolves one of the
 ;   two items flagged unassigned at the end of v0.1b)
 ;   - Removed PRINT's CHR$(n)/TAB(n)/HEX$(n) special-casing (DP_CHAR, the
 ;     DP_TAB TAB() loop, DP_NOTC/DP_HEXITEM/PRINT_HEX_BYTE). DP_ITEM no
@@ -690,7 +625,7 @@
 ;   - Verified: assembles 0 errors; showcase runs correctly end to end,
 ;     including the WR-based "ABC" demo and a full Mandelbrot render.
 ;
-; v0.1b (2026-08-29) - Stage 1b: cut statements, LIST range; rename INPUT
+; v0.1b (Aug 2026) - Stage 1b: cut statements, LIST range; rename INPUT
 ;   - Removed FOR/NEXT (DO_FOR, DO_NEXT/DN_POP_EMPTY, FORSP/FORBASE,
 ;     GOTOFLG's "$03 direct NLP" dispatch case), GOSUB/RETURN (DO_GOSUB,
 ;     DO_RETURN/DRT_GO, SWSP/GSBASE, GOTOFLG's "$02" case), POKE, REM
@@ -727,9 +662,8 @@
 ;     question on which stage these land in).
 ;   - Verified: assembles 0 errors; showcase runs correctly end to end.
 ;
-; v0.1 (2026-08-29) - Stage 1a: cut all functions
-;   - Forked from uBASIC2650.asm v4.9.
-;   - Removed all 9 functions (ABS, AND, NEG, NOT, OR, PEEK, RND, USR, XOR)
+; v0.1 (Aug 2026) - Initial fork from uBASIC2650.asm v4.9
+;   - Stage 1a: cut functions (ABS, AND, NEG, NOT, OR, PEEK, RND, USR, XOR)
 ;     and their FUNC_TAB dispatch: DO_ABS_FUNC, DO_AND_FUNC/DO_OR_FUNC/
 ;     DO_XOR_FUNC (stub entries only -- the P2A_ANDOP/OROP/XOROP bodies
 ;     inside PARSE_2ARGS are left in place as dead code for now, since
@@ -767,105 +701,6 @@
 ;     pipbug_wrap through the Mandelbrot finale with output unchanged
 ;     apart from the removed FUNCTIONS section.
 ;
-; -----------------------------------------------------------------------
-; PRE-FORK CHANGE HISTORY (uBASIC2650, v4.9 and earlier)
-; -----------------------------------------------------------------------
-;
-; V4.9 (2026-08-16) - ROMEND $0FD0, 48 bytes Free
-;   - FIXED BUG-DL2-01: DELETE_LINE's shift-copy loop (DL2_LP) could exit up
-;     to ~128+ bytes early, corrupting the program store, whenever a delete
-;     forced the copy to cross a $xx00 address boundary while TMPL was still
-;     numerically far below PEL. Root cause: the loop's lo-byte end check did
-;     "SUBA,R0 PEL / BCFR,LT DL2_DONE", branching on the SIGNED condition
-;     code from the subtraction. TMPL/PEL are unsigned address bytes, so a
-;     case like TMPL=$00, PEL=$9F (difference > 127) wraps the signed result
-;     positive (CC=GT), tripping the exit early instead of continuing the
-;     copy. FIND_LINE/FIND_INS/STORE_LINE already use the correct pattern
-;     (TPSL $01 testing the carry flag) for equivalent unsigned pointer
-;     compares; DL2_LP alone used the raw signed CC. Fixed by matching the
-;     TPSL $01 pattern. Confirmed via memory-dump diffing: pre-fix, deleting
-;     a line in a >255-byte program whose shift crossed a page boundary
-;     left stale bytes from the deleted line's old content and silently
-;     dropped the program's last line; post-fix, verified correct across
-;     delete/replace/insert stress tests spanning the boundary, and full
-;     showcase run (incl. Mandelbrot) is byte-for-byte identical to V4.8.
-;
-; V4.8 (2026-08-15) - ROMEND $0FD9
-;   - Added PRINT HEX$(n): unsigned 4-digit hex of n truncated to 16 bits.
-;     Dispatch hook is a single instruction in DP_ITEM (BCFR,EQ DP_TAB ->
-;     BCFA,EQ DP_NOTC, +1 byte); DP_NOTC/DP_HEXITEM/PRINT_HEX_BYTE live in
-;     the free ROM slack between COUT and the ORG 4096 RAM boundary (was
-;     104 bytes free, 65 used) -- the 18-byte gap before the hard ORG $286
-;     CHIN boundary was too small, same constraint as the V4.5 PEEK/USR
-;     relocation below. Nibble->ASCII done inline in PRINT_HEX_BYTE
-;     (not a shared sub-call) to keep RAS depth equal to DP_CHAR's
-;     (PRINT_HEX_BYTE -> COUT -> DLAY, 2 deep) rather than adding a third
-;     nested level. Verified in simulator: HEX$(255/0/4660/65535/-1/-32768)
-;     all correct; HEX$ nested in IF-THEN and FOR-NEXT; bare variable H
-;     still parses correctly (DP_BACKUP fallback); full showcase run
-;     (unlimited instructions) byte-for-byte identical to V4.7 pre-Mandelbrot
-;     and through the full Mandelbrot render.
-;
-; V4.7 (2026-08-10) - ROMEND $0F98 
-;   - PUSH_RET helper: R0=lo,R1=hi 16-bit return-address push onto SWBASE,
-;     replacing the repeated LODI/STRA x2 idiom used before every ZBRR.
-;   - BUG: indexed autoincrement STRA (abs,R3+) only exists for R0 on
-;     the 2650 -- STRA,R1 abs,R3+ silently assembles identical to STRA,R0
-;     (same opcode byte) and does NOT store R1. PUSH_RET uses LODZ,R1
-;     (R0=R1) before the second store to work around this.
-;   - Added ^ (power) operator: CHECK_POW hook, called after every atom-
-;     fetch returns (8 sites: EAM0_RET/EAM_P_RET/EAM_M_RET/MU_AT_RET/
-;     DV_AT_RET/MD_AT_RET/NEG_AT_RET/POS_AT_RET -- the last needed its own
-;     landing label, previously EAM_POS just reused PARSER_RET directly
-;     since unary + is a no-op). Left-associative (2^3^2 == (2^3)^2),
-;     binds tighter than */÷/% and looser than atoms; unary - binds
-;     tighter than ^ (-2^2 == (-2)^2 == 4). 0^0==1. Negative exponent ->
-;     ERR_OV ('9', new error code). 
-;   - FIXED print variable -32768 (e.g. 2^15), would hang. Root cause
-;     (BUG-MINLP-01): the -32768 special-case string-print loop (MIN_LP)
-;     used LODR,R0 MSG_MIN-1,R1+ to walk the "32768" literal -- but LODR
-;     has no indexed addressing on this CPU 
-;
-; V4.6 (2026-07-03) - 3879 bytes (ROMEND $0F27)
-;   - FIXED: FUNCATOM-01 - functions now work as non-leading atoms, e.g.
-;     "PRINT 10+ABS(A)" (previously only "PRINT ABS(A)+10" worked).
-;   - Added FT_SP/FT_STK/FT_SAVE_SP/FT_SAVE/FT_N/FT_R2SAVE (72 RAM bytes)
-;     and FUNC_EPILOG; PE_SAFE/EAM_ATOM/PE_NOFUNC/DO_END updated. 
-;
-; V4.5 (2026-06-30) - 3705 bytes
-;   - FIXED: Function parser tracking for trailing operators (e.g., ABS(-5)+10).
-;   - Relocated PEEK/USR/EXPH functions to optimize space post-COUT.
-;   - Integrated emulator SP-reset override fix in pipbug_wrap.c.
-;
-; V4.4 (2026-06-30) - 3636 bytes
-;   - FIXED: RND 16-bit seed rotation bug by correctly setting PSL WC bit.
-;   - FIXED: Subtraction left-operand dropping bug in EAM_MH_RET.
-;   - Unified 2-argument parsing for AND/OR/XOR/POKE/LIST to save ~25 bytes.
-;   - Deduplicated bare assignments (LET-less statements).
-;
-; V4.3 (2026-06-25) - 3672 bytes
-;   - FIXED: Nested operator precedence clobbering bug using SWBASE stack.
-;   - Added bitwise functions: AND(a,b), OR(a,b), XOR(a,b), NOT(a).
-;   - Rewrote default showcase program with an expanded Mandelbrot finale.
-;
-; V4.2 (2026-06-24) - 3485 bytes
-;   - Rewrote RDLINE using R3 as an IBUF offset optimization.
-;   - Merged sign-handling and addition paths into shared ADD16_SAVE_EXP.
-;   - Added optional line-range filtering to LIST [start,end].
-;
-; V4.0 - V4.1 (2026-06)
-;   - Implemented function evaluation table (ABS, NEG, PEEK, USR, RND).
-;   - FIXED: Signed subtraction boundary bug in line storage shift logic.
-;   - Added POKE statement support.
-;
-; V3.0 - V3.9 (2026-06)
-;   - Implemented recursive descent expression parser via software stack.
-;   - Added full FOR/NEXT (4-level stack) and GOSUB/RETURN (8-level stack).
-;   - Fixed critical memory layout aliasing and carry detection bugs.
-;
-; V2.3 - V2.8 (2026-05)
-;   - Initial optimization baseline with TAB(), CHR$(), and Mandelbrot demo.
-;
 ; =============================================================================
 
 ;  ASCII Defines
@@ -882,11 +717,7 @@ ERR_SYN         EQU '0'
 ERR_DIV_ZERO    EQU '2'
 ERR_OOM         EQU '3'
 ERR_VAR         EQU '4'
-; v0.1b: ERR_RET/ERR_FOR/ERR_NXT ('5'/'6'/'7') retired - GOSUB/RETURN and
-; FOR/NEXT are cut, so nothing raises them anymore.
 ERR_NEST        EQU '8'         ; Expression nesting too deep (RAS guard, v3.2 had '5')
-; v0.5: ERR_OV ('9') removed - it was CHECK_POW's negative-exponent error;
-; ^ is cut along with CHECK_POW.
 
 ; RAS (hardware Return Address Stack) Defines
 RAS_DEPTH       EQU 8           ; 2650 HW RAS depth (SPSU field is 3 bits, 0-7)
@@ -906,8 +737,6 @@ PSW_FLAG        EQU     $40
 
 ; System Defines
 PROGLIM         EQU $1FFF   ; top of program store (numeric constant, not address)
-; v0.1b: GOSUB stack (SWSP/GSBASE/GSSTKLIM) and FOR/NEXT stack (FORSP/
-; FORBASE/FORSTKLIM) retired entirely - GOSUB/RETURN and FOR/NEXT are cut.
 
 ;  CODE starts at Zero (No Pipbug)
         ORG 0
@@ -933,24 +762,14 @@ VCOUT:
         DW COUT                 ; 10 sites
 VPARSE_EXPR:
         DW EXPR                 ; 19 sites (v0.5: was PARSE_EXPR)
-; v0.6: VGETCI_UC/GETCI_UC removed - orphaned (zero real callers; comment
-; claimed 7 sites, none found). See PORT HISTORY.
 VEATWORD:
         DW EATWORD              ; 7 sites
 VSET_IP_IBUF:
         DW SET_IP_IBUF          ; 4 sites
 VPRT_SPACE:
         DW PRT_SPACE            ; 4 sites (v0.1c: was 5 - TAB()'s call went
-                                 ; with it, TAB is cut)
-; v0.6: VINC_EXP removed - sole caller now uses BSTA,UN INC_EXP directly
-; (INC_EXP itself stays - it's an anchor point in the INC_ET chain).
 VCLR_EXP:
         DW CLR_EXP              ; 5 sites
-; v0.5: VEAM_ATOM/VEAM_HI removed - EAM_ATOM/EAM_HI are gone along with the
-; multi-tier evaluator. EXPR_ATOM is called directly (BSTA, a real call)
-; from EXPR_LOOP and from itself now - no vector needed, since Reading A
-; uses ordinary hardware calls throughout instead of the old SW-stack
-; trampolining these vectors supported.
 VDO_ERROR:
         DW DO_ERROR             ; 3 sites
 VJSYNERR:
@@ -961,43 +780,18 @@ VCLR_RUNFLG:
         DW CLR_RUNFLG           ; 3 sites
 VEXP16_TO_LNUM:
         DW EXP16_TO_LNUM        ; 4 sites (was 5; DO_LIST now sets LNUM
-                                 ; directly from ARGAH:ARGAL post-v4.4)
-; v0.6: VTMP_TO_EXP16/TMP_TO_EXP16 removed - orphaned (its own LODI was
-; always skipped by CUR_TO_EXP16's db $EC trick; comment claimed 4 sites,
-; none real). See PORT HISTORY.
-; v0.6: VDEC_IP removed - sole caller now uses BSTA,UN DEC_IP directly
-; (DEC_IP itself stays - it's an anchor point in the DEC_ET chain).
-; v0.6: VRND_SHUFFLE removed along with RND_SHUFFLE - see PORT HISTORY.
 VSET_TMP_PROG:
         DW SET_TMP_PROG
-; v0.6: VIP_TO_TMP removed - IP_TO_TMP inlined at its sole caller
-; (DO_LIST). See PORT HISTORY.
-; v0.1b: VCHECK_LPAREN/VCHECK_RPAREN removed - no callers left now that
-; PARSE_2ARGS and every function that used them are gone.
-; v0.1: VFUNC_CONT removed - FUNC_EPILOG/FUNC_CONT are gone, no callers left.
-; v0.6: VPUSH_RET removed - PUSH_RET inlined at its sole caller (PREC's
-; PR_REC tail). See PORT HISTORY.
-; v0.5: VCHECK_POW removed - CHECK_POW/^ are gone.
+
 MAIN:
-        ; Pre-load SHOWCASE_END as program so RUN executes the showcase.
-        ; Delete for ROM 
+       ; Delete for ROM 
         LODI,R0 <SHOWCASE_END
         STRA,R0 PEH
         LODI,R0 >SHOWCASE_END
         STRA,R0 PEL
-       
-        ; clear RUNFLG, SWSP, FORSP, GOTOFLG - change to DO_NEW for ROM
+
+        ; clear flags - change to DO_NEW for ROM
         BSTA,UN DO_END          
-
-        ; clear A-Z variables (52 bytes) 
-        LODI,R3 51       ; Loop bounds: 51 down to 0 (52 total bytes)
-        EORZ,R0          ; Clear R0 (Stays zero; STRA doesn't alter ALU states)
-CLRV:
-        STRA,R0 VARS,R3  ; Clear target index byte directly
-        BDRR,R3 CLRV     ; Decrement R3 and loop until underflow to $FF
-
-; v0.6: RND seed-priming stub removed - RNDSEED/RND_SHUFFLE are gone,
-; see PORT HISTORY.
 
         ; print sign-on banner
         LODI,R0 <BANNER
@@ -1005,9 +799,6 @@ CLRV:
         LODI,R0 >BANNER
         STRA,R0 IPL
         BSTA,UN PRTSTR
-        ; v0.1b: was BSTA,UN DO_FREE here (boot-time "Bytes Free" print) -
-        ; DO_FREE is cut along with the FREE statement; pBASIC65c02's own
-        ; boot banner has no bytes-free print either, so this matches.
         ; fall through to REPL
 
 ; =============================================================================
@@ -1029,6 +820,23 @@ REPL:
         BCTR,UN REPL
 
 ; =============================================================================
+;  DO_IF -- Conditional execution (v0.5: THEN is gone - relops are now
+;  flat operators inside EXPR itself, so the expression's own result IS
+;  the whole truth value. No separate relop parse, no THEN keyword.
+;  Nests for free: "IF a IF b stmt" - the true-path dispatch is a JUMP to
+;  STMT_EXEC, so if "stmt" is itself another IF, it costs no extra depth.)
+; Syntax: IF expr stmt
+; In:  IP -> first char after IF keyword
+; Out: executes stmt if expr is nonzero; otherwise sequential return
+; Clobbers: R0, R1, EXPH, EXPL (via EXPR, plus whatever the dispatched
+;           statement clobbers on the true path)
+DO_IF:
+        BSTA,UN EXPR                      ; [+1] condition -> EXPH:EXPL
+        LODA,R0 EXPL
+        IORA,R0 EXPH
+        RETC,EQ                           ; both zero: false, sequential return
+        ; drop through
+; =============================================================================
 ;  STMT_EXEC -- Decode and dispatch one BASIC statement from IP.
 ; In:  IPH:IPL -> first char of statement (after any leading whitespace)
 ; RAS depth: 1 from REPL, 3 from DO_IF(THEN body).
@@ -1042,9 +850,7 @@ REPL:
 ; (still-unconsumed) 1st character is matched against TOK_CHARS; on a
 ; hit, EATWORD consumes the whole keyword - 1st char included, since it
 ; was only peeked, never actually read off IP - in one pass, then control
-; jumps to the handler. LET is gone: it collided with LIST on 1-char
-; dispatch, and pBASIC65c02 itself has no LET keyword either - bare
-; "V=expr" (SE_NOTKW) already covers every assignment.
+; jumps to the handler. 
 STMT_EXEC:
         ZBSR *VWSKIP  
         ; peek 2nd char (IP+1) without consuming
@@ -1096,50 +902,7 @@ SE_NOTKW:
         COMI,R0 A'='
         BCFA,EQ JSYNERR
         ZBSR *VINC_IP
-        BCTR,UN DL_EX                    ; expression follows
-
-; =============================================================================
-;  DO_NEW -- Clear program store
-; Syntax: NEW
-; In:  nothing
-; Out: PEH:PEL = VARS; program store ($10E0-$1FFF) zeroed; falls through to DO_END
-; Clobbers: R0, R1, IPH, IPL, SWSP, FORSP, GOTOFLG, RUNFLG
-DO_NEW:
-        ; Zero VARS + program store using IPH:IPL as write pointer.
-        ; R1 = 0 
-        ; Stop when IPH reaches $20 (i.e. address wrapped past $1FFF).
-        LODI,R0 <VARS
-        STRA,R0 IPH
-        LODI,R0 >VARS
-        STRA,R0 IPL
-        EORZ,R1                          ; Zero, is CR better?
-DN_CLR:
-        STRA,R1 *IPH                     ; zero byte at IPH:IPL
-        ZBSR *VINC_IP
-        LODA,R0 IPH                      ; past $1FFF? $2000 hi = $20
-        COMI,R0 <PROGLIM+1               ; Change for other mem configs
-        BCTR,LT DN_CLR                   ; no: continue 
- 
-        ; set both PEH:PEL and IPH:IPL to PROG in one pass
-        LODI,R0 <PROG
-        STRA,R0 PEH
-        STRA,R0 IPH
-        LODI,R0 >PROG
-        STRA,R0 PEL 
-        STRA,R0 IPL
-        ; fall through to DO_END
-
-; =============================================================================
-;  DO_END -- Stop execution and clear all run state
-; Syntax: END  (also called by DO_NEW, DO_ERROR, RESET)
-; In:  nothing
-; Out: GOTOFLG=0, RUNFLG=0
-; Clobbers: R0
-DO_END:
-        EORZ,R0
-        STRA,R0 GOTOFLG
-        ZBRR *VCLR_RUNFLG               ; tail call
-
+        ; drop through
 ; =============================================================================
 ;  DL_EX / DL_STORE -- Variable assignment (v0.3: DO_LET's own prologue,
 ;  reachable only via the explicit "LET" keyword, is gone along with LET
@@ -1159,16 +922,23 @@ DL_STORE:
         STRA,R0 VARS,R1  ; Store directly to VARS array + offset
         LODA,R0 EXPL     ; R0 = Low byte of expression
         STRA,R0 VARS+1,R1; Store directly to VARS array + offset + 1
-        ; fall through to DO_REM (RETC,UN)
+        RETC,UN
 
 ; =============================================================================
-;  DO_REM -- shared no-op return (v0.1b: REM keyword itself is cut - this
-;  label is kept only because DL_STORE falls through into it as its exit).
-; In:  nothing
-; Out: nothing
-; Clobbers: nothing
-DO_REM:
-        RETC,UN
+;  DO_ASK -- Read signed integer from user into variable (v0.1b: renamed
+;  from INPUT - I is taken by IF under 1-char statement dispatch)
+; Syntax: ASK V
+; In:  IP -> variable letter
+; Out: VARS[V] = parsed value
+; Clobbers: R0, R2, SC0, SC1, EXPH, EXPL, TMPH, TMPL, IBUF
+DO_ASK:
+        BSTR,UN PARSE_VAR_SAVE
+        BSTA,UN PRT_QUEST
+        ZBSR *VPRT_SPACE  
+        BSTA,UN GETLINE                   ; [+1]
+        ZBSR *VSET_IP_IBUF                ; IPH:IPL = IBUF
+        BSTA,UN PARSE_S16                ; [+1]
+        BCTR,UN DL_STORE
 
 ; =============================================================================
 ;  DO_GOTO -- Computed GOTO
@@ -1187,28 +957,6 @@ DO_GOTO:
         ZBRR *VCLR_RUNFLG 
 
 ; =============================================================================
-;  DO_IF -- Conditional execution (v0.5: THEN is gone - relops are now
-;  flat operators inside EXPR itself, so the expression's own result IS
-;  the whole truth value. No separate relop parse, no THEN keyword.
-;  Nests for free: "IF a IF b stmt" - the true-path dispatch is a JUMP to
-;  STMT_EXEC, so if "stmt" is itself another IF, it costs no extra depth.)
-; Syntax: IF expr stmt
-; In:  IP -> first char after IF keyword
-; Out: executes stmt if expr is nonzero; otherwise sequential return
-; Clobbers: R0, R1, EXPH, EXPL (via EXPR, plus whatever the dispatched
-;           statement clobbers on the true path)
-DO_IF:
-        BSTA,UN EXPR                      ; [+1] condition -> EXPH:EXPL
-        LODA,R1 EXPH
-        LODA,R0 EXPL
-        IORZ R1                           ; R0 |= R1: nonzero iff either byte is
-        RETC,EQ                           ; both zero: false, sequential return
-        BCTA,UN STMT_EXEC                 ; nonzero: run the following statement
-
-; v0.1b: DO_RETURN removed - RETURN is cut. DRT_GO (the GOTOFLG=$03 tail
-; DO_NEXT also used) went with it - see DR_EXEC's simplified dispatch.
-
-; =============================================================================
 ;  SET_TMP_PROG -- Set TMPH:TMPL = PROG base address
 ; Clobbers: R0
 SET_TMP_PROG:
@@ -1217,9 +965,6 @@ SET_TMP_PROG:
         LODI,R0 >PROG
         STRA,R0 TMPL
         RETC,UN
-
-; v0.6: RND_SHUFFLE body removed (was orphaned once its call site in CHIN
-; and the MAIN seed-priming stub were cut) - see PORT HISTORY.
 
 ; =============================================================================
 ; PARSE_VAR_SAVE -- skip whitespace, read+upcase var letter, range-check,
@@ -1240,24 +985,29 @@ PARSE_VAR_SAVE:
         ZBRR *VINC_IP           ; tail call  
 
 ; =============================================================================
-;  DO_ASK -- Read signed integer from user into variable (v0.1b: renamed
-;  from INPUT - I is taken by IF under 1-char statement dispatch)
-; Syntax: ASK V
-; In:  IP -> variable letter
-; Out: VARS[V] = parsed value
-; Clobbers: R0, R2, SC0, SC1, EXPH, EXPL, TMPH, TMPL, IBUF
-DO_ASK:
-        BSTR,UN PARSE_VAR_SAVE
-        BSTA,UN PRT_QUEST
-        ZBSR *VPRT_SPACE  
-        BSTA,UN GETLINE                   ; [+1]
-        ZBSR *VSET_IP_IBUF                ; IPH:IPL = IBUF
-        BSTA,UN PARSE_S16                ; [+1]
-        BCTA,UN DL_STORE
+;  DO_NEW -- Reset PE and IP
+; Syntax: NEW
+; In:  nothing
+DO_NEW:
+        ; set both PEH:PEL and IPH:IPL to PROG in one pass
+        LODI,R0 <PROG
+        STRA,R0 PEH
+        STRA,R0 IPH
+        LODI,R0 >PROG
+        STRA,R0 PEL 
+        STRA,R0 IPL
+        ; fall through to DO_END
 
-; (v0.9: MSG_MIN "32768" filler removed - PRINT_S16's new repeated-
-; subtraction algorithm handles -32768 without a special-case string; see
-; PRINT_S16's own header comment for why.)
+; =============================================================================
+;  DO_END -- Stop execution and clear all run state
+; Syntax: END  (also called by DO_NEW, DO_ERROR, RESET)
+; In:  nothing
+; Out: GOTOFLG=0, RUNFLG=0
+; Clobbers: R0
+DO_END:
+        EORZ,R0
+        STRA,R0 GOTOFLG
+        ZBRR *VCLR_RUNFLG               ; tail call
 
 ; =============================================================================
 ; Character IO
@@ -1397,16 +1147,6 @@ DO_WR:
         ZBSR *VPARSE_EXPR  
         LODA,R0 EXPL
         ZBRR *VCOUT              ; tail call
-
-; v0.1c: DP_NOTC/DP_HEXITEM/PRINT_HEX_BYTE (HEX$ support) removed - HEX$ is
-; cut, no replacement (matching pBASIC65c02's minimal PRINT).
-
-; v0.1b: DO_GOSUB removed - GOSUB is cut.
-
-; v0.1b: DO_FOR removed - FOR is cut.
-
-; v0.1b: DO_NEXT removed - NEXT is cut (DN_POP_EMPTY went with it; DO_END
-; no longer needs it, see DO_END above).
 
 ; =============================================================================
 ;  CMP_TMP_PE -- Compare TMPH:TMPL against PEH:PEL (16-bit, byte-serial,
@@ -1629,11 +1369,6 @@ TSL_DONE:
         RETC,UN
 TSL_ERR:
         ZBRR *VJSYNERR                    ; v0.6: was BCTA,UN JSYNERR (3B); vector already exists
-
-; v0.2: STORE_LINE/DELETE_LINE/MEMCPY removed - superseded by the
-; append-only TRY_STORE_LINE above (see its header). FIND_LINE/FIND_INS
-; stay unchanged - DO_GOTO still needs a plain "find this line number" scan,
-; which TRY_STORE_LINE also now reuses directly instead of duplicating it.
 
 ; =============================================================================
 ;  INC16_TMP_TO_EXP -- EXPH:EXPL = TMPH:TMPL + 1
@@ -1953,23 +1688,13 @@ DO_LTOP:
         BCTR,GT DOP_TRUE
 DOP_FALSE:
         EORZ,R0
-        STRA,R0 EXPH
-        STRA,R0 EXPL
-        BCTA,UN EXPR_LOOP
+        db $EC                            ; COMA,R0 -- consume next 2 bytes
 DOP_TRUE:
-        EORZ,R0
+        LODI,R0 $FF
         STRA,R0 EXPH
-        LODI,R0 1
         STRA,R0 EXPL
         BCTA,UN EXPR_LOOP
 
-; =============================================================================
-; v0.1b: CHECK_LPAREN/CHECK_RPAREN removed - orphaned (see VCHECK_LPAREN/
-; VCHECK_RPAREN note). Stage 5's flattened parens (EA_PAREN) already do
-; their own inline paren consumption and never used these.
-
-
-; =============================================================================
 ; =============================================================================
 ;  PARSE_FACTOR -- Parse a single value (variable or literal)
 ; In:  IPH:IPL -> first char of factor
@@ -2011,11 +1736,6 @@ PF_LOADVAR:
         STRA,R0 EXPL
         RETC,UN
 
-; =============================================================================
-; v0.5: PARSE_RELOP removed - DO_IF no longer calls it (relops are flat
-; operator-table entries, dispatched via DO_EQOP/DO_LTOP instead of being
-; parsed into a remembered flag). PRO_NONE survives as PARSE_U16's cheap
-; nearby error-jump surrogate (see its own comment below).
 PRO_NONE:
         ZBRR *VJSYNERR 
 
@@ -2527,8 +2247,6 @@ GETLINE:
         LODI,R3 $FF                      ; R3 = empty-buffer sentinel (pre-inc convention)
 GL_LP:
         BSTA,UN CHIN                     ; [+1] blocking read
-        COMI,R0 NUL
-        BCTR,EQ GL_EOL
         STRZ,R1
         COMI,R1 CR
         BCTR,EQ GL_EOL
@@ -2574,12 +2292,6 @@ WSKIP:
         ZBSR *VINC_IP 
         BCTR,UN WSKIP 
 
-; v0.6: GETCI_UC removed - orphaned (zero real callers; comment claimed
-; 7 sites, none found). WSKIPRET below is still the shared return point
-; for WSKIP/EATWORD/UPCASE.
-WSKIPRET:
-        RETC,UN
-
 ; =============================================================================
 ;  UPCASE -- Convert R0 to uppercase if 'a'..'z'
 ; In:  R0 = character
@@ -2591,6 +2303,7 @@ UPCASE:
         COMI,R0 A'z'+1
         BCFR,LT WSKIPRET
         SUBI,R0 32
+WSKIPRET:
         RETC,UN
 
 ; =============================================================================
@@ -2738,8 +2451,6 @@ DE_NL:
         BSTA,UN DO_END                   ; [+1] clears SWSP, FORSP, GOTOFLG, RUNFLG
         BCTA,UN REPL                     ; REPL resets RAS (PSU SP bits) on entry
 
-; v0.1b: DO_FREE removed - FREE is cut.
-
 ; =============================================================================
 ;  Shared character print routines -- $EC (COMA) byte-skip chain
 ; Each entry loads its character then falls through via the skip opcode trick.
@@ -2757,14 +2468,8 @@ PRT_CR:
         db $EC
 PRT_SPACE:
         LODI,R0 32
-        ZBRR *VCOUT                     ; v0.7: was another $EC skip into PRT_BS
-                                         ; (print backspace) - BS is never
-                                         ; printed anywhere in this build (no
-                                         ; backspace support since v0.2), so
-                                         ; PRT_BS was a dead terminal link.
-                                         ; Removed; PRT_SPACE now ends the
-                                         ; chain directly. Saves 3 bytes.
-
+        ZBRR *VCOUT                
+        
 ; =============================================================================
 ;  SET_IP_IBUF -- Set IPH:IPL = IBUF base address
 ; In:  nothing
@@ -2789,7 +2494,7 @@ CLR_EXP:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "pBASIC2650 V0.4", CR, LF, NUL
+        DB CR, LF, "pBASIC2650V1.0", CR, LF, NUL
 
 ; -- Combined operator + statement dispatch table (v0.5: extends the v0.3
 ; statement-only table with 6 operator entries ahead of it, matching
@@ -2820,14 +2525,6 @@ TOK_CHARS:
         DB "W", <DO_WR,     >DO_WR        ; WR
         DB NUL, <SE_NOTKW,  >SE_NOTKW     ; No match handler
 
-; v0.1: FUNC_TAB removed entirely - no functions left, and nothing scans
-; for one anymore (see PARSE_EXPR/EAM_ATOM changes in PORT HISTORY).
-
-
-; v0.5: CHECK_POW removed entirely - ^ (power) is cut along with % (MOD),
-; which went with the old multi-tier EAM_HI. Nothing calls the ^ operator
-; anymore; the flat operator table (TOK_CHARS) only has +-*/=<.
-
 ROMEND: 
 
 ;  RAM variables -- sequential RES block 
@@ -2845,7 +2542,6 @@ GOTOL   RES 1       ; pending target lo
 CURH    RES 1       ; current line hi  (error reporting)
 CURL    RES 1       ; current line lo
 
-; v0.1b: FORVAR removed - orphaned now that DO_FOR/DO_NEXT are gone.
 LNUMH   RES 1       ; scratch line number hi       (DEC_ET offset 12 = LNUMH-IPH)
 LNUML   RES 1       ; scratch line number lo
 EXPH    RES 1       ; expression result hi         (INC_ET offset 4 = EXPH-IPH)
@@ -2858,25 +2554,14 @@ SC1     RES 1       ; Scratch byte 1
 PEH     RES 1       ; Program end pointer hi
 PEL     RES 1       ; Program end pointer lo
 SAVEH   RES 1       ; ADD16_SAVE_EXP: popped left operand scratch (hi)
-; v0.5: POWCNTH/POWCNTL removed - CHECK_POW/^ are gone.
-; v0.1b: FUNCOP/FT_SP/FT_STK/FT_SAVE_SP/FT_SAVE/FT_N/FT_R2SAVE (72+ bytes,
-; the function-atom protect/restore machinery from Stage 1a) and ARGAH/
-; ARGAL (PARSE_2ARGS's arg scratch) all removed - orphaned now that
-; PARSE_2ARGS, AND/OR/XOR, and POKE/LIST's range parsing are all gone.
 SAVEL   RES 1       ; ADD16_SAVE_EXP: popped left operand scratch (lo)
 TEMPRETH RES 1      ; SW return address hi
 TEMPRETL RES 1      ; SW return address lo
-; v0.6: RNDSEED (2 bytes) removed along with RND_SHUFFLE - see PORT HISTORY.
 
 ;  --- Flags & Stuff --- 
 RUNFLG  RES 1       ; $01=running $00=immediate
 R3SAVE  RES 1       ; Save/restore R3 across PARSE_U16 multiply loop
 NEGFLG  RES 1       ; Sign flag
-; v0.1b: FORSP/SWSP removed - orphaned now that FOR/NEXT and GOSUB/RETURN
-; are gone.
-; v0.5: RELOP removed - relops (=, <) are now flat operator-table entries
-; (DO_EQOP/DO_LTOP) dispatched immediately, not parsed into a remembered
-; flag for DO_IF to check later.
 
 ;  SW call stack -- used by PARSE_EXPR / PRINT_S16 only
 ; R3 = index ($FF=empty, grows up). Each frame = [lo][hi].
@@ -2894,9 +2579,6 @@ SWBASE  RES 16      ; SW stack base (v0.5, was 32 bytes). Sized for
                      ; only ever runs after an expression has fully
                      ; unwound) but share this one array, and PRINT_S16's
                      ; requirement is the larger of the two.
-
-; v0.1b: GSBASE (GOSUB stack, 16 bytes) and FORBASE (FOR/NEXT stack,
-; 28 bytes) removed - orphaned now that GOSUB/RETURN and FOR/NEXT are gone.
 
 ; Buffers
 IBUF    RES 64      ; Input buffer 64 bytes
@@ -2941,7 +2623,7 @@ PROG:
         DB 0,190,"PRINT ",$22,"",$22,$0D                                        ; 190 PRINT ""
         DB 0,216,"PRINT ",$22,"",$22,$0D                                        ; 216 PRINT ""
         DB 0,236,"PRINT ",$22,"--- LIST ---",$22,$0D                            ; 236 PRINT "--- LIST ---"
-        DB 0,238,"LIST",$0D                                                     ; 238 LIST
+;        DB 0,238,"LIST",$0D                                                     ; 238 LIST
         DB 0,240,"GOTO 300",$0D                                                 ; 240 GOTO 300
         DB 1,44,"PRINT ",$22,"--- MANDELBROT ---",$22,$0D                      ; 300 PRINT "--- MANDELBROT ---"
         DB 1,54,"I=-64",$0D                                                     ; 310 I=-64
