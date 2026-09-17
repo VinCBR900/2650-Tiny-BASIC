@@ -1,4 +1,4 @@
-# 2650-Tiny-BASIC - Intended for 2732 4kByte EPROM
+# 2650-Tiny-BASICs 
 
 > **AI Disclosure**: This code was developed with the assistance of AI (Claude by Anthropic, and Gemini by Google). The architecture, code, tests, and documentation were produced collaboratively between a human developer and an AI assistant. All code has been reviewed by the author.
 >Specifically:
@@ -8,14 +8,21 @@
 >
 > To be frank, without these agents this work would not have been possible.
 > 
-You can play with this Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
+You can play with the 2kbyte Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
 
-This minimal integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below.  
+These integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below. Three versions are available
+  * **pBASIC2650** - Proof of concept, Smallest Useful 2650 Tiny BASIC.  Only has `<` and `=` relops, flat math but full signed 16 bit Add/Sub/Mul/Div. Delete/Append only BASIC line entry, less than 1700 ROM bytes including bitbang serial.
+  * **uBASIC2650** - 2kbyte Minimal Tiny BASIC.  BODMAS lite operator prceidence, uses `!=` and `!<` to emulate other relops.  Still append only line handling (Sorry)
+  * **4kBASIC2650** - Standard Tiny BASIC with `GOSUB`/`RETURN`, `FOR`/`NEXT`, Functions, proper six relops, and normal BASIC line entry. Was previously called uBASIC but renamed since chunky.    
+
+Development first started with uBASIC but I coudln't get it to less than ~2.5kbyte when the target was 2kbyte, so I padded it out with stuff e.g. `HEX$(num)`.  It was only after I developed pBASIC65c02 I realised I could use same techniques here, which led to minimal pBASIC, then expanded pBASIC which become V2 uBASIC and original uBASIC became 4kBASIC.
 
 If you just want a proper BASIC for your Signetics 2650 system then the vintage [MicroWorld BASIC interpreter](https://binnie.id.au/MicroByte/BASIC%20Manual.pdf) is significantly more capable with floating point and string support. It is scattered around on the internet but I found a version at [https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main](https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main).
+
 > If you've found these Tiny BASIC interpreters useful for learning, retrocomputing, or your own projects, you can buy me a coffee.  Donations are entirely optional but greatly appreciated.
 > [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/vpcrabtreeZ)
 ---
+# 4kBASIC2650 - 4kbyte, Intended for 2732 Eprom
 ## Functionality
 
 **Statements:** 
@@ -48,10 +55,9 @@ Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing
 
 ##  Notes
 
-No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution using 3 character keyword matching.  You must leave spaces between keyword e.g. `FOR A=1 TO 5` will work, `FORA+1TO5` will not. 
+No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution.  You must leave spaces between keyword e.g. `FOR A=1 TO 5` will work, `FORA+1TO5` will not. 
 
-So far, this has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
-
+This has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
 - 8 level hardware Return Address Stack (RAS). Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
   - One of the tricks for reduced size (sometimes called _Code Golf_) is for any code used twice or more, make it a subroutine.  That's Not possible here due to the small RAS, so we have lots of duplicate inline code.
   - I implemneted a SW stack for key subroutines, which has about a dozen bytes overhead for each call.  Interestingly the return address does not have to be the immediate next instruction...   
