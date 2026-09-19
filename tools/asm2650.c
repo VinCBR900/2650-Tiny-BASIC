@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.16
+ * Version: 1.17
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -18,6 +18,60 @@
  *   '$' alone (not followed by a hex digit) = address of the current source
  *   line, i.e. the classic assembler "here" token. E.g. "BDRR,R0 $" decrements
  *   R0 and branches back to itself — a busy-wait delay loop timed by R0.
+ *
+ * EXPRESSION GRAMMAR (eval_expr, used by every operand — DB/DW/EQU/ORG/DS/RES
+ * and every instruction's immediate/relative/absolute field):
+ *   Primary: $HHHH (hex), %BBBB (binary), decimal, 'c' or A'c' (char literal),
+ *            label name, or bare '$' (= this line's start address).
+ *   Prefix:  unary '-'; '<' / '>' (HI/LO byte of the REST of the expression).
+ *   Binary:  '+' '-' '*' '/', standard precedence, left-to-right; '(' ')'
+ *            grouping. Division by zero is an error. Trailing text the
+ *            grammar can't parse is a hard error (was silently dropped
+ *            pre-1.17 — BUG-ASM-15).
+ *
+ * Changes v1.16 -> v1.17:
+ *   Added --no-warn-branch-skip (on by default): warns when a BCTR/BCTA
+ *     positive-condition branch skips over an immediately-following
+ *     unconditional BCTR/BCTA,UN whose fall-through target is the very next
+ *     line, e.g.:
+ *       BCTR,cc SKIP1     (cc = EQ/GT/LT, not UN)
+ *       BCTA,UN FAR
+ *     SKIP1:
+ *     This can be replaced by a single BCFR/BCFA,cc FAR (same condition,
+ *     opposite true/false sense), dropping the unconditional branch. Purely
+ *     a textual, line-oriented check (mirrors the user's grep) over three
+ *     strictly consecutive raw source lines — does not consult pc/label
+ *     values, so it does NOT verify FAR is in relative range for BCFR, and
+ *     (like the grep it replaces) will not match if a blank or comment-only
+ *     line sits between any of the three lines. A hint, not an auto-fix.
+ *
+ * Changes v1.16 -> v1.17 (BUG-ASM-14/15 folded into same version per request):
+ *   BUG-ASM-14 FIXED: eval_expr()'s '+'/'-' chain recursed on the remainder
+ *     for every operator, making it right-associative instead of
+ *     left-to-right: "10-3-2" evaluated as 10-(3-2)=9, not (10-3)-2=5; any
+ *     expression with a '-' followed by another '+' or '-' was affected
+ *     (confirmed empirically: "DB 10-3-2" emitted $09, "DB 10-3+2" emitted
+ *     $05). Fixed by rewriting the expression parser as an iterative
+ *     precedence-climbing parser (parse_expr/parse_term/parse_factor/
+ *     parse_primary) instead of a single self-recursive function; the '+'/'-'
+ *     and new '*'/'/' levels both now genuinely iterate left-to-right.
+ *   BUG-ASM-15 FIXED: eval_expr() had no unsupported-operator or
+ *     trailing-garbage check — anything after a successfully-parsed prefix
+ *     was silently dropped with *ok left at 1 and no diagnostic at all, e.g.
+ *     "DB $10*2" quietly assembled as a single $10 byte, "0 error(s)". Given
+ *     the same rewrite, this was fixed by implementing real '*' and '/'
+ *     support (standard precedence over '+'/'-', left-to-right, division by
+ *     zero is an error) and real '(' ')' grouping, then having the public
+ *     eval_expr() entry point require the operand text be fully consumed —
+ *     anything left over is now "ERROR line %d: unexpected 'c' in expression
+ *     '...'" on pass 2, not a silent truncation.
+ *   Side effect of the rewrite: unary '-' applied to a HI/LO term (e.g.
+ *     "-<$1234") previously discarded the '-' silently (the old HI/LO branch
+ *     returned before the neg flag was ever applied); now correctly negates.
+ *     '<'/'>' (HI/LO of the rest of the expression) keep their documented
+ *     v1.16 meaning and are now valid as a factor anywhere, not only at the
+ *     very start of an operand — e.g. "2*<FOO" now works instead of silently
+ *     truncating to "2" (see BUG-ASM-15).
  *
  * Changes v1.15 -> v1.16:
  *   BUG-ASM-08 FIXED: register-indexed addressing (,Rn[+/-]) detection in the
@@ -180,7 +234,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.16"
+#define ASM2650_VERSION "1.17"
 
 typedef struct { char name[64]; int value; int referenced; int def_line; } Label;
 static Label labels[MAX_LABELS];
@@ -218,6 +272,7 @@ static int  errors = 0;
 static int  lineno = 0;
 static int  warn_inline_label = 1;
 static int  warn_local_abs_branch = 1;
+static int  warn_branch_skip = 1;
 static int  list_enabled = 1;
 
     /* Upcase the assembler line but preserve content inside single-quoted literals.
@@ -305,28 +360,34 @@ static void label_define(const char *n, int v){
     labels[nlabels].value=v; labels[nlabels].referenced=0; labels[nlabels].def_line=lineno; nlabels++;
 }
 
-static int eval_expr(char *s, int *ok){
-    s=skip_ws(s); *ok=1;
-    int neg=0;
-    if(*s=='-'){ neg=1; s++; s=skip_ws(s); }
-    /* HI/LO operators — Signetics/WinArcadia/asm2650.py standard:
-     *   <ADDR = HIGH byte  (asm2650.py UPPER: value >>= 8)
-     *   >ADDR = LOW  byte  (asm2650.py LOWER: value &= 0xFF)
-     * WinArcadia docs: "<FOO for the high byte, >FOO for the low byte" */
-    if(*s=='<'||*s=='>'){
-        int hi=(*s=='<'); s++;
-        int ok2=0; int v=eval_expr(s,&ok2);
-        if(!ok2){ *ok=0; return 0; }
-        return hi?((v>>8)&0xFF):(v&0xFF);
-    }
-    int val=0;
+/* ---------------------------------------------------------------------------
+ * Expression parser (BUG-ASM-14/15 rewrite, v1.17).
+ * Grammar, standard precedence, all left-to-right at each level:
+ *   expr   := term (('+' | '-') term)*
+ *   term   := factor (('*' | '/') factor)*
+ *   factor := '-' factor | ('<'|'>') expr | '(' expr ')' | primary
+ *   primary:= $HEX | %BIN | decimal | 'c' | A'c' | label | bare '$'
+ * '<'/'>' (HI/LO) keep their pre-1.17 meaning: they consume a full nested
+ * expr (not just the next factor), matching the WinArcadia/asm2650.py
+ * convention documented in the file header, but are now valid as a factor
+ * anywhere (after '*', inside parens, as an operand of unary '-', etc.),
+ * not only at the very start of an operand.
+ * ------------------------------------------------------------------------- */
+
+static int parse_expr(char **sp, int *ok);
+
+/* parse_primary: $hex / %bin / decimal / 'c' / A'c' / label / bare '$'.
+ * Inputs:   *sp = current parse position.
+ * Outputs:  *sp advanced past the consumed token on success; *ok=0 on
+ *           failure (undefined/too-long label reports its own ERROR line,
+ *           same as pre-1.17 — callers still print their own "bad operand"
+ *           message on top of that, unchanged double-report convention).
+ * Clobbers: errors (via label_find/label name-length check on pass 2). */
+static int parse_primary(char **sp, int *ok){
+    char *s=*sp; *ok=1; int val=0;
     if(*s=='$'){ s++;
         if(!isxdigit((unsigned char)*s)){
-            /* BUG-ASM-13: bare '$' (not followed by a hex digit) = address of
-             * the current source line — the classic assembler "here" token.
-             * E.g. "BDRR,R0 $" decrements R0 and branches back to itself: a
-             * busy-wait delay loop timed by the initial R0 value. */
-            val = line_start_pc;
+            val = line_start_pc;  /* bare '$' = this line's start address */
         } else {
             while(isxdigit((unsigned char)*s)) val=val*16+(isdigit((unsigned char)*s)?*s-'0':toupper((unsigned char)*s)-'A'+10), s++;
         }
@@ -334,37 +395,138 @@ static int eval_expr(char *s, int *ok){
     else if(*s=='%'){ s++; while(*s=='0'||*s=='1') val=val*2+(*s++-'0'); }
     else if(isdigit((unsigned char)*s)){ while(isdigit((unsigned char)*s)) val=val*10+(*s++-'0'); }
     else if(isalpha((unsigned char)*s)||*s=='_'){
-        /* A'x' — Signetics ASCII character literal (asm2650.py ASCII token) */
         if(toupper((unsigned char)*s)=='A' && *(s+1)=='\''){
-            s+=2; /* skip A' */
-            val=(unsigned char)*s;
+            s+=2; val=(unsigned char)*s;
             if(*s) s++;
-            if(*s=='\'') s++; /* skip closing ' */
+            if(*s=='\'') s++;
         } else {
             char nm[64]; int i=0;
             while((isalnum((unsigned char)*s)||*s=='_')&&i<63) nm[i++]=*s++;
             nm[i]=0;
             if(isalnum((unsigned char)*s)||*s=='_'){
                 if(pass==2){ fprintf(stderr,"ERROR line %d: label name too long (max 63 chars) near '%s'\n",lineno,nm); errors++; }
-                *ok=0; return 0;
+                *ok=0; *sp=s; return 0;
             }
             int lv=label_find(nm);
-            if(lv==UNDEF){ if(pass==2){fprintf(stderr,"ERROR line %d: undefined '%s'\n",lineno,nm); errors++;} *ok=0; return 0; }
+            if(lv==UNDEF){ if(pass==2){fprintf(stderr,"ERROR line %d: undefined '%s'\n",lineno,nm); errors++;} *ok=0; *sp=s; return 0; }
             if(pass==2) label_mark_referenced(nm);
             val=lv;
         }
     } else if(*s=='\''){
-        s++; val = (unsigned char)*s;
+        s++; val=(unsigned char)*s;
         if(*s) s++;
         if(*s=='\'') s++;
-    } else { *ok=0; return 0; }
-    if(neg) val=-val;
-    s=skip_ws(s);
-    if(*s=='+'||*s=='-'){
-        int sub=(*s=='-'); s++; s=skip_ws(s);
-        int ok2; int rhs=eval_expr(s,&ok2);
-        if(!ok2){ *ok=0; return 0; }
-        val=sub?val-rhs:val+rhs;
+    } else { *ok=0; *sp=s; return 0; }
+    *sp=s; return val;
+}
+
+/* parse_factor: unary '-' (recurses on itself), '<'/'>' HI/LO of a full
+ * nested expr, '(' expr ')', or a primary.
+ * Inputs/Outputs/Clobbers: as parse_primary; additionally reports a missing
+ * ')' as its own ERROR line on pass 2 (same double-report convention). */
+static int parse_factor(char **sp, int *ok){
+    char *s=skip_ws(*sp);
+    if(*s=='-'){
+        s++; s=skip_ws(s);
+        int v=parse_factor(&s,ok);
+        *sp=s;
+        return *ok?-v:0;
+    }
+    if(*s=='<'||*s=='>'){
+        int hi=(*s=='<'); s++;
+        int v=parse_expr(&s,ok);
+        *sp=s;
+        if(!*ok) return 0;
+        return hi?((v>>8)&0xFF):(v&0xFF);
+    }
+    if(*s=='('){
+        s++;
+        int v=parse_expr(&s,ok);
+        if(!*ok){ *sp=s; return 0; }
+        s=skip_ws(s);
+        if(*s!=')'){
+            if(pass==2){ fprintf(stderr,"ERROR line %d: missing ')'\n",lineno); errors++; }
+            *ok=0; *sp=s; return 0;
+        }
+        s++; *sp=s;
+        return v;
+    }
+    int v=parse_primary(&s,ok);
+    *sp=s;
+    return v;
+}
+
+/* parse_term: left-to-right '*'/'/' chain over parse_factor.
+ * Clobbers: errors (division by zero, or a failing factor, on pass 2). */
+static int parse_term(char **sp, int *ok){
+    char *s=*sp;
+    int val=parse_factor(&s,ok);
+    if(!*ok){ *sp=s; return 0; }
+    for(;;){
+        char *p=skip_ws(s);
+        if(*p=='*'){
+            p=skip_ws(p+1);
+            int ok2; int rhs=parse_factor(&p,&ok2);
+            if(!ok2){ *ok=0; *sp=p; return 0; }
+            val*=rhs; s=p;
+        } else if(*p=='/'){
+            p=skip_ws(p+1);
+            int ok2; int rhs=parse_factor(&p,&ok2);
+            if(!ok2){ *ok=0; *sp=p; return 0; }
+            if(rhs==0){
+                if(pass==2){ fprintf(stderr,"ERROR line %d: division by zero\n",lineno); errors++; }
+                *ok=0; *sp=p; return 0;
+            }
+            val/=rhs; s=p;
+        } else break;
+    }
+    *sp=s; return val;
+}
+
+/* parse_expr: left-to-right '+'/'-' chain over parse_term. Iterative (not
+ * recursive) specifically so chained '-' is left-associative — this is the
+ * BUG-ASM-14 fix: pre-1.17, "A-B-C" evaluated as A-(B-C) instead of
+ * (A-B)-C because the old eval_expr recursed on the remainder for every
+ * '+'/'-' it saw. */
+static int parse_expr(char **sp, int *ok){
+    char *s=*sp;
+    int val=parse_term(&s,ok);
+    if(!*ok){ *sp=s; return 0; }
+    for(;;){
+        char *p=skip_ws(s);
+        if(*p=='+'){
+            p=skip_ws(p+1);
+            int ok2; int rhs=parse_term(&p,&ok2);
+            if(!ok2){ *ok=0; *sp=p; return 0; }
+            val+=rhs; s=p;
+        } else if(*p=='-'){
+            p=skip_ws(p+1);
+            int ok2; int rhs=parse_term(&p,&ok2);
+            if(!ok2){ *ok=0; *sp=p; return 0; }
+            val-=rhs; s=p;
+        } else break;
+    }
+    *sp=s; return val;
+}
+
+/* eval_expr: public entry point, signature unchanged so none of the ~30
+ * call sites in assemble_line need to change. Parses a full expression and
+ * now REQUIRES the entire string to be consumed — the BUG-ASM-15 fix.
+ * Pre-1.17, trailing text the grammar couldn't parse (e.g. an operator that
+ * wasn't implemented, like '*' before this version) was silently dropped
+ * with *ok left at 1, so e.g. "DB $10*2" quietly assembled as just $10 with
+ * no diagnostic at all. Now it's a hard ERROR, same double-report
+ * convention as every other failure path here (this prints the specific
+ * "unexpected 'c'" line; the call site's own generic "bad operand" message
+ * still follows). Inputs/Outputs/Clobbers: as before this rewrite. */
+static int eval_expr(char *s, int *ok){
+    char *p=s;
+    int val=parse_expr(&p,ok);
+    if(!*ok) return 0;
+    p=skip_ws(p);
+    if(*p){
+        if(pass==2){ fprintf(stderr,"ERROR line %d: unexpected '%c' in expression '%s'\n",lineno,*p,s); errors++; }
+        *ok=0; return 0;
     }
     return val;
 }
@@ -795,6 +957,91 @@ static void assemble_line(char *line){
     if(pass==2){ fprintf(stderr,"ERROR line %d: unknown mnemonic '%s'\n",lineno,mn); errors++; }
 }
 
+/* ---------------------------------------------------------------------------
+ * Branch-skip warning: three small line-oriented text matchers.
+ * These work on raw, unprocessed source lines (their own upcased local copy)
+ * and are independent of pc/label state — they only ever run from main()'s
+ * pass-2 read loop, never from assemble_line(). See the v1.16->v1.17 header
+ * changelog entry for the pattern being detected and its known limits.
+ * ------------------------------------------------------------------------- */
+
+/* match_skip_branch: does 'raw' look like "BCTR,cc TARGET" / "BCTA,cc TARGET"
+ * with cc one of EQ/GT/LT (i.e. NOT UN)?
+ * Inputs:  raw       = one raw source line, unmodified.
+ *          target_sz = capacity of target_out.
+ * Outputs: *is_abs_out = 0 for BCTR, 1 for BCTA (valid only if returns 1).
+ *          *cc_out     = 0=EQ, 1=GT, 2=LT (valid only if returns 1).
+ *          target_out  = the branch's target token, upcased, NUL-terminated.
+ *          return 1 on match, 0 otherwise.
+ * Clobbers: none (local buffer only). */
+static int match_skip_branch(const char *raw, int *is_abs_out, int *cc_out, char *target_out, size_t target_sz){
+    char buf[MAX_LINE]; strncpy(buf,raw,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    upcase(buf);
+    char *p=skip_ws(buf);
+    int is_abs;
+    if(strncmp(p,"BCTR",4)==0) is_abs=0;
+    else if(strncmp(p,"BCTA",4)==0) is_abs=1;
+    else return 0;
+    p+=4;
+    if(*p!=',') return 0;
+    p=skip_ws(p+1);
+    static const char *cc_names[3]={"EQ","GT","LT"};
+    int cc=-1;
+    for(int i=0;i<3;i++){
+        int l=(int)strlen(cc_names[i]);
+        if(strncmp(p,cc_names[i],l)==0 && !isalnum((unsigned char)p[l])){ cc=i; p+=l; break; }
+    }
+    if(cc<0) return 0;   /* UN, or not a recognised cc -> not a skip-branch candidate */
+    p=skip_ws(p);
+    if(*p==',') p=skip_ws(p+1);
+    if(!*p) return 0;
+    size_t i=0;
+    while(*p && !isspace((unsigned char)*p) && *p!=';' && i<target_sz-1) target_out[i++]=*p++;
+    target_out[i]=0;
+    if(!i) return 0;
+    *is_abs_out=is_abs; *cc_out=cc;
+    return 1;
+}
+
+/* match_uncond_branch: does 'raw' look like "BCTR,UN TARGET" / "BCTA,UN TARGET"?
+ * Inputs:  raw = one raw source line, unmodified. target_sz = capacity of target_out.
+ * Outputs: target_out = the branch's target token, upcased, NUL-terminated
+ *          (valid only if returns 1). return 1 on match, 0 otherwise.
+ * Clobbers: none. */
+static int match_uncond_branch(const char *raw, char *target_out, size_t target_sz){
+    char buf[MAX_LINE]; strncpy(buf,raw,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    upcase(buf);
+    char *p=skip_ws(buf);
+    if(strncmp(p,"BCTR",4)!=0 && strncmp(p,"BCTA",4)!=0) return 0;
+    p+=4;
+    if(*p!=',') return 0;
+    p=skip_ws(p+1);
+    if(strncmp(p,"UN",2)!=0 || isalnum((unsigned char)p[2])) return 0;
+    p=skip_ws(p+2);
+    if(*p==',') p=skip_ws(p+1);
+    if(!*p) return 0;
+    size_t i=0;
+    while(*p && !isspace((unsigned char)*p) && *p!=';' && i<target_sz-1) target_out[i++]=*p++;
+    target_out[i]=0;
+    return i>0;
+}
+
+/* line_defines_label: does 'raw' begin with "NAME:" (colon-terminated label
+ * definition), where NAME matches 'want' (already upcased) case-insensitively?
+ * Inputs:  raw = one raw source line, unmodified. want = upcased label name to match.
+ * Outputs: return 1 if raw defines that label at column-start, 0 otherwise.
+ * Clobbers: none. */
+static int line_defines_label(const char *raw, const char *want){
+    char buf[MAX_LINE]; strncpy(buf,raw,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+    upcase(buf);
+    char *p=skip_ws(buf);
+    char lbl[64]; size_t i=0;
+    while((isalnum((unsigned char)*p)||*p=='_') && i<sizeof(lbl)-1) lbl[i++]=*p++;
+    lbl[i]=0;
+    if(!i || *p!=':') return 0;
+    return strcmp(lbl,want)==0;
+}
+
 static void write_hex(FILE *f){
     if(rom_hi<rom_lo){ fprintf(f,":00000001FF\n"); return; }
     int addr=rom_lo;
@@ -936,6 +1183,7 @@ static void print_usage(FILE *f){
     fprintf(f,"  -NoList                        Suppress default .LST listing sidecar\n");
     fprintf(f,"  --no-warn-inline-label         Disable warning for LABEL: INSTR on same line\n");
     fprintf(f,"  --no-warn-local-branch         Disable warning when absolute branch could be relative\n");
+    fprintf(f,"  --no-warn-branch-skip          Disable warning for BCTR/BCTA-skips-BCTx,UN idiom (see BCFR/BCFA)\n");
     fprintf(f,"  -h, --help                     Show this help and exit\n");
 }
 
@@ -972,6 +1220,7 @@ int main(int argc,char *argv[]){
             range_set=1;
         } else if(!strcmp(argv[i],"--no-warn-inline-label")) warn_inline_label=0;
         else if(!strcmp(argv[i],"--no-warn-local-branch")) warn_local_abs_branch=0;
+        else if(!strcmp(argv[i],"--no-warn-branch-skip")) warn_branch_skip=0;
         else if(!strcmp(argv[i],"-h") || !strcmp(argv[i],"--help")){
             print_usage(stdout);
             return 0;
@@ -995,10 +1244,35 @@ int main(int argc,char *argv[]){
         if(pass==2) memset(rom_emitted,0,sizeof(rom_emitted));
         FILE *f=fopen(src_file,"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",src_file);return 1;}
         pc=0; lineno=0; char line[MAX_LINE];
+        /* Rolling 3-line window for the branch-skip warning (match_skip_branch /
+         * match_uncond_branch / line_defines_label above). Fresh each pass since
+         * these are ordinary locals re-created every time this for-loop body
+         * runs; only ever acted on during pass 2 (below), so pass 1 leaves them
+         * unused. */
+        int  bsw_pending=0, bsw_is_abs=0, bsw_cc=0, bsw_lineno=0, bsw_saw_uncond=0;
+        char bsw_target1[128]="", bsw_target2[128]="";
         while(fgets(line,MAX_LINE,f)){
             lineno++;
             int l=strlen(line);
             while(l>0&&(line[l-1]=='\r'||line[l-1]=='\n')) line[--l]=0;
+            if(pass==2 && warn_branch_skip){
+                static const char *bsw_cc_name[3]={"EQ","GT","LT"};
+                if(bsw_pending && bsw_saw_uncond && line_defines_label(line,bsw_target1)){
+                    fprintf(stderr,
+                        "WARN line %d: %s,%s %s skips an unconditional branch (to %s) to reach %s: on line %d"
+                        " -- consider BCF%s,%s %s instead, dropping the unconditional branch\n",
+                        bsw_lineno, bsw_is_abs?"BCTA":"BCTR", bsw_cc_name[bsw_cc], bsw_target1,
+                        bsw_target2, bsw_target1, lineno,
+                        bsw_is_abs?"A":"R", bsw_cc_name[bsw_cc], bsw_target2);
+                    bsw_pending=0; bsw_saw_uncond=0;
+                } else if(bsw_pending && !bsw_saw_uncond && match_uncond_branch(line,bsw_target2,sizeof(bsw_target2))){
+                    bsw_saw_uncond=1;
+                } else {
+                    bsw_pending=match_skip_branch(line,&bsw_is_abs,&bsw_cc,bsw_target1,sizeof(bsw_target1));
+                    bsw_lineno=lineno;
+                    bsw_saw_uncond=0;
+                }
+            }
             if(pass==2 && list_enabled) list_begin_line();
             assemble_line(line);
             if(pass==2 && list_enabled) list_add_line(lineno,line);
