@@ -2,8 +2,6 @@
 
 This folder contains an assembler and simulator for Signetics 2650 CPU.
 
-For Claude, run `Bundle.cmd` to generate `bundle.txt` file that you can tell upload along with `unbundle.sh`.  Tell Claude `Do no Parse the bundle.txt file as it wastes tokens, but unbundle with the Shell file`.  Calude should then have a development environment it can build and test autonimously.
-
 CODEX pulls everything from Github but its strengths lie in modern Assembly and 8086 type coding.
 
 The assembler is home built but cross referenced with
