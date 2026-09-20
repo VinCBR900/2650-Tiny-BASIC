@@ -6,7 +6,7 @@
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : <2 KB target, $0000 upward (currently 2045 bytes - see ROMEND)
+;   ROM    : <2 KB target, $0000 upward (currently 1950 bytes - see ROMEND)
 ;   RAM    : ~213 bytes, $1000 upward (half an 8 KB page above the code)
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
@@ -27,7 +27,7 @@
 ; Statements accepted (first letter dispatches; GOTO/GOSUB and RUN/RETURN
 ; share a letter - see STATEMENT DISPATCH under KNOWN LIMITATIONS):
 ;   ASK  END  GOTO <expr>  GOSUB <expr>  IF <cond> <stmt>
-;   LIST  NEW  PRINT  RETURN  RUN
+;   LIST  NEW  PRINT  REM  RETURN  RUN
 ;
 ; ASK reads a signed integer into a variable ('I' is taken by IF).
 ; PRINT items: "literal", CHR$(n), TAB(n), or an expression; separate with ';'.
@@ -148,8 +148,9 @@
 ;
 ; v2.5 (Sep 2026) - Added niladic RND to the expression parser.
 ;   - EXPR_ATOM: added 'R'-then-alpha check - cant use PEEK_C2_ALPHA due to R2
-;   - Golf pass, all over.
-;   - ROMEND: $0800 after RND detection -> $07AF (1976 bytes)
+;   - Golf pass, all over. Added REM support - no-op.
+;   - Changed line endings ot NULL: DO_RUN executes straight out of PROG.
+;   - ROMEND: $07AF -> $079C (1948 bytes)
 ; v2.4 (Sep 2026) - Added GOSUB/RETURN; golf pass; showcase exercises both.
 ;   - GOSUB/RETURN: TOK_CHARS only matches 1st ketter, so GOTO/GOSUB share a
 ;     row (as do RUN/RETURN) 
@@ -693,6 +694,8 @@ CLR_RUNFLG:
 ;  char is 'T', RUN's is 'N').  
 DO_RU:
         LODA,R0 RXSAVE
+        COMI,R0 A'M'    ; REM
+        RETC,EQ         ; Rem just returns as does nothing
         COMI,R0 A'T'
         BCTR,EQ DO_RETURN
         ; fall through: not RETURN -> plain RUN
@@ -717,30 +720,33 @@ DR_LP:
         RETC,EQ
 
         ; save current line number for error reporting.  2-pass loop:
+        ; indexed read only - TMP itself stays at the record's header start,
+        ; which is exactly what ADV_PAST_RECORD (below) expects.
         LODI,R1 2
 DR_HDR:
         LODA,R0 *TMPH,R1-                 ; R1 2->1: TMP[1]; 1->0: TMP[0]
         STRA,R0 CURH,R1                   ; CURH+1 = CURL
+        LODA,R0 TMPH,R1                 ; R1 2->1: TMP[1]; 1->0: TMP[0]
+        STRA,R0 IPH,R1                   ; CURH+1 = CURL
         BRNR,R1 DR_HDR
-        ZBSR *VINC_TMP
-        ZBSR *VINC_TMP
-        ; copy body to IBUF until CR, NUL-terminate
-        ZBSR *VSET_IP_IBUF                ; IPH:IPL = IBUF
-DR_CPY:
-        LODA,R1 *TMPH
-        COMI,R1 CR
-        BCTR,EQ DR_CD
-        STRA,R1 *IPH
-        ZBSR *VINC_TMP  
-        ZBSR *VINC_IP  
-        BCTR,UN DR_CPY
-DR_CD:
-        ZBSR *VINC_TMP                    ; skip past CR in store
-        EORZ,R0
-        STRA,R0 *IPH                     ; NUL-terminate IBUF
+        ; IP = TMP + 2 (body start) - execute straight out of PROG, no copy.
+        ; Bodies are NUL-terminated in storage now, so every NUL-terminated-
+        ; string assumption already baked into STMT_EXEC/EXPR/etc. just works.
+;        LODA,R0 TMPH
+;        STRA,R0 IPH
+;        LODA,R0 TMPL
+;        STRA,R0 IPL
+;
+        
+        ZBSR *VINC_IP
+        ZBSR *VINC_IP
+        ; advance TMP past this whole record (header+body+terminator) to
+        ; find the next one; stash for SWSTK/DR_LP's next iteration (or a
+        ; GOTO's redirection). Reuses the same shared scan FIND_LINE/
+        ; FIND_INS/TSL_MATCH already use - one routine, one terminator.
+        BSTA,UN ADV_PAST_RECORD
         BSTA,UN TMP_TO_SWSTK
         ; execute line
-        ZBSR *VSET_IP_IBUF                ; IPH:IPL = IBUF
         BSTA,UN STMT_EXEC                ; [+1]
 
         ; resume from SWSTK unconditionally
@@ -749,7 +755,7 @@ DR_SWSTK:
         LODA,R0 SWSTK,R1-                 ; 
         STRA,R0 TMPH,R1                   ; 
         BRNR,R1 DR_SWSTK
-        BCTA,UN DR_LP
+        BCTR,UN DR_LP
 
 ; -----------------------------------------------------------------------------
 ; PEEK_C2_ALPHA - Checks if the 2nd character (IPH+1) is a letter (A-Z).
@@ -881,12 +887,17 @@ P10_HI:
         db $27, $03, $00, $00, $00
 P10_LO:
         db $10, $E8, $64, $0A, $01
-        db 0 ; padding for CHIN = $286
+
+ ; =============================================================================
+;  TABLES 
+BANNER:
+        DB CR, LF, "uBASIC 2.5", CR, LF, NUL 
+
 ; =============================================================================
 ; Character IO
 ; 110 Baud teletype from PIPBUG V1 as per Signetics M20 application note
 ; Simulator default expects CHIN $286 COUT $2B4
- ;       ORG $286
+       ORG $286
 
 CHIN:
         BSTR,UN RND_SHUFFLE 
@@ -1016,7 +1027,7 @@ TSL_MATCH:
         BCTR,EQ TSL_EXCISE
         ZBRR *VJSYNERR                    
 TSL_EXCISE:
-;        LODI,R1 2
+        LODI,R1 2
 TSL_LOOP:
         ; It's the last line: truncate the store back to where it started -
         ; nothing after it, so no shifting needed.
@@ -1028,7 +1039,6 @@ TSL_WRITE:
         ZBSR *VWSKIP_PEEK
         BCTR,EQ TSL_DONE                  ; Arithmetic class) - EQ means NUL (empty
                                           ; body): delete-only (or no-op append).
-                                          ; IBUF is NUL-terminated, not CR-terminated
         LODI,R1 2                         ; write the 2-byte line-number header
 TSL_HDR:
         LODA,R0 LNUMH,R1-                 ; R1 2->1: LNUML; 1->0: LNUMH
@@ -1044,9 +1054,12 @@ TSL_CPY:
         ZBSR *VINC_IP  
         BCTR,UN TSL_CPY
 TSL_CPYDONE:
-        LODI,R0 CR                        ; manufacture the CR terminator ourselves -
-        STRA,R0 *TMPH                     ; the stored record format needs one, but
-        ZBSR *VINC_TMP                     ; IBUF (NUL-terminated) never contains one
+        STRA,R0 *TMPH                     ; R0 is already 0 (NUL) from the LODA
+                                          ; above that branched here - the stored
+                                          ; record format now uses the same NUL
+                                          ; terminator IBUF already used, so no
+                                          ; terminator needs manufacturing at all
+        ZBSR *VINC_TMP
 ;TMP_TO_PE:
         LODI,R0 PEH-IPH
         BSTA,UN TMP_TO_ET                ; Tail call
@@ -1080,9 +1093,9 @@ FL_FOUND:
 
 ; =============================================================================
 ;  ADV_PAST_RECORD -- Advance TMPH:TMPL past the current stored line record
-; Skips the 2-byte line-number header, scans forward until CR (end of that
-; record's text), then skips the CR too - leaves TMPH:TMPL pointing at the
-; start of the NEXT record (or PE, if this was the last one). 
+; Skips the 2-byte line-number header, scans forward until NUL (end of that
+; record's text), then skips the NUL too - leaves TMPH:TMPL pointing at the
+; start of the NEXT record (or PE, if this was the last one).
 ; In:  TMPH:TMPL -> start of a stored record (its line-number hi byte)
 ; Out: TMPH:TMPL -> start of the next record
 ; Clobbers: R0
@@ -1091,12 +1104,11 @@ ADV_PAST_RECORD:
         ZBSR *VINC_TMP
 APR_LP:
         LODA,R0 *TMPH
-        COMI,R0 CR
-        BCTR,EQ APR_DONE
+        BCTR,EQ APR_DONE                  ; free zero-test: NUL ends the body
         ZBSR *VINC_TMP  
         BCTR,UN APR_LP
 APR_DONE:
-        ZBSR *VINC_TMP                    ; skip the CR itself
+        ZBSR *VINC_TMP                    ; skip the NUL itself
         RETC,UN
 
 ; =============================================================================
@@ -1646,7 +1658,7 @@ DO_LIST:
         ZBSR *VSET_TMP_PROG
         db $EC                  ; COMA,R0: consume next 2 bytes
 DLS_NL:
-        ZBSR *VINC_TMP                    ; skip over CR
+        ZBSR *VINC_TMP                    ; skip over NUL
         ZBSR *VPRT_CRLF
 DLS_LP:
         ; Check TMP against program end
@@ -1668,8 +1680,7 @@ DLS_HDR:
         ZBSR *VPRT_SPACE
 DLS_BLPX:
         LODA,R0 *TMPH
-        COMI,R0 CR
-        BCTR,EQ DLS_NL
+        BCTR,EQ DLS_NL                     ; free zero-test: NUL ends the body
         ZBSR *VCOUT
         ZBSR *VINC_TMP
         BCTR,UN DLS_BLPX
@@ -1804,11 +1815,7 @@ TMP_TO_ET:
         STRA,R0 IPL,R1          ; store lo byte to dest+1
         LODA,R0 TMPH
         BCTR,UN ET_STORE        ; store hi byte, restore bank, return
-          
-; =============================================================================
-;  TABLES 
-BANNER:
-        DB CR, LF, "uBASIC 2.5", CR, LF, NUL        
+                
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -2039,83 +2046,84 @@ VARS    RES 52      ; A-Z variables 2 bytes each
 ; =============================================================================
 ;  Pre-loaded SHOWCASE program
 ;
-;  Line format: <lineno_hi> <lineno_lo> <body_ASCII> <CR>
+;  Line format: <lineno_hi> <lineno_lo> <body_ASCII> <NUL>
 ;  Lines  10-190: feature demos (PRINT, WR, arithmetic, comparisons, GOTO loop)
 ;  Lines 300-510: Mandelbrot set renderer )
 ;
-;  Format: DB hi,lo,"text",$0D  -- hi-then-lo matches DR_EXEC record format.
+;  Format: DB hi,lo,"text",$00  -- hi-then-lo matches DR_EXEC record format.
 ;  $22=DQ $3B=semicolon  in-string chars that need escaping.
 ; =============================================================================
 PROG:
-        DB 0,20,"PRINT ",$22,"-- uBASIC2650 Showcase --",$22,$0D
-        DB 0,30,"PRINT ",$22,"--- PRINT / CHR$ / TAB ---",$22,$0D         ; 30
-        DB 0,40,"PRINT CHR$(65);CHR$(66);CHR$(67)",$0D                    ; 40  ABC via CHR$
-        DB 0,43,"PRINT",$0D                                                ; 43  newline
-        DB 0,44,"PRINT TAB(4);",DQ,"Hi",DQ,$0D                            ; 44  TAB(4) then "Hi"
-        DB 0,50,"PRINT ",$22,"--- ARITHMETIC ---",$22,$0D
-        DB 0,60,"PRINT ",$22,"3+4=",$22,$3B,"3+4",$3B,$22,"  10-3=",$22,$3B,"10-3",$3B,$22,"  6*7=",$22,$3B,"6*7",$0D
-        DB 0,70,"PRINT ",$22,"20/4=",$22,$3B,"20/4",$0D
-        DB 0,80,"PRINT ",$22,"--- COMPARISONS ---",$22,$0D
-        DB 0,90,"IF 3<9 PRINT ",$22,"3<9 ok",$22,$0D
-        DB 0,100,"IF 7=7 PRINT ",$22,"7=7 ok",$22,$0D
-        DB 0,110,"IF 9!=2 PRINT ",$22,"9!=2 ok",$22,$0D
-        DB 0,120,"IF 9!<4 PRINT ",$22,"9!<4 ok",$22,$0D
-        DB 0,130,"IF 4<9 PRINT ",$22,"9>4 ok",$22,$0D
-        DB 0,135,"IF 9!<6 PRINT ",$22,"6<=9 ok",$22,$0D
-        DB 0,140,"PRINT ",$22,"--- LOOP via GOTO ---",$22,$0D
-        DB 0,150,"I=1",$0D
-        DB 0,160,"IF 5<I GOTO 190",$0D
-        DB 0,170,"PRINT I",$3B,$0D
-        DB 0,180,"I=I+1",$0D
-        DB 0,185,"GOTO 160",$0D
-        DB 0,190,"PRINT ",$22,"",$22,$0D
-        DB 0,195,"PRINT ",$22,"--- GOSUB/RETURN ---",$22,$0D
-        DB 0,196,"GOSUB 210",$0D
-        DB 0,197,"PRINT",$0D                                                ; newline after the nested-call line
-        DB 0,198,"GOTO 300",$0D
-        DB 0,210,"PRINT ",$22,"L1 ",$22,$3B,$0D
-        DB 0,211,"GOSUB 220",$0D
-        DB 0,212,"PRINT ",$22,"L1-done ",$22,$3B,$0D
-        DB 0,213,"RETURN",$0D
-        DB 0,220,"PRINT ",$22,"L2 ",$22,$3B,$0D
-        DB 0,221,"GOSUB 230",$0D
-        DB 0,222,"PRINT ",$22,"L2-done ",$22,$3B,$0D
-        DB 0,223,"RETURN",$0D
-        DB 0,230,"PRINT ",$22,"L3 ",$22,$3B,$0D
-        DB 0,231,"GOSUB 240",$0D
-        DB 0,232,"PRINT ",$22,"L3-done ",$22,$3B,$0D
-        DB 0,233,"RETURN",$0D
-        DB 0,240,"PRINT ",$22,"L4-deepest ",$22,$3B,$0D                     ; 4 levels deep - the documented max
-        DB 0,241,"RETURN",$0D
-        DB 1,44,"PRINT ",$22,"--- MANDELBROT ---",$22,$0D                  ; 300
-        DB 1,54,"I=-64",$0D                                                ; 310
-        DB 1,64,"IF 56<I GOTO 510",$0D                                     ; 320
-        DB 1,74,"D=I",$0D                                                  ; 330
-        DB 1,84,"C=-144",$0D                                               ; 340
-        DB 1,94,"IF 28<C GOTO 480",$0D                                     ; 350
-        DB 1,104,"A=C",$0D                                                 ; 360
-        DB 1,105,"B=D",$0D                                                 ; 361
-        DB 1,106,"E=0",$0D                                                 ; 362
-        DB 1,107,"N=1",$0D                                                 ; 363
-        DB 1,108,"GOSUB 600",$0D                                           ; 364 escape-count subroutine (below)
-        DB 1,174,"IF 0<E PRINT CHR$(E+32);",$0D                           ; 430 char for iteration depth
-        DB 1,184,"IF E=0 PRINT CHR$(32);",$0D                             ; 440 space for unescaped
-        DB 1,194,"C=C+4",$0D                                              ; 450
-        DB 1,204,"GOTO 350",$0D                                            ; 460
-        DB 1,224,"PRINT",$0D                                               ; 480 end of row newline
-        DB 1,234,"I=I+6",$0D                                               ; 490
-        DB 1,244,"GOTO 320",$0D                                            ; 500
-        DB 1,254,"END",$0D                                                 ; 510
-        DB 2,88,"IF 16<N GOTO 650",$0D                                     ; 600 escape-count subroutine:
-        DB 2,98,"IF 0<E GOTO 640",$0D                                      ; 610   same iteration logic as
-        DB 2,108,"T=(A*A/64)-(B*B/64)+C",CR                                 ; 620   before, now GOSUB-called
-        DB 2,113,"B=2*A*B/64+D",$0D                                        ; 625   once per pixel instead
-        DB 2,114,"A=T",$0D                                                 ; 626   of being inlined there
-        DB 2,118,"IF 256<((A*A/64)+(B*B/64)) IF E=0 E=N",CR               ; 630
-        DB 2,128,"N=N+1",$0D                                               ; 640
-        DB 2,129,"IF 16<N GOTO 650",$0D                                    ; 641
-        DB 2,130,"GOTO 600",$0D                                            ; 642
-        DB 2,138,"RETURN",$0D                                              ; 650
+        DB 0,10,"REM -- Rem does nothing --", $00
+        DB 0,20,"PRINT ",$22,"-- uBASIC2650 Showcase --",$22,$00
+        DB 0,30,"PRINT ",$22,"--- PRINT / CHR$ / TAB ---",$22,$00         ; 30
+        DB 0,40,"PRINT CHR$(65);CHR$(66);CHR$(67)",$00                    ; 40  ABC via CHR$
+        DB 0,43,"PRINT",$00                                                ; 43  newline
+        DB 0,44,"PRINT TAB(4);",DQ,"Hi",DQ,$00                            ; 44  TAB(4) then "Hi"
+        DB 0,50,"PRINT ",$22,"--- ARITHMETIC ---",$22,$00
+        DB 0,60,"PRINT ",$22,"3+4=",$22,$3B,"3+4",$3B,$22,"  10-3=",$22,$3B,"10-3",$3B,$22,"  6*7=",$22,$3B,"6*7",$00
+        DB 0,70,"PRINT ",$22,"20/4=",$22,$3B,"20/4",$00
+        DB 0,80,"PRINT ",$22,"--- COMPARISONS ---",$22,$00
+        DB 0,90,"IF 3<9 PRINT ",$22,"3<9 ok",$22,$00
+        DB 0,100,"IF 7=7 PRINT ",$22,"7=7 ok",$22,$00
+        DB 0,110,"IF 9!=2 PRINT ",$22,"9!=2 ok",$22,$00
+        DB 0,120,"IF 9!<4 PRINT ",$22,"9!<4 ok",$22,$00
+        DB 0,130,"IF 4<9 PRINT ",$22,"9>4 ok",$22,$00
+        DB 0,135,"IF 9!<6 PRINT ",$22,"6<=9 ok",$22,$00
+        DB 0,140,"PRINT ",$22,"--- LOOP via GOTO ---",$22,$00
+        DB 0,150,"I=1",$00
+        DB 0,160,"IF 5<I GOTO 190",$00
+        DB 0,170,"PRINT I",$3B,$00
+        DB 0,180,"I=I+1",$00
+        DB 0,185,"GOTO 160",$00
+        DB 0,190,"PRINT ",$22,"",$22,$00
+        DB 0,195,"PRINT ",$22,"--- GOSUB/RETURN ---",$22,$00
+        DB 0,196,"GOSUB 210",$00
+        DB 0,197,"PRINT",$00                                                ; newline after the nested-call line
+        DB 0,198,"GOTO 300",$00
+        DB 0,210,"PRINT ",$22,"L1 ",$22,$3B,$00
+        DB 0,211,"GOSUB 220",$00
+        DB 0,212,"PRINT ",$22,"L1-done ",$22,$3B,$00
+        DB 0,213,"RETURN",$00
+        DB 0,220,"PRINT ",$22,"L2 ",$22,$3B,$00
+        DB 0,221,"GOSUB 230",$00
+        DB 0,222,"PRINT ",$22,"L2-done ",$22,$3B,$00
+        DB 0,223,"RETURN",$00
+        DB 0,230,"PRINT ",$22,"L3 ",$22,$3B,$00
+        DB 0,231,"GOSUB 240",$00
+        DB 0,232,"PRINT ",$22,"L3-done ",$22,$3B,$00
+        DB 0,233,"RETURN",$00
+        DB 0,240,"PRINT ",$22,"L4-deepest ",$22,$3B,$00                     ; 4 levels deep - the documented max
+        DB 0,241,"RETURN",$00
+        DB 1,44,"PRINT ",$22,"--- MANDELBROT ---",$22,$00                  ; 300
+        DB 1,54,"I=-64",$00                                                ; 310
+        DB 1,64,"IF 56<I GOTO 510",$00                                     ; 320
+        DB 1,74,"D=I",$00                                                  ; 330
+        DB 1,84,"C=-144",$00                                               ; 340
+        DB 1,94,"IF 28<C GOTO 480",$00                                     ; 350
+        DB 1,104,"A=C",$00                                                 ; 360
+        DB 1,105,"B=D",$00                                                 ; 361
+        DB 1,106,"E=0",$00                                                 ; 362
+        DB 1,107,"N=1",$00                                                 ; 363
+        DB 1,108,"GOSUB 600",$00                                           ; 364 escape-count subroutine (below)
+        DB 1,174,"IF 0<E PRINT CHR$(E+32);",$00                           ; 430 char for iteration depth
+        DB 1,184,"IF E=0 PRINT CHR$(32);",$00                             ; 440 space for unescaped
+        DB 1,194,"C=C+4",$00                                              ; 450
+        DB 1,204,"GOTO 350",$00                                            ; 460
+        DB 1,224,"PRINT",$00                                               ; 480 end of row newline
+        DB 1,234,"I=I+6",$00                                               ; 490
+        DB 1,244,"GOTO 320",$00                                            ; 500
+        DB 1,254,"END",$00                                                 ; 510
+        DB 2,88,"IF 16<N GOTO 650",$00                                     ; 600 escape-count subroutine:
+        DB 2,98,"IF 0<E GOTO 640",$00                                      ; 610   same iteration logic as
+        DB 2,108,"T=(A*A/64)-(B*B/64)+C",NUL                                 ; 620   before, now GOSUB-called
+        DB 2,113,"B=2*A*B/64+D",$00                                        ; 625   once per pixel instead
+        DB 2,114,"A=T",$00                                                 ; 626   of being inlined there
+        DB 2,118,"IF 256<((A*A/64)+(B*B/64)) IF E=0 E=N",NUL               ; 630
+        DB 2,128,"N=N+1",$00                                               ; 640
+        DB 2,129,"IF 16<N GOTO 650",$00                                    ; 641
+        DB 2,130,"GOTO 600",$00                                            ; 642
+        DB 2,138,"RETURN",$00                                              ; 650
 SHOWCASE_END:
 
         END
