@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.17
+ * Version: 1.18
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -28,6 +28,36 @@
  *            grouping. Division by zero is an error. Trailing text the
  *            grammar can't parse is a hard error (was silently dropped
  *            pre-1.17 — BUG-ASM-15).
+ *
+ * Changes v1.17 -> v1.18:
+ *   BUG-ASM-16 FIXED: a DB whose operand can't be evaluated yet in pass 1 (a
+ *     FORWARD reference to a label defined later in the file, e.g.
+ *       PEH  DB <SHOWCASE_END      ; SHOWCASE_END defined further down
+ *     ) was counted as ZERO bytes: the !ok branch of the DB handler did
+ *     "continue" without advancing pc, whereas the DW handler already did
+ *     emit(pc,0);pc++ in the same situation. Every label after such a DB was
+ *     therefore assigned an address too low (one byte per affected operand) in
+ *     pass 1, pass 2 then emitted the bytes at the wrong place, and the run
+ *     still ended "0 error(s)". Minimal repro:
+ *       A: DB <B      ; A, C, D all came out $0000 (should be $0000, $0001, $0002)
+ *       C: DB >B
+ *       D: DB 1
+ *          ORG 16
+ *       B: DB 5
+ *     Fixed by advancing pc (emitting a placeholder 0) in that branch, exactly
+ *     as DW does; pass 2 overwrites it with the real value. DW was never affected.
+ *   BUG-ASM-17 FIXED: the "can use relative form (offset N)" hint for absolute
+ *     branches (BCTA/BCFA/BSTA/BSFA/BRNA/BIRA/BDRA/BSNA...) computed its offset
+ *     as target-(pc+1) with pc still at the START of the 3-byte instruction, but
+ *     the real relative encoding (emit_rel, called after the opcode byte has been
+ *     emitted) uses target-(start+2). The hint was therefore one too high: it
+ *     reported a reachable branch at real offset -65 as "-64" (converting it then
+ *     failed with "relative offset -65 out of range") and failed to hint a valid
+ *     real +63 (hint +64). Fixed by passing pc+1 at all three call sites, so the
+ *     reported offset is exactly the one emit_rel would use.
+ *   Verified: pBASIC2650 v0.30/v0.31 (which use neither construct) assemble to
+ *     byte-identical hex under v1.16, v1.17 and v1.18; the two repros above now
+ *     behave correctly.
  *
  * Changes v1.16 -> v1.17:
  *   Added --no-warn-branch-skip (on by default): warns when a BCTR/BCTA
@@ -234,7 +264,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.17"
+#define ASM2650_VERSION "1.18"
 
 typedef struct { char name[64]; int value; int referenced; int def_line; } Label;
 static Label labels[MAX_LABELS];
@@ -714,6 +744,7 @@ static void assemble_line(char *line){
                 int ok,v=eval_expr(ops[i],&ok);
                 if(!ok){
                     if(pass==2){ fprintf(stderr,"ERROR line %d: bad DB expression '%s'\n",lineno,ops[i]); errors++; }
+                    emit(pc,0); pc++;   /* BUG-ASM-16: keep pc advancing (forward ref in pass 1), as DW does */
                     continue;
                 }
                 emit(pc,(unsigned char)(v&0xFF)); pc++;
@@ -806,7 +837,7 @@ static void assemble_line(char *line){
             else {
                 if(pass==2 && warn_local_abs_branch && ok){
                     int off=0;
-                    if(rel_offset_if_possible(v,pc,&off)){
+                    if(rel_offset_if_possible(v,pc+1,&off)){
                         fprintf(stderr,"WARN line %d: %s can use relative form (offset %d)\n",lineno,mn,off);
                     }
                 }
@@ -825,7 +856,7 @@ static void assemble_line(char *line){
             if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,addr_s); errors++;}
             if(pass==2 && warn_local_abs_branch && ok){
                 int off=0;
-                if(rel_offset_if_possible(v,pc,&off)){
+                if(rel_offset_if_possible(v,pc+1,&off)){
                     fprintf(stderr,"WARN line %d: %s can use relative form (offset %d)\n",lineno,mn,off);
                 }
             }
@@ -841,7 +872,7 @@ static void assemble_line(char *line){
         if(!ok&&pass==2){fprintf(stderr,"ERROR line %d: bad %s operand '%s'\n",lineno,mn,addr_s); errors++;}
         if(pass==2 && warn_local_abs_branch && ok){
             int off=0;
-            if(rel_offset_if_possible(v,pc,&off)){
+            if(rel_offset_if_possible(v,pc+1,&off)){
                 fprintf(stderr,"WARN line %d: %s can use relative form (offset %d)\n",lineno,mn,off);
             }
         }
