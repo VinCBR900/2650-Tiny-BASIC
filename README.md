@@ -8,11 +8,11 @@
 >
 > To be frank, without these agents this work would not have been possible.
 > 
-You can play with the 2kbyte Interpreter online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
+You can play with these online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
 
 These integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article availble [here](/docs/history.md), summarized below. Three versions are available
-  * **pBASIC2650** - Proof of concept, Smallest Useful 2650 Tiny BASIC.  Only has `<` and `=` relops, flat precedence math but full signed 16 bit `+`/`-`/`*`/`/`. Delete/Append only BASIC line entry, less than 1700 ROM bytes including bitbang serial.
-  * **uBASIC2650** - 2kbyte Minimal Tiny BASIC with 4 level `GOSUB`/`RETURN`.  BODMAS lite operator precedence, uses `!=` and `!<` to emulate other relops.  Still append only line handling (Sorry)
+  * **pBASIC2650** - Proof of concept, Smallest Useful 2650 Tiny BASIC.  Only has `<` and `=` relops, flat precedence math but full signed 16 bit `+`/`-`/`*`/`/`. Delete/Append only BASIC line entry, less than 1500 ROM bytes including bitbang serial.
+  * **uBASIC2650** - <2kbyte Minimal Tiny BASIC with 4 level `GOSUB`/`RETURN`.  BODMAS lite operator precedence, uses `!=` and `!<` to emulate other relops.  Still append only line handling (Sorry)
   * **4kBASIC2650** - Standard Tiny BASIC with `GOSUB`/`RETURN`, `FOR`/`NEXT`, Functions, proper six relops, and normal BASIC line entry. Was previously called uBASIC but renamed since chunky.    
 
 Development first started with uBASIC but I coudln't get it to less than ~2.5kbyte when the target was 2kbyte, so I padded it out with features e.g. `HEX$(num)` to 4kbyte.  It was only after I developed pBASIC65c02 I realised I could use same techniques here, which led to minimal pBASIC, then expanded pBASIC which become V2 uBASIC and original uBASIC became 4kBASIC.
