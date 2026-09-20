@@ -1,5 +1,5 @@
 ; pBASIC2650.asm - PoC Minimal Tiny BASIC for Signetics 2650
-; v0.30 - Sep 2026
+; v0.31 - Sep 2026
 ; Vincent Crabtree - MIT License
 ;
 ; TARGET
@@ -61,6 +61,7 @@
 ;   A new line number must be greater than the current highest,
 ;   or equal to it to replace/delete the last line.
 ;   Input is not bounds-checked; overlong lines will corrupt memory.
+;   Line 0 is an ordinary line: "0 PRINT 1" is stored/listed/RUN able.
 ;
 ; NESTED UNARY MINUS ( -(-(-(...  about 6 deep ) recurses on the hardware RAS
 ;   with no guard and can wrap it; parentheses are guarded (PDEPTH/PE_RAS_LIMIT),
@@ -80,57 +81,30 @@
 ; VERSION HISTORY (pBASIC2650)
 ; =============================================================================
 ;
-; v0.30 (Sep 2026) - ROMEND: $05B2 (1458 bytes)   [v0.29 as uploaded: $0645 / 1605]
-;   BUG FIXES (found while checking line entry after NEW)
-;   - Line entry: TSL_CPYDONE's "tail call" into TMP_TO_ET was a ZBSR, so after
-;     storing a line it returned and FELL THROUGH into FIND_LINE, whose CC=EQ
-;     made REPL also execute the stored line - every stored line printed ?4
-;     (and a replaced line printed ?4@garbage). Now ZBRR; returns CC=GT. 0 bytes.
-;   - RUN left RUNFLG=1 after a normal program end (TMP==PE returned via RETC,EQ
-;     without clearing it), so a later immediate-mode error printed a stale
-;     "@line". DR_LP now clears on GT or EQ (BCFA,LT CLR_RUNFLG). -1 byte.
+; v0.31 (Sep 2026) - ROMEND: $059E (1438 bytes)   [v0.30: $05B2 / 1458]
+;   - PEH:PEL is now preset by the ASSEMBLER for showcase demo - delete for ROM. 
+;   - Line number 0 is no longer special-cased in TRY_STORE_LINE (-10 bytes)
+;
+; v0.30 (Sep 2026) - ROMEND: $05B2 (1458 bytes)   
+;   - TSL_CPYDONE's "tail call" into TMP_TO_ET used a ZBSR not ZBRR - corrected.
+;   - RUN left RUNFLG=1 after a normal program end. DR_LP now clears on GT or EQ
 ;   - Operator-first lines ("-A", "*A", "/A", "=A", "<A") were silently accepted
-;     (or ran a division): MD_SCAN began at table row 0, the operator rows. It now
-;     starts at the first statement row (literal 18), so they give ?4. 0 bytes.
-;     NB asm2650 silently assembles the expression "6*3" as 6 - use literals.
-;   SIZE (ROMEND $0645 -> $05B2 with the fixes above)
-;   - GETLINE sets IPH:IPL itself: SET_IP_IBUF, its vector slot and 2 call sites
-;     are gone. IBUF moved to $1010 (hi == lo) so IP = IBUF is one LODI + two STRA.
-;     RAM total unchanged (SC1 -> IBUF -> PEH ...).
+;   - GETLINE sets IPH:IPL itself: SET_IP_IBUF deleted.
 ;   - MD_HIT: step-then-test keyword eater, one branch instead of two.
 ;   - R2 now holds the variable's VARS byte offset (2*index): PARSE_VAR_SAVE
-;     drops its ADDI, DL_STORE its recompute and indexes with R2 directly;
-;     PF_LOADVAR uses ADDZ,R0 instead of STRZ/ADDZ/STRZ.
-;   - TRY_STORE_LINE digit test: SUBI/COMI + BCFR,GT TSL_NUM. The inverted sense
-;     needs no "not equal" condition (and no db $EC skip).
-;   - Dead WSKIP calls removed: DO_GOTO/DO_WR (EXPR_ATOM skips leading spaces),
-;     TSL_NUM (IP already on the digit), TSL_NZ (TSL_WRITE's WSKIP_PEEK does it).
+;   - TRY_STORE_LINE digit test: SUBI/COMI + BCFR,GT TSL_NUM.
+;   - Dead WSKIP calls removed: DO_GOTO/DO_WR/TSL_NUM (IP already on the digit),
+;     TSL_NZ (TSL_WRITE's WSKIP_PEEK does it).
 ;   - NEGFLG polarity is now 0 = negate: PARSE_S16 sets it with one EORI/STRA
-;     (0 exactly for '-'), ABS_TMP writes it fresh, so no clears anywhere;
-;     ABS_EXP toggles $80; NEG_EXP returns on GT/LT.
-;   - PRINT_S16: R2 save/restore removed (nothing needs R2 after a print, and the
-;     digit path always clobbered it - only the zero path used to restore it).
+;   - PRINT_S16: R2 save/restore removed 
 ;   - DO_NEW: SET_TMP_PROG + TMP_TO_ET (its IP write had no reader).
-;   - Arithmetic core: DV_LP subtracts IN PLACE with a WC-chained 16-bit
-;     subtract and tests the final carry (no compare pass, no scratch: the
-;     remainder is dead). MULT_LOOP is a leaf (decrement-with-borrow test +
-;     inline WC add) shared by DO_MUL and PU16; PU16 preloads EXP with the digit
-;     so MULT_LOOP yields digit + 10*value (no final add / carry step). DO_ADD
-;     uses a WC add, so CARRY_INTO_EXPH (+ slot) and EXP16_TO_TMP are gone.
+;   - Arithmetic core: Added MULT_LOOP decrement-with-borrow test + inline WC add)
+;     shared by DO_MUL and PU16, CARRY_INTO_EXPH & EXP16_TO_TMP deleted.
 ;   - Relops park their partial result in R1 (EORA/STRZ,R1/COMZ,R1), not SC0.
-;   - FIND_LINE/FIND_INS read the stored line's lo byte with *TMPH,R1 (indirect
-;     indexed) instead of computing TMP+1 - INC16_TMP_TO_EXP is gone.
+;   - FIND_LINE/FIND_INS uses indirect indexed, INC16_TMP_TO_EXP is gone.
 ;   - Vector-table caller counts regenerated (several were stale).
-;   REGRESSION: 150 inputs, output-identical to v0.29+fixes: line entry after NEW
-;   (append / replace-last / delete-last / out-of-order / delete-only-line /
-;   zero and large line numbers), expressions and sign sweeps, all statements,
-;   error paths, ASK, GOTO/IF/NEW-in-RUN, showcase incl. Mandelbrot, and random
-;   fuzz (token-soup + valid-expression). Only intended differences: operator-
-;   first lines (?4). Peak hardware RAS depth identical on every test (showcase 7/8).
-;   Known/untouched: -(-(-(-(-(-1))))) recurses on the hardware RAS unguarded
-;   (added to KNOWN LIMITATIONS); v0.29's PU16 range test also makes ':' a syntax
-;   error where it used to parse as 0.
-; v0.29 (Sep 2026) - ROMEND: $$0645 (1605 bytes)
+;
+; v0.29 (Sep 2026) - ROMEND: $0645 (1605 bytes)
 ;   - Dropped the TSL_ERR indirection 
 ;   - DO_RUN: IPH:IPL = TMPH:TMPL now via the shared TMP_TO_ET copier
 ;   - DR_LP's loop-back: BCTA,UN DR_LP -> BCTR,UN DR_LP (in range here too).
@@ -139,8 +113,6 @@
 ;     replaced with the SUBI/COMI range test
 ;   - PU16's two digit-range tests SUBI/COMI idiom
 ;   - MU_DONE's post-negate CLR_NEGFLAG confirmed dead and rmeoved.
-;   - TRY_STORE_LINE's digit test: tried same SUBI/COMI idea, "BCTR,NE"
-;     condition this CPU doesn't have (only EQ/GT/LT/UN exist) - reverted
 ;
 ; v0.28 (Sep 2026) - Stored-program record terminator: CR -> NUL, ported from
 ;   uBASIC2650wip.asm's same conversion.
@@ -338,15 +310,11 @@ VINC_ET:
 ; MAIN - Program init
 ; =============================================================================
 MAIN:
-       ; 10 bytes - Delete for ROM 
-        LODI,R0 <SHOWCASE_END
-        STRA,R0 PEH
-        LODI,R0 >SHOWCASE_END
-        STRA,R0 PEL
-
+        ; (PEH:PEL is preset at assembly time - see the RAM section - so the
+        ;  4 instructions / 10 bytes that used to load SHOWCASE_END here are gone)
         PPSL $02                ; COM=1 (unsigned compare mode) for the entire
 
-        ; clear Run flag - change to DO_NEW for ROM
+        ; clear Run flag - change to "BSTA,UN DO_NEW" for a ROM build (see PEH)
         ZBSR *VCLR_RUNFLG             
 
         ; print sign-on banner
@@ -427,7 +395,7 @@ STMT_EXEC:
         COMI,R0 A'Z'-A'A'                ; Compare against 25 (length of alphabet - 1)
         BCTR,GT SE_NOTKW                 ; Unsigned compare catches both < 'A' and > 'Z'
         LODI,R1 18                       ; scan from the first STATEMENT row (6 operator rows x 3 bytes;
-                                         ; NB asm2650 silently mis-assembles "6*3" as 6, so a literal).
+                                         ; a literal on purpose: asm2650 before v1.17 silently truncated "6*3" to 6).
                                          ; Starting at row 0 let "-A" / "*A" match an operator row and be
                                          ; silently accepted as a no-op; now they fall to SE_NOTKW -> ?4.
                                          ; It also guarantees MD_HIT's first char is a letter.
@@ -777,11 +745,8 @@ TSL_NO:
         RETC,UN
 TSL_NUM:
         ZBSR *VPARSE_S16                ; [+1]  (no WSKIP first: IP is already on the first digit)
-        LODA,R0 EXPH
-        BCTR,GT TSL_NZ
-        LODA,R0 EXPL
-        BCTR,EQ TSL_NO                   ; line number zero: not stored
-TSL_NZ:
+                                         ; (line number 0 is NOT special-cased: it is an ordinary line -
+                                         ;  see KNOWN LIMITATIONS)
         ZBSR *VEXP16_TO_LNUM             ; LNUMH:LNUML = EXPH:EXPL (parsed line number)
                                           ; (space after the number is skipped by TSL_WRITE's WSKIP_PEEK)
         ZBSR *VFIND_LINE                ; [+1] TMP=matched record (CC=EQ), or
@@ -1601,7 +1566,7 @@ DO_WR:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "pBASIC 0.30", CR, LF, NUL
+        DB CR, LF, "pBASIC 0.31", CR, LF, NUL
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -1665,10 +1630,17 @@ SWSTK   RES 2       ; next-line pointer cache [NLP_H][NLP_L] written by DR_EXEC
 SC0     RES 1       ; Scratch byte 0
 SC1     RES 1       ; Scratch byte 1
 IBUF    RES 64      ; Input buffer 64 bytes - MUST sit at $1010 (hi == lo, see GETLINE)
-PEH     RES 1       ; Program end pointer hi
-PEL     RES 1       ; Program end pointer lo
-;PEH     DB <SHOWCASE_END       ; Program end pointer hi
-;PEL     DB >SHOWCASE_END       ; Program end pointer lo
+; Program end pointer. DEMO/TEST build: preset by the ASSEMBLER to the end of the
+; preloaded showcase (RAM contents ride in with the hex file, exactly like the
+; showcase text itself), so MAIN needs no code to set it.
+; ROM build: make these "PEH RES 1" / "PEL RES 1" (delete the EQU), drop the
+; showcase DB block at PROG, and in MAIN replace "ZBSR *VCLR_RUNFLG" with
+; "BSTA,UN DO_NEW" (DO_NEW sets PE = PROG and then clears RUNFLG).
+; Deliberately ONE "DW" (hi, lo) with PEL as an EQU: asm2650 (through at least
+; v1.17) counts a "DB" whose operand is a FORWARD label as 0 bytes in pass 1, which
+; silently shifts every later label; "DW" is counted correctly.
+PEH     DW SHOWCASE_END        ; Program end pointer hi (then lo)
+PEL     EQU PEH+1              ; Program end pointer lo
 PDEPTH  RES 1       ; SW-tracked paren nesting depth 
 
 ;  --- Flags & Stuff --- 
