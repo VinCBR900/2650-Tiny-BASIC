@@ -56,6 +56,7 @@
 ;     the existing PE_RAS_LIMIT=5 guard (?8 ERR_NEST).
 ;
 ; RECENT CHANGE HISTORY
+; V4.9 (2026-09-14) - Renamed 4kBASIC, no change to features
 ;
 ; V4.9 (2026-08-16) - ROMEND $0FDB
 ;   - FIXED BUG-DL2-01: DELETE_LINE's shift-copy loop (DL2_LP) could exit up
