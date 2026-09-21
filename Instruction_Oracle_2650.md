@@ -1,4 +1,4 @@
-# **Signetics 2650 Instruction Set Oracle v1.7**
+# **Signetics 2650 Instruction Set Oracle v1.9**
 
 ## **1\. Definitions & Addressing Modes**
 
@@ -29,6 +29,24 @@ Format: \[Opcode+Reg\] \[Indirect+IndexControl+HighAddr\] \[LowAddr\]
 | **Auto-Decrement** | OP,r0 abs,rx- | rx--; r0 \= r0 OP \*(abs \+ rx) |
 
 **Note on Indexing:** When indexing is used, the instruction's register field specifies the **Index Register (rx)**. The data source/destination is hardware-locked to **r0**.
+
+**Note on address width (verified against WinArcadia's `ABS_EA` / `BRA_EA`):**
+the A-group *non-branch* instructions above do **not** carry a full 15-bit
+address. Byte 2 supplies only bits 12:8 (its top three bits are the indirect
+flag and the index-control field), so a direct LODA/STRA/ADDA/etc. reaches only
+within the **current 8 KB page**: `ea = (PC & $6000) + (operand13 & $1FFF)`.
+Indirection lifts this — the pointer fetched from memory is a full 15-bit
+address — but indexing is then applied modulo the page, so `abs + rx` wraps at
+an 8 KB boundary rather than crossing it. *Branch* absolutes (BCTA, BSTA, BRNA,
+BDRA, BXA, ...) are different: they do use the full 15-bit space.
+
+**Note on ordering of indirection vs indexing (verified):** for
+`OP,r0 *abs,rx` and its auto-modify forms, the CPU resolves the **indirection
+first**, then applies the index to the fetched pointer — `*(*(abs) + rx)`, never
+`*(*(abs + rx))`. Auto-increment and auto-decrement combine with indirection
+normally, and the register is modified before the access in both cases. Both
+`LODA,r0 *abs,rx-` and `STRA,r0 *abs,rx` are legal and correctly assembled by
+asm2650.
 
 ### **B. Relative Addressing (2-Byte Instructions)**
 
@@ -147,8 +165,23 @@ Used in BCT, BCF, BST, BSF, RET, and RETE instructions:
 
 BCF and BSF instructions do NOT test a distinct, separate "false" condition bit. They simply invert the CC comparison evaluation logic:
 
-* BCTR,v : branch if CC \== v  
-* BCFR,v : branch if CC \!= v (Note: v=3 \[UN\] is reserved for branch-false)
+| 6502/8086 Op-Code | 2650 Absolute (3-Byte) | CC Logic / Notes |
+| --- | --- | --- |
+| **JMP** / **JMP** | `BCTA,UN abs` | Unconditional|
+| **JSR** / **CALL** | `BSTA,UN abs` | Unconditional|
+| **RTS** / **RET** | `RETC,UN` | Unconditional return from subroutine|
+| **BEQ** / **JZ** | `BCTA,EQ abs` | Branch if CC == EQ |
+| **BNE** / **JNZ** | `BCFA,EQ abs` | Branch if CC != EQ (Inverts evaluation logic)|
+| **BMI** / **JS** | `BCTA,LT abs` | Branch if CC == LT (Result is negative / bit 7 set)|
+| **BPL** / **JNS** | `BCFA,LT abs` | Branch if CC != LT (Catches both GT and EQ states)|
+| **BGT** / **JG** | `BCTA,GT abs` | Branch if CC == GT (Result is positive nonzero)|
+| **BLE** / **JLE** | `BCFA,GT abs` | Branch if CC != GT (Inverts evaluation logic)|
+| **BLT** / **JL** | `BCTA,LT abs` | Branch if CC == LT (Less Than)|
+| **BGE** / **JGE** | `BCFA,LT abs` | Branch if CC != LT (Inverts evaluation logic)|
+| **BCS** / **JC** | `TPSL $01` → `BCTA,EQ abs` | Requires explicit bit-test where EQ means all selected bits are 1|
+| **BCC** / **JNC** | `TPSL $01` → `BCTA,LT abs` | Requires explicit bit-test where LT means test failed|
+| **LOOP** / **DJNZ** | `BDRA,rn abs` | Decrements `rn`, then branches if the result is **non-zero**. `LODI,rn N` gives exactly N iterations. See section 4|
+| **CBNZ** *(Reg != 0)* | `BRNA,rn abs` | Tests register directly; CC is tested but not modified|
 
 ### **Hardware Stack (RAS)**
 
@@ -265,6 +298,8 @@ ZBSR    \*zero       ;push(PC); PC \= \*(0 + zero);               ;5,2
 PIPBUG ROM — these instructions are **unusable for user jumps under PIPBUG**.  
 User code base is $0C00; there is no page-zero RAM available for targets.
 
+### **Indirect Branch with offset **
+
 BXA     abs,r3       ;goto abs \+ r3;                          ;3,3  
 BXA     \*abs,r3      ;goto \*(abs) \+ r3;                       ;5,3  
 BSXA    abs,r3       ;gosub abs \+ r3;                         ;3,3  
@@ -296,16 +331,37 @@ BIRA,rn \*abs        ;rn++; if (rn \!= 0\) PC \= \*abs;             ;5,3
 
 ### **BDRR / BDRA — Branch and Decrement Register**
 
-BDRR,rn rel         ;rn--; if (rn \>= 0\) PC \+= rel;             ;3,2  
-BDRA,rn abs         ;rn--; if (rn \>= 0\) PC \= abs;              ;3,3  
-BDRA,rn \*abs        ;rn--; if (rn \>= 0\) PC \= \*abs;             ;5,3
+BDRR,rn rel         ;rn--; if (rn \!= 0\) PC \+= rel;             ;3,2  
+BDRA,rn abs         ;rn--; if (rn \!= 0\) PC \= abs;              ;3,3  
+BDRA,rn \*abs        ;rn--; if (rn \!= 0\) PC \= \*abs;             ;5,3
 
-Register IS decremented before SIGNED test. **Practical behavior:** Loop continues while rn \!= $FF. Loop exits when rn underflows from $00 to $FF (-1 signed). This is the most compact loop instruction — just 2 bytes, decrement is free:
+⚠️ **CORRECTED IN v1.9 — this was documented wrongly up to v1.8.** The test is
+**NON-ZERO**, not signed \>= 0. The register is decremented (8-bit, underflow
+wraps $00 \-\> $FF) and the branch is taken if the new value is non-zero. This is
+the same rule BIRR/BIRA use, in the opposite direction.
 
-        LODI,R1 4       ; will take 5 iterations: 4-\>3-\>2-\>1-\>0-\>FF(exits)  
+**Practical behavior:** the loop runs exactly N times for LODI,rn N. It exits
+when the register reaches $00. A register that starts at $00 gives 256
+iterations ($00 \-\> $FF \-\> ... \-\> $00), which is how a maximum-length delay
+loop is written. This is the most compact loop instruction — just 2 bytes, and
+the decrement is free:
+
+        LODI,R1 4       ; exactly 4 iterations: 4-\>3-\>2-\>1-\>0 (exits)  
 LOOP:  
         ; body  
-        BDRR,R1 LOOP    ; R1--, branch if R1 \>= 0 signed (2 bytes per loop-close)
+        BDRR,R1 LOOP    ; R1--, branch if R1 \!= 0 (2 bytes per loop-close)
+
+**Consequence for 2-pass loops.** BDRR cannot walk an index down to and
+including 0, because the pass where the register would be 0 is the pass that
+does not happen. To move a 2-byte field with the index reaching 0, drive the
+index from the addressing mode's auto-decrement and close the loop with BRNR,
+which tests without modifying:
+
+        LODI,R1 2  
+LP:  
+        LODA,R0 SRC,R1-   ; R1 2-\>1: SRC+1 ; 1-\>0: SRC+0  
+        STRA,R0 \*PTR,R1   ; same index reaches \*(PTR)+1 then \*(PTR)+0  
+        BRNR,R1 LP        ; R1 untouched; exits when R1 == 0
 
 ## **5\. System, Status & I/O**
 
@@ -357,7 +413,7 @@ PSL: CC1\[7\] CC0\[6\] IDC\[5\] RS\[4\] WC\[3\] OVF\[2\] COM\[1\] C\[0\]
 * **COM** \= bit 1 — compare mode (0=signed, 1=unsigned)  
 * **C** \= bit 0 — carry / borrow
 
-⚠️ **CRITICAL PITFALL:** The COM status bit exclusively impacts the execution of explicit comparison instructions (COMA, COMR, COMI, COMZ). It has **no effect** on how standard math (ADD, SUB) or register-branching instructions (BDRR, BRNR) evaluate signed vs. unsigned values. BDRR and BDRA always perform a signed arithmetic test (rn \>= 0), regardless of the COM bit state.
+⚠️ **CRITICAL PITFALL:** The COM status bit exclusively impacts the execution of explicit comparison instructions (COMA, COMR, COMI, COMZ). It has **no effect** on how standard math (ADD, SUB) or register-branching instructions (BDRR, BIRR, BRNR) behave. Those three do not perform a signed or unsigned *comparison* at all — BDRR/BIRR test the post-modification register against zero, and BRNR tests the register against zero — so the COM bit is irrelevant to every one of them.
 
 ### **Multi-Byte Arithmetic Control (WC alternative)**
 
@@ -388,11 +444,35 @@ Use IORZ,R0 (R0 |= R0, no-op) or EORZ,R0 (R0 ^= R0 → clears R0) instead of LOD
 
 COUT  $02B4   BSTA,UN $02B4   R0 → terminal         confirmed working  
 CHIN  $0286   BSTA,UN $0286   R0 ← terminal         non-blocking in WinArcadia  
-CRLF  $008A   BSTA,UN $008A   print CR+LF
 
 User code: ORG $0C00, run via G 0C00. PIPBUG ROM $0000-$03FF (read-only). First free RAM: $0440. PIPBUG RAM $0400-$043F (reserved). ZBSR/ZBRR target range $0000-$007F is entirely within PIPBUG ROM — unusable under PIPBUG.
 
 ## **7\. Version History**
+### **Changes v1.8 \-\> v1.9 Updated: 2026-09-16**
+
+* **FIXED BDRR/BDRA semantics (was wrong since first written).** The document
+  claimed a signed `rn \>= 0` test, continuing while `rn != $FF` and exiting on
+  underflow from $00 to $FF, and gave a worked example claiming `LODI,R1 4`
+  yields 5 iterations. All of that is wrong. The instruction decrements and
+  branches if the result is **non-zero**: `LODI,rn N` gives exactly N
+  iterations. Confirmed in WinArcadia's 2650 core (`if (r[rr])` after
+  `writereg(rr, r[rr] - 1)`, identical for BDRR and BDRA) and reproduced on a
+  traced hardware-model test. The BIRR/BIRA entry was already correct and is
+  the same rule inverted; the inconsistency between the two sections is what
+  concealed this. Note that every BDRR loop in pBASIC2650 already assumed the
+  correct behaviour, so the bug was confined to this document.
+* **ADDED 2-pass loop idiom** (auto-decrement addressing + BRNR) for the case
+  BDRR cannot express: an index that must reach 0.
+* **CORRECTED the COM-bit pitfall note**, which repeated the "signed test"
+  claim for BDRR/BDRA. BDRR, BIRR and BRNR perform no comparison at all; they
+  test the register against zero.
+* **ADDED address-width and indirect/index-ordering notes** to section 1:
+  non-branch absolute addressing is 13-bit page-local, branch absolute is
+  15-bit, indirection resolves before indexing, and indexed addresses wrap
+  within the 8 KB page.
+
+### **Changes v1.7 \-\> v1.8 Updated: 2026-09-10**
+**Conditional Branch update:** Claude still struggles with Negative logic branches so added a translation table.  
 
 ### **Changes v1.6 \-\> v1.7 Updated: 2026-06-07**
 
