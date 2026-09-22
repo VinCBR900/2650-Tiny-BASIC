@@ -1,5 +1,5 @@
 ; pBASIC2650.asm - PoC Minimal Tiny BASIC for Signetics 2650
-; v0.31 - Sep 2026
+; v0.32 - Sep 2026
 ; Vincent Crabtree - MIT License
 ;
 ; TARGET
@@ -41,12 +41,21 @@
 ;   Parentheses use a software depth counter to reduce RAS usage.
 ;
 ; BASIC LANGUAGE
-;   26 uppercase variables (A-Z), 16-bit signed integers.
-;   No arrays or string variables.
-;   PRINT supports string literals.
-;   No built-in functions.
-;   Operators: + - * / = <
-
+;   Statements: ASK V   END   GOTO expr   IF expr stmt   LIST   NEW
+;               PRINT [item {;item}]   RUN   WR expr   V=expr
+;     (no LET or THEN keyword exists - assignment and IF-bodies are bare)
+;   PRINT items: "literal", or an expression; separate with ';'.
+;   Arithmetic: + - * /  (unary -).
+;   Relops: `=`  `<` only - see DELIBERATE LIMITS below for precedence.
+;   Numbers : signed 16-bit  (-32768 .. 32767)
+;   Variables: A-Z (26), 16-bit signed; no arrays or string variables
+;   Print   : "literals", expr, `;` separator - no string vars
+;
+;   NOT IMPLEMENTED (smallest-useful-set is deliberate, not an oversight):
+;     FOR/NEXT, GOSUB/RETURN, RND, arrays, string variables,
+;     CHR$()/TAB()/HEX$(), LET, THEN, DELETE of an arbitrary line
+;     (program storage is append-only; only the last line can be
+;     replaced or deleted - see STORAGE / INPUT below).
 ;
 ;        KNOWN LIMITATIONS
 ;
@@ -74,12 +83,20 @@
 ;   Parenthesis nesting is RAS-limited via a software depth counter;
 ;   deepest guaranteed safe level is 3, e.g. "(((expr)))". Excess depth
 ;   generates ERR_NEST.
+;
 ;   Minimal syntax validation; malformed constructs may produce the
 ;   normal syntax/runtime error rather than a specialised diagnostic.
 ;
 ; =============================================================================
 ; VERSION HISTORY (pBASIC2650)
 ; =============================================================================
+;
+; v0.32 (Sep 2026) - ROMEND: $058e (1422 bytes)
+;   - DO_EQOP/DO_LTOP  share CMP_OPS compare, from uBASICwip.
+;   - DIGIT_CHECK ported from uBASIC2650wip: replaces 3 byte-
+;     identical inline copies of the digit-range test (TRY_STORE_LINE,
+;     PU16 x2) with one zero-page-vectored (VDIGIT_CHECK) call.
+;   - File header rewritten for consistancy with other variants.
 ;
 ; v0.31 (Sep 2026) - ROMEND: $059E (1438 bytes)   [v0.30: $05B2 / 1458]
 ;   - PEH:PEL is now preset by the ASSEMBLER for showcase demo - delete for ROM. 
@@ -305,6 +322,8 @@ VTMP_TO_SWSTK:
         DW TMP_TO_SWSTK     ; 2 callers (1 ZBSR, 1 ZBRR)
 VINC_ET:
         DW INC_ET           ; 2 callers (1 ZBSR, 1 ZBRR)
+VDIGIT_CHECK:
+        DW DIGIT_CHECK      ; 3 callers (all ZBSR) - ported from uBASIC
 
 ; =============================================================================
 ; MAIN - Program init
@@ -735,9 +754,7 @@ DR_SWSTK:
 ; Out: CC=GT if line stored/deleted; CC=EQ if not a numbered line
 ; Clobbers: R0, EXPH, EXPL, LNUMH, LNUML, TMPH, TMPL, CURH, CURL
 TRY_STORE_LINE:
-        LODA,R0 *IPH
-        SUBI,R0 A'0'
-        COMI,R0 9
+        ZBSR *VDIGIT_CHECK                ; R0 = char-'0'; ported from uBASIC (was inline here)
         BCFR,GT TSL_NUM                  ; unsigned range test: 0-9 ("not greater" - the inverted sense
                                          ; needs no "not equal" condition, and no db $EC skip either)
 TSL_NO:
@@ -769,14 +786,7 @@ TSL_MATCH:
         BCTR,EQ TSL_EXCISE
         ZBRR *VJSYNERR
 TSL_EXCISE:
-        LODI,R1 2                         ; REQUIRED, not redundant: R1 is
-                                          ; whatever GETLINE left it as (the
-                                          ; typed line's length) - only
-                                          ; coincidentally 2 for a 2-char
-                                          ; delete/replace. Verified: dropping
-                                          ; this corrupts PE/TMP by 1 byte and
-                                          ; silently loses a line for any
-                                          ; other length. See v0.29 history.
+        LODI,R1 2  
 TSL_LOOP:
         ; It's the last line: truncate the store back to where it started -
         ; nothing after it, so no shifting needed.
@@ -1025,36 +1035,51 @@ DO_ADD:
         ZBRR *VEXPR_LOOP
 
 ; =============================================================================
+;  CMP_OPS -- shared signed 16-bit 3-way compare. Ported from
+;  uBASIC2650wip.asm v2.7 (where it also backs FOR/NEXT's limit test -
+;  not applicable here, pBASIC has no FOR/NEXT). Biased EORI $80 compare
+;  (COM=1 set once in MAIN) avoids the raw-SUBA CC range limit that
+;  caused the old DO_LTOP bug (previously fixed in-line, pre-port, v0.19).
+; In:  TMPH:TMPL = left operand, EXPH:EXPL = right operand
+; Out: CC = LT/EQ/GT as left is <, =, > right
+; Clobbers: R0, R1
+CMP_OPS:
+        LODA,R0 EXPH
+        EORI,R0 $80                       ; bias hi bytes: signed order becomes
+        STRZ,R1                           ; unsigned order (COM=1 compares)
+        LODA,R0 TMPH
+        EORI,R0 $80
+        COMZ,R1                           ; biased left.hi : right.hi
+        RETC,GT
+        RETC,LT
+        LODA,R0 TMPL                      ; hi bytes equal: unsigned lo compare
+        COMA,R0 EXPL
+        RETC,UN
+
+; =============================================================================
 ;  DO_EQOP / DO_LTOP -- relop handlers, folded into the flat operator
-;  table. Pop left, compare against right (EXPH:EXPL), leave $0000 (false)
+;  table. Pop left, compare against right via CMP_OPS, leave $0000 (false)
 ;  or $FFFF (true) in EXPH:EXPL - not "0/1" as an earlier comment here (and
 ;  in EXPR's own header) used to claim; DO_IF's own IORA-then-RETC,EQ test
 ;  never cared (any nonzero value reads as true), so the mismatch was
-;  silent until corrected.
+;  silent until corrected. DO_GTOP deliberately not implemented - pBASIC's
+;  relops stay = and < only (v0.4). CMP_OPS still leaves the full 3-way
+;  CC, so adding it back later costs one 3-line handler, same as uBASIC's.
 DO_EQOP:
-        LODA,R0 TMPH
-        EORA,R0 EXPH                      ; 0 iff the hi bytes are equal (EOR, not SUB: same test, and the
-        STRZ,R1                           ; partial result now parks in R1 - free here - not via SC0)
-        LODA,R0 TMPL
-        EORA,R0 EXPL
-        IORZ R1                           ; 0 iff both bytes equal
+        BSTR,UN CMP_OPS
         BCTR,EQ DOP_TRUE
         BCTR,UN DOP_FALSE
 DO_LTOP:
-        LODA,R0 TMPH
-        EORI,R0 $80
-        STRZ,R1                           ; biased(left.hi) parked in R1 (free here), not SC0
-        LODA,R0 EXPH
-        EORI,R0 $80
-        COMZ,R1                           ; biased(right.hi) : biased(left.hi)
-        BCTR,GT DOP_TRUE                  ; right.hi > left.hi -> left<right
-        BCTR,LT DOP_FALSE
-        LODA,R0 EXPL
-        COMA,R0 TMPL                      ; right.lo : left.lo (hi bytes equal)
-        BCTR,GT DOP_TRUE
+        BSTR,UN CMP_OPS
+        BCTR,LT DOP_TRUE
+;        BCTR,UN DOP_FALSE
+;DO_GTOP:
+;        BSTR,UN CMP_OPS
+;        BCTR,GT DOP_TRUE
+        ; drop through: false
 DOP_FALSE:
         EORZ,R0
-        db $EC                            ; COMA,R0 -- consume next 2 bytes
+        db $EC                           ; COMA,R0 -- consume next 2 bytes
 DOP_TRUE:
         LODI,R0 $FF
         ; both paths converge here (see EORZ,R0/db $EC above): R0 = $00
@@ -1127,14 +1152,10 @@ PS16_UN:
 ; Clobbers: R0, R3, SC0, EXPH, EXPL, TMPH, TMPL (RXSAVE used to preserve R3)
 ;PARSE_U16:
         ZBSR *VCLR_EXP
-        LODA,R0 *IPH
-        SUBI,R0 A'0'
-        COMI,R0 9
+        ZBSR *VDIGIT_CHECK
         BCTR,GT PRO_NONE; surrogate for JSYNERR
 PU16_LP:
-        LODA,R0 *IPH
-        SUBI,R0 A'0'
-        COMI,R0 9
+        ZBSR *VDIGIT_CHECK
         BCTR,GT PU16_RET                  ; unsigned range test: not 0-9 -> done
 PU16_DIG:
         STRZ,R1                          ; digit -> R1 (INC_IP, EXP16_TO_ET, CLR_EXP and MULT_LOOP leave R1 alone)
@@ -1421,6 +1442,18 @@ WSKIP:
         BCTR,UN WSKIP 
 
 ; =============================================================================
+;  DIGIT_CHECK -- Is *IPH a decimal digit '0'-'9'?  Ported from
+;  uBASIC2650wip.asm: the identical 3-instruction test was inlined 3x
+;  here (TRY_STORE_LINE, PU16 x2) before this port.
+; Out: R0 = char - '0'; CC=GT if not a digit (single unsigned range test)
+; Clobbers: R0
+DIGIT_CHECK:
+        LODA,R0 *IPH
+        SUBI,R0 A'0'
+        COMI,R0 9
+        RETC,UN
+
+; =============================================================================
 ;  SHARED 16-BIT POINTER INCREMENT  - INC_ET family
 ; INC_TMP : TMPH:TMPL += 1   (offset TMPH-IPH from IPH)
 ; INC_IP  : IPH:IPL  += 1    (offset 0 from IPH)
@@ -1566,7 +1599,7 @@ DO_WR:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "pBASIC 0.31", CR, LF, NUL
+        DB CR, LF, "pBASIC 0.32", CR, LF, NUL
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
