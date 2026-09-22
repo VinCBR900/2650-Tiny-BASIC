@@ -6,7 +6,7 @@
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : <2 KB target, $0000 upward (currently 2002 bytes - see ROMEND)
+;   ROM    : <2 KB target, $0000 upward (currently 2037 bytes - see ROMEND)
 ;   RAM    : ~213 bytes, $1000 upward (half an 8 KB page above the code)
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
@@ -15,7 +15,7 @@
 ; Statements:
 ;   INPUT  END  GOTO <expr>  GOSUB <expr>  IF <cond> [THEN] <stmt>
 ;   LIST  NEW  PRINT  RETURN  RUN  [LET] <var>=<expr>  (LET and THEN optional)
-;   FOR <var>=<expr> TO <expr>   NEXT [<var>]
+;   FOR <var>=<expr> TO <expr> [STEP <expr>]   NEXT [<var>]
 ;
 ; PRINT items: "literal", CHR$(n), TAB(n), or an expression; separate with ';'.
 ;
@@ -59,9 +59,11 @@
 ;   nested GOSUB, or a RETURN with nothing pushed, raises ERR_OOM ('?3').
 ;
 ; FOR / NEXT
-;   FOR <var>=<start> TO <limit>, then NEXT [<var>].  Step is always 1.
+;   FOR <var>=<start> TO <limit> [STEP <step>], then NEXT [<var>].  Step
+;   defaults to 1 if omitted; a negative STEP counts down (limit < start).
 ;   - Test at end so Body always runs at least once
 ;   - NEXT always closes the innermost loop
+;   - STEP 0 loops forever (var never passes the limit) - no check for it.
 ;   - Leaving a loop early (GOTO / GOSUB target outside it) not permitted.
 ;
 ; STATEMENT DISPATCH matches ONLY the first character of a line.
@@ -137,9 +139,14 @@
 ;     (ERR_OOM) with the store untouched (+10). A REPLACE that does not fit has
 ;     already deleted the old line. 
 ;   - Relop refactor, added '>': 3-way compare, each handler picks its CC (EQ/LT/GT).
-;   - FOR/NEXT note STEP 1 only, body runs at least once.
+;   - FOR/NEXT: body runs at least once.
+;   - FOR/NEXT frame is pushed/popped by loops 
+;   - STEP added, frame widened to 7 bytes, holding [var][limit lo/hi]
+;     [step lo/hi][body lo/hi]; 
 ;   - SHOWCASE updated for new keywords amd relops.
-;   - ROMEND $06F6 (1782) -> $07D6 (2006 bytes)
+;   - Golf pass - duplicate digit test (LODA,R0 *IPH; SUBI,R0 A'0';
+;     COMI,R0 9) inlinedin TRY_STORE_LINE and PARSE_U16, now DIGIT_CHECK.
+;     ROMEND $07FA (2042) -> $07F5 (2037 bytes);
 ;
 ; v2.6 (Sep 2026) - Code-golf and Bigfix.
 ;   - STMT_EXEC/MD_SCAN: dispatch scan now starts at 1st STATEMENT row, skipping
@@ -292,7 +299,7 @@ ERR_OOM         EQU '3'         ; GOSUB/FOR stack full, RETURN/NEXT with nothing
 ERR_VAR         EQU '4'
 ERR_EXPR        EQU '8'         ; Expression too complex (SW stack full)
 GSSTKLIM        EQU 8           ; 4 GOSUB levels x 2 bytes
-FSTKLIM         EQU 20          ; 4 FOR levels x 5 bytes
+FSTKLIM         EQU 28          ; 4 FOR levels x 7 bytes
 PROGLIM         EQU $1FFF       ; last usable program-store address. MUST be $xxFF (one
                                 ; below a page boundary): OPEN_GAP checks the new PE's
                                 ; hi byte only. Change for other RAM sizes (1 KB: $13FF)
@@ -361,6 +368,8 @@ VEXPR_ATOM:
         DW EXPR_ATOM
 VINC_ET:
         DW INC_ET
+VDIGIT_CHECK:
+        DW DIGIT_CHECK
 
 ; =============================================================================
 ; MAIN - Program init
@@ -789,28 +798,48 @@ DO_N:
 DO_NEXT:
         LODA,R3 FSP
         BCTA,EQ DRT_UFLOW                ; NEXT with no FOR
-        LODA,R0 FSTK,R3-                 ; var's VARS offset
-        STRZ,R2
-        ADDI,R0 VARS-IPH
-        ZBSR *VINC_ET                    ; var++ (INC_ET keeps R3,R2)
-        LODA,R0 VARS,R2                  ; TMP = var
-        STRA,R0 TMPH
-        LODA,R0 VARS+1,R2
-        STRA,R0 TMPL
-        LODA,R0 FSTK,R3-                 ; EXP = limit
+        SUBI,R3 7                        ; R3 = frame base
+        LODI,R2 5
+DN_POP5:
+        LODA,R0 FSTK-1,R3+               ; var, limit lo, limit hi, step lo, step hi ...
+        STRA,R0 EXPH,R2-                 ; ... into FVAR, LNUML, LNUMH, EXPL, EXPH
+        BRNR,R2 DN_POP5
+        LODA,R2 FVAR
+        LODA,R1 EXPH                     ; keep the step's sign (CMP_OPS trashes R1)
+        LODA,R0 EXPL                     ; EXP = step + var
+        ADDA,R0 VARS+1,R2
         STRA,R0 EXPL
-        LODA,R0 FSTK,R3-
+        PPSL PSW_WC
+        LODA,R0 EXPH
+        ADDA,R0 VARS,R2
+        CPSL PSW_WC
         STRA,R0 EXPH
-        BSTA,UN CMP_OPS                  ; var : limit (signed)
-        BCTR,GT DN_POP                   ; var > limit: loop is finished
-        LODA,R0 FSTK,R3-                 ; body -> SWSTK: DR_CD resumes there
-        STRA,R0 SWSTK+1
-        LODA,R0 FSTK,R3-
-        STRA,R0 SWSTK
-        RETC,UN
+        BSTA,UN DL_STORE                 ; var = var + step
+        LODZ,R1
+        STRZ,R2                          ; R2 = step's sign
+        LODI,R1 2
+DN_LIM:
+        LODA,R0 LNUMH,R1-                ; TMP = limit (CMP_OPS's left operand)
+        STRA,R0 TMPH,R1
+        BRNR,R1 DN_LIM
+        BSTA,UN CMP_OPS                  ; limit (TMP) : var (EXP), signed
+        BCTR,EQ DN_GO                    ; var = limit: one more pass
+        BCTR,GT DN_UP                    ; limit above var
+        LODZ,R2                          ; limit below var: still going only if step < 0
+        BCTR,LT DN_GO
 DN_POP:
-        SUBI,R3 2                        ; R3 = frame base: pop it
+        SUBI,R3 5                        ; back to the frame base: pop it
         STRA,R3 FSP
+        RETC,UN
+DN_UP:
+        LODZ,R2                          ; limit above var: finished if step < 0
+        BCTR,LT DN_POP
+DN_GO:
+        LODI,R2 2
+DN_BODY:
+        LODA,R0 FSTK-1,R3+               ; body lo, body hi -> SWSTK: DR_CD
+        STRA,R0 SWSTK,R2-                ; resumes there
+        BRNR,R2 DN_BODY
         RETC,UN
 
 ; -----------------------------------------------------------------------------
@@ -1035,9 +1064,7 @@ CMP_TMP_PE:
 ; Clobbers: R0, R1, R3, EXPH, EXPL, LNUMH, LNUML, IPH, IPL, TMPH, TMPL, PEH, PEL
 ;   (PE is updated as intended; R3 = record size while a line is being stored)
 TRY_STORE_LINE:
-        LODA,R0 *IPH
-        SUBI,R0 A'0'                     ; shift '0'-'9' down to 0-9
-        COMI,R0 9                        ; single unsigned range test
+        ZBSR *VDIGIT_CHECK
         BCFR,GT TSL_NUM                  ; in 0-9 -> a numbered line
 TSL_NO:
         EORZ,R0                          ; CC=EQ: not a numbered line
@@ -1537,14 +1564,10 @@ PS16_UN:
 ; Clobbers: R0, R1, SC0, SC1, EXPH, EXPL, TMPH, TMPL
 ;PARSE_U16:
         ZBSR *VCLR_EXP
-        LODA,R0 *IPH
-        SUBI,R0 A'0'                      ; shift '0'-'9' down to 0-9
-        COMI,R0 9                         ; single unsigned range test
+        ZBSR *VDIGIT_CHECK
         BCTR,GT PRO_NONE; surrogate for JSYNERR
 PU16_LP:
-        LODA,R0 *IPH
-        SUBI,R0 A'0'
-        COMI,R0 9
+        ZBSR *VDIGIT_CHECK
         BCTR,GT NEG_EXP                    ; not a digit -> end of number
 PU16_DIG:
         STRZ,R1                          ; digit -> R1 (INC_IP, EXP16_TO_ET,
@@ -1943,19 +1966,28 @@ DO_FOR:
         BCFA,EQ JSYNERR                  ; must be TO
         ZBSR *VEATWORD
         ZBSR *VPARSE_EXPR                ; EXP = limit
+        LODI,R0 LNUMH-IPH
+        ZBSR *VEXP16_TO_ET               ; LNUM = limit (safe across the STEP expression)
+        ZBSR *VWSKIP_PEEK
+        COMI,R0 A'S'
+        BCTR,EQ DF_STEP
+        ZBSR *VCLR_EXP                   ; no STEP: EXP = 1
+        LODI,R0 EXPH-IPH
+        ZBSR *VINC_ET
+        BCTR,UN DF_GOT
+DF_STEP:
+        ZBSR *VEATWORD
+        ZBSR *VPARSE_EXPR                ; EXP = step
+DF_GOT:
         LODA,R1 FSP
         COMI,R1 FSTKLIM
         BCFA,LT DRT_UFLOW                ; all frames in use
-        LODA,R0 SWSTK
+        STRA,R2 FVAR                     ; var offset joins SWSTK, EXP and LNUM in RAM
+        LODI,R2 7
+DF_PUSH:
+        LODA,R0 SWSTK,R2-                ; SWSTK+6..+0 = FVAR, LNUML, LNUMH, EXPL, EXPH, SWSTKL, SWSTKH
         STRA,R0 FSTK-1,R1+               ; pre-increment store: FSTK[FSP++]
-        LODA,R0 SWSTK+1
-        STRA,R0 FSTK-1,R1+
-        LODA,R0 EXPH
-        STRA,R0 FSTK-1,R1+
-        LODA,R0 EXPL
-        STRA,R0 FSTK-1,R1+
-        LODZ,R2
-        STRA,R0 FSTK-1,R1+
+        BRNR,R2 DF_PUSH
         STRA,R1 FSP
         RETC,UN
 
@@ -2042,6 +2074,18 @@ WSKIP:
         BCFR,EQ WSKIPRET
         ZBSR *VINC_IP 
         BCTR,UN WSKIP 
+
+; =============================================================================
+;  DIGIT_CHECK -- Is *IPH a decimal digit '0'-'9'?  (found via a duplicate-
+;  byte-sequence scan: this 7-byte test was inlined 3x - TRY_STORE_LINE and
+;  twice in PARSE_U16 - byte-for-byte identical each time, see PORT HISTORY)
+; Out: R0 = char - '0'; CC=GT if not a digit (single unsigned range test)
+; Clobbers: R0
+DIGIT_CHECK:
+        LODA,R0 *IPH
+        SUBI,R0 A'0'
+        COMI,R0 9
+        RETC,UN
 
 ; =============================================================================
 ; CLR_EXP -- Helper Zeroes EXP
@@ -2144,14 +2188,17 @@ GOTOL   RES 1       ; pending target lo
 CURH    RES 1       ; current line hi  (error reporting)
 CURL    RES 1       ; current line lo
 
-LNUMH   RES 1       ; scratch line number hi       (DEC_ET offset 12 = LNUMH-IPH)
-LNUML   RES 1       ; scratch line number lo
-EXPH    RES 1       ; expression result hi         (INC_ET offset 4 = EXPH-IPH)
-EXPL    RES 1       ; expression result lo
+; SWSTK, EXP, LNUM and FVAR MUST stay contiguous, in this order: DO_FOR pushes
+; the seven bytes with one loop and DO_NEXT pops them back the same way.
+; During a FOR: EXP = step, LNUM = limit (LNUM is untouched by expression
+; evaluation, so it can hold the limit while the STEP expression is parsed).
 SWSTK   RES 2       ; next-line pointer cache [NLP_H][NLP_L] written by DR_EXEC
-
-SC0     RES 1       ; Scratch byte 0
-SC1     RES 1       ; Scratch byte 1
+EXPH    RES 1       ; expression result hi
+EXPL    RES 1       ; expression result lo
+LNUMH   RES 1       ; scratch line number hi
+LNUML   RES 1       ; scratch line number lo
+FVAR    RES 1       ; FOR: variable's VARS offset (staging for frame push/pop)
+FSP     RES 1       ; bytes used in FSTK: 0,7,14,21; 28=full
 
 ; Buffers - IBUF MUST be exactly 16 bytes from IPH (see above)
 IBUF    RES 64      ; Input buffer 64 bytes
@@ -2177,9 +2224,10 @@ NEGFLG  RES 1       ; Sign flag
 BANG    RES 1       ; '!' relop-invert modifier: $00 clear, $FF armed -
 GSSTK   RES 8       ; GOSUB return-address stack, 4 levels x [hi][lo]
 GSSP    RES 1       ; GOSUB stack offset into GSSTK: 0,2,4,6; 8=full
-FSTK    RES 20      ; FOR frames, 4 levels x 5 bytes, pushed in this order:
-                    ; [body hi][body lo][limit hi][limit lo][VARS offset]
-FSP     RES 1       ; bytes used in FSTK: 0,5,10,15; 20=full
+FSTK    RES 28      ; FOR frames, 4 levels x 7 bytes, pushed in this order:
+                    ; [VARS offset][limit lo][limit hi][step lo][step hi][body lo][body hi]
+SC0     RES 1       ; Scratch byte 0
+SC1     RES 1       ; Scratch byte 1
 
 ;  SW call stack -- used by PARSE_EXPR / PRINT_S16 only
 ; R3 = index ($FF=empty, grows up). Each frame = [lo][hi].
@@ -2266,7 +2314,11 @@ PROG:
         DB 1,34,"NEXT B",$00
         DB 1,35,"PRINT",$00
         DB 1,36,"NEXT A",$00
-        DB 1,39,"GOTO 300",$00
+        DB 1,37,"FOR C=10 TO 2 STEP -4",$00                                     ; 293  STEP demo: expect 10 6 2
+        DB 1,38,"PRINT C",$3B,$22," ",$22,$3B,$00                              ; 294
+        DB 1,39,"NEXT C",$00                                                   ; 295
+        DB 1,40,"PRINT",$00                                                    ; 296
+        DB 1,41,"GOTO 300",$00                                                 ; 297
         DB 1,44,"PRINT ",$22,"--- MANDELBROT ---",$22,$00                  ; 300
         DB 1,49,"M=16",$00                                                 ; 305 iteration limit (a variable FOR limit)
         DB 1,54,"FOR R=0 TO 20",$00                                        ; 310 21 rows       (FOR level 1)
