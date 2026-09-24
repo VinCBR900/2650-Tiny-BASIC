@@ -1,12 +1,12 @@
 ; =============================================================================
-; uBASIC2650 v2.9  --  Minimal Tiny BASIC for the Signetics 2650
+; uBASIC2650 v2.10  --  Minimal Tiny BASIC for the Signetics 2650
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: standalone build - I/O is bit-banged in software, no PIPBUG ROM or
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : <2 KB target, $0000 upward (see ROMEND)
+;   ROM    : <2 KB target, $0000 upward (currently 2024 bytes - see ROMEND)
 ;   RAM    : ~213 bytes, $1000 upward (half an 8 KB page above the code)
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
@@ -131,8 +131,14 @@
 ; VERSION HISTORY 
 ; =============================================================================
 ;
+; v2.10 (Sep 2026) - BUG FIX: mid-list line insert corrupted following line.
+;   - OPEN_GAP's move loop decrements PE via an inlined former DEC_PE.
+;     However still used "RETC,EQ" for fast path so bailed early. Fixed by 
+;     jumping to where subroutine end would be.
+;     ROMEND $07EF (2031 bytes)
+;
 ; v2.9 (Sep 2026) - Added ABS(x) function to EXPR, and FREE memory statement.
-;   -  ROMEND $07C5 (1989) -> $07f5 (2037 bytes).
+;   -  ROMEND $07C5 (1989) -> $07EE (2030 bytes).
 ;
 ; v2.8 (Sep 2026) - Code golf, ported from pBASIC2650.asm v0.33.
 ;   - New ADD_CORE: shared 16-bit indexed add (EXPH:EXPL += *(IPH+off)) used by
@@ -156,7 +162,7 @@
 ;     [step lo/hi][body lo/hi]; 
 ;   - SHOWCASE updated for new keywords amd relops.
 ;   - Golf pass - duplicate digit test (LODA,R0 *IPH; SUBI,R0 A'0';
-;     COMI,R0 9) inlinedin TRY_STORE_LINE and PARSE_U16, now DIGIT_CHECK.
+;     COMI,R0 9) inlined in TRY_STORE_LINE and PARSE_U16, now DIGIT_CHECK.
 ;     ROMEND $07FA (2042) -> $07F5 (2037 bytes);
 ;
 ; v2.6 (Sep 2026) - Code-golf and Bigfix.
@@ -174,7 +180,7 @@
 ;   - DIV16: remainder was unused, no MOD operator. DV_LP/DV_SUB/DV_SNB's 
 ;     refactored into destructive subtract-and-test-borrow pass
 ;   - PRINT_S16: removed the R2 save/restore 
-;   - DR_HDR: rraccred to use shared TMP_TO_ET call 
+;   - DR_HDR: refactored to use shared TMP_TO_ET call 
 ;   - NEGFLG polarity flipped to 0=negate across PARSE_S16,ABS_TMP, ABS_EXP,
 ;     NEG_EXP, DO_MUL, MU_DONE. 
 ;   - IBUF moved to $1010 so GETLINE now sets IPH:IPL with one LODI.
@@ -218,81 +224,7 @@
 ;     by simulator trace, not assumed.
 ;   - ROMEND: $075D (1885 bytes)
 ;
-; Branched from pBASIC, variants below
-; v0.22 (Sep 2026) - Zero-page vector audit (ZBSR/ZBRR vs direct BSTA/BCTA)
-;   - Refactor DO_MUL/DO_DIV to share one setup body and pick their loop via R1
-;     used in OPS_HIT.
-;   - ROMEND: $06da (1754 bytes)
-; v0.21 (Sep 2026) - Refactor for size inc OPS_LP. 
-;   - ROMEND: $075A (1882 bytes)
-; v0.20 (Sep 2026)
-;   - SUBA/COMA audit - set COM=1 once in MAIN to eliminate redundant PPSL/CPSL loads
-;   - ROMEND: $07D3 -> $07C4 
-; v0.19 (Sep 2026)
-;   - Refactor STMT_EXEC for size.
-;   - Fixed DO_LTOP '<' comparison bug caused by raw CC range limits
-;   - ROMEND: $07CB -> $07D3 
-; v0.18 (Sep 2026)
-;   - Added '!' relop-invert modifier (!=, !<) using a BANG flag and XORing
-;     into the boolean result at convergence.
-;   - ROMEND: $07BC -> $07D6 
-; v0.17 (Sep 2026)
-;   - Factored out WSKIP subroutine and ADV_TMP_PAST_REC
-;   - ROMEND: $07D7 -> $07BC 
-; v0.16 (Sep 2026)
-;   - Code golf pass: collapsed branch-to-return into RETC,EQ and removed
-;     redundant whitespace skips.
-;   - ROMEND: $07DA -> $07D7 
-; v0.15 (Sep 2026)
-;   - Added software paren-nesting tracker (PDEPTH) to eliminate hardware call
-;     frame consumption in EA_PAREN, allowing deeper expression nesting.
-;   - Repurposed dead TEMPRETH/TEMPRETL RAM cells for PDEPTH.
-;   - ROMEND: $07C5 -> $07DA 
-; v0.14 (Sep 2026)
-;   - Optimized branch elimination (RETC,LT collapses) and converted keyword
-;     dispatch (MD_SCAN/MD_HIT) to use direct register-indexed addressing on TOK_CHARS.
-;   - ROMEND: $07C5 (1989 bytes).
-; v0.13 (Sep 2026)
-;   - Removed UPCASE case-folding entirely; forced strict uppercase syntax.
-;   - ROMEND: $07F5 -> $07D7
-; V0.12 (Sep 2026)
-;   - Code golf pass. ROMEND: $7FB.
-; v0.11 (Sep 2026)
-;   - Fixed -32768 overflow bugs in MUL16 (MU_LP updated to BCFR,EQ) and
-;     DIV16 (DV_LP updated to use COMA,R0 SC0).
-;   - ROMEND: $0825 -> $082A
-; v0.10 (Sep 2026)
-;   - Fixed MUL16 loop counter decrement bug (replaced faulty BCFR,LT borrow test).
-; v0.9 (Sep 2026) - PRINT_S16 replaced with a flat power-of-10 loop
-;   - ROMEND $08C1 -> $0823 (2241 -> 2083 bytes)
-; v0.8 (Sep 2026) - Size pass: CMP_TMP_PE extraction, PRT_BS removal
-;   - ROMEND $090D -> $08C1
-; v0.7 (Sep 2026) - PAREN-NEST-02: fix wrong-operator bug in EXPR
-;   - ROMEND $08F3 -> $090D
-; v0.6 (Sep 2026) - Delete GETCI_UC, TMP_TO_EXP16, RND_SHUFFLE/VRND_SHUFFLE/RNDSEED
-;   - Inlined PUSH_RET and IP_TO_TMP    
-; v0.5 (Aug 2026) - Flatten precedence
-;   - Replaced PARSE_EXPR/EAM_ATOM/EAM_HI/EAM_LO_LOOP + SW- trampolining 
-;     (PUSH_RET/PARSER_RET/SWRETURN dance) with flat EXPR/EXPR_ATOM/EXPR_LOOP: all 
-;     operators (+-*/=<) are at one precedence, left to right: "1+2*3" = "(1+2)*3".
-;   - ROM: ROMEND $0AE6 (2790) -> $093D (2365 bytes)
-; v0.4 (Aug 2026) - Stage 4: narrow relops to = and <, plus a golf pass
-;   - PARSE_RELOP: Now matches only '=' or '<' directly.
-;   - ROM: ROMEND $0B00 (2816) -> $0AE6 (2790 bytes)
-; v0.3 (Aug 2026) - Stage 3: single-char + letter statement dispatch
-;   - Replaced KW_TAB's 2-3 char match (MATCH_KW, stride 5) with TOK_CHARS
-;   - Deleted LET, REM, THEN
-;   - ROM: ROMEND $0B17 (2839) -> $0B00 (2816 bytes)
-; v0.2 (Aug 2026) - Stage 2: Implimented minimal line handling
-;   - Append-only BASIC line handling - line number is accepted only if greater than
-;     all  stored lines (append) or exactly equal to the current LAST line (in-place
-;     replace, or delete on an empty body). Anything else is a syntax error.
-;   - Removed STORE_LINE, DELETE_LINE, MEMCPY, and DEC_LNUM/DEC_GOTO.
-;   - ROM: ROMEND $0BD9 (3033) -> $0B18 (2840 bytes)
-; v0.1 (Aug 2026) - Initial port from uBASIC2650, inspired by pBASIC65c02.
-;   - Cut statements and functions, cleaned showcase.
-;   - Removed PRINT's CHR$(n)/TAB(n)/HEX$(n) 
-;   - Added DO_WR: `WR expr` equivalent of `PRINT CHR$(n);`
+; Branched from pBASIC V0.22
 ; =============================================================================
 
 ;  ASCII Defines
@@ -647,10 +579,6 @@ GL_EOL:
         STRA,R0 IBUF,R1+                 ; R1++ (pre-inc, one past last char); NUL-terminate
         BCTA,UN PRT_CRLF                ; tail call
 
-; =============================================================================
-;  DO_GO -- 'G' dispatch: GOTO or GOSUB.  TOK_CHARS only matches the first
-;  letter, so the two share a row; STMT_EXEC stashes the keyword's 3rd char
-;  in RXSAVE before dispatch (GOTO's is 'T', GOSUB's is 'S'). 
 JERRVAR:
         LODI,R0 ERR_VAR
         db $EC                  ; COMA,R0: consume next 2 bytes
@@ -832,7 +760,7 @@ DO_NEXT:
         LODA,R3 FSP
         BCTA,EQ DRT_UFLOW                ; NEXT with no FOR
         SUBI,R3 7                        ; R3 = frame base
-        LODI,R2 5
+        LODI,R2 5       
 DN_POP5:
         LODA,R0 FSTK-1,R3+               ; var, limit lo, limit hi, step lo, step hi ...
         STRA,R0 EXPH,R2-                 ; ... into FVAR, LNUML, LNUMH, EXPL, EXPH
@@ -864,6 +792,7 @@ DN_POP:
         SUBI,R3 5                        ; back to the frame base: pop it
         STRA,R3 FSP
         RETC,UN
+
 DN_UP:
         LODZ,R2                          ; limit above var: finished if step < 0
         BCTR,LT DN_POP
@@ -883,11 +812,12 @@ DN_BODY:
 ; -----------------------------------------------------------------------------
 PEEK_C2_ALPHA:
         STRZ,R2            ; R2 = first char
+PK_C2_NO_R2:
         LODI,R1 1
         LODA,R0 *IPH,R1                  ; peek 2nd char
         SUBI,R0 A'A'                     ; Shift 'A' down to 0
         COMI,R0 A'Z'-A'A'                ; Compare against 25 (length of alphabet - 1)
-        BCTR,GT PCA_RET                 ; Unsigned compare catches both < 'A' and > 'Z'      
+        RETC,GT                          ; Unsigned compare catches both < 'A' and > 'Z'  
 PCA_MATCH:
         EORZ,R0             ; set EQ
 PCA_RET:
@@ -1199,33 +1129,32 @@ OG_ADD:
 OG_LP:
         ZBSR *VCMP_TMP_PE
         BCFR,LT OG_FIX                   ; PE has walked down to TMP: done
-;        BSTR,UN DEC_PE
 ; =============================================================================
-;  DEC_PE -- PEH:PEL -= 1 INLINED
+;  PEH:PEL -= 1, inlined (formerly a called DEC_PE; folded into this loop).
 ;  Borrow is read from carry (TPSL $01: EQ = C=1 = no borrow), not from the
 ;  result's CC - the CC after a SUB is only the sign of the result byte.
-; Out: PE decremented
-; Clobbers: R0
-DEC_PE:
+;  BUG FIX v2.10: the no-borrow fast path used to be RETC,EQ, a leftover
+;  from when this was a separate BSTR-called subroutine. Inlined with no
+;  call in between, that RETC returned out of OPEN_GAP itself (to TSL_WRITE)
+;  after decrementing PE by 1 and copying nothing - the loop essentially
+;  never ran. Now branches to OG_CPY instead, staying inside the loop.
+; =============================================================================
         LODA,R0 PEL
         SUBI,R0 1
         STRA,R0 PEL
         TPSL $01
-        RETC,EQ                          ; no borrow: hi byte untouched
+        BCTR,EQ OG_CPY                    ; no borrow: hi byte untouched
         LODA,R0 PEH
         SUBI,R0 1
         STRA,R0 PEH
-;        RETC,UN
-; =============================================================================
-
+        ; RETC,UN
+OG_CPY:
         LODA,R0 *PEH                     ; byte at PE ...
         STRA,R0 *PEH,R3                  ; ... goes to PE+R3
         BCTR,UN OG_LP
 OG_FIX:
         LODI,R0 PEH-IPH
         ZBRR *VEXP16_TO_ET               ; PE = EXP (tail call)
-
-
 
 ; =============================================================================
 ;  FIND_LINE -- Search for line LNUMH:LNUML in program store
@@ -1297,8 +1226,6 @@ CHK_LP:
         EORI,R1 1               ; XOR R1 with 1 (Toggles 0 -> 1 -> 0) & updates CC flags
         BCFR,EQ CHK_LP          ; If result is not 0 (we just did High byte), loop for Low byte
         RETC,UN                 ; If result is 0 (both bytes matched exactly), return
-
-
 
 HI_LOOP:
         ZBSR *VWSKIP              ; R0 has character
@@ -1413,11 +1340,8 @@ EXPR_ATOM:
         BCTR,EQ EA_PAREN
 
         ; --- FUNCTION CHECK ---
-        LODI,R1 1
-        LODA,R0 *IPH,R1         ; Peek char[1] first for letter
-        SUBI,R0 A'A'
-        COMI,R0 A'Z'-A'A'
-        BCTR,GT END_FUNCS       ; Not an alpha? Skip to bare variable check
+        BSTA,UN PK_C2_NO_R2
+        BCFR,EQ END_FUNCS
 
         ; 2nd char is a letter. Check char[0] for known functions
         ZBSR *VWSKIP            ; re-peek with R0 = char[0]
@@ -1566,6 +1490,7 @@ PARSE_FACTOR:
                                           ; (R0's shifted value is discarded
                                           ; there - PARSE_S16 reloads *IPH
                                           ; fresh via EORZ,R0 first thing)
+
         ; fall through: A-Z letter, R0 = index (0..25) already computed
 ; =============================================================================
 ;  PF_LOADVAR -- Load variable value from VARS
@@ -2095,7 +2020,6 @@ EATWORD:
         BCFR,GT EW_ADV                    ; without restoring it first)
         COMI,R0 A'$'-A'A'                 ; '$' compared in the same shifted
         BCFR,EQ EW_RET                    ; frame (wraps mod 256; EQ test is
-                                          ; unaffected by signedness either way)
 EW_ADV:
         ZBSR *VINC_IP 
         BCTR,UN EATWORD
