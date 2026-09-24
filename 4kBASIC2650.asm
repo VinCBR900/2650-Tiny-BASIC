@@ -1,5 +1,5 @@
 ; 4kBASIC2650.asm       4k Tiny BASIC interpreter for Signetics 2650 (was uBASIC)
-; Version: v4.18
+; Version: v4.19
 ; By Vincent Crabtree, 2026.  MIT License
 ; Date:    2026-09-24
 ;
@@ -57,14 +57,20 @@
 ; literals" are taken verbatim regardless of case, as always.
 ;
 ; GOSUB/RETURN NESTING
-;   Up to 9 levels deep (GSSTKLIM=15 bytes, 2 per level; empirically
-;   verified via the simulator). A 10th nested GOSUB raises ?3 (ERR_OOM).
-;   A RETURN with nothing pushed raises ?5 (ERR_RET).
+;   Up to 8 levels deep (GSSTKLIM=16 bytes, 2 per level; empirically
+;   verified via the simulator -- a write watchpoint on FORBASE confirmed
+;   the old GSSTKLIM=15/$FF-sentinel scheme let a 9th nested GOSUB write
+;   past GSBASE's 16-byte allocation, corrupting FORBASE's first byte;
+;   fixed in V4.19 along with the sentinel removal below).
+;   A 9th nested GOSUB raises ?3 (ERR_OOM). A RETURN with nothing pushed
+;   raises ?5 (ERR_RET). SWSP/FORSP now use a plain 0-based byte count
+;   (0=empty) instead of a $FF/$F9 sentinel -- same error codes, less
+;   push/pop bookkeeping (V4.19, ported from uBASIC2650wip's GSSP/FSP).
 ;
 ; FOR / NEXT
 ;   FOR <var>=<start> TO <limit> [STEP <step>], then NEXT [<var>]. Default
 ;   step is 1 (positive or negative steps both work via STEP).
-;   Up to 4 levels deep (FORSTKLIM=21 bytes, 7 per level; empirically
+;   Up to 4 levels deep (FORSTKLIM=28 bytes, 7 per level; empirically
 ;   verified). A 5th nested FOR raises ?6 (ERR_FOR). NEXT without a
 ;   matching FOR raises ?7 (ERR_NXT).
 ;   - Test at end so Body always runs at least once (by spec, see FOR-02
@@ -135,7 +141,26 @@
 ;
 ; RECENT CHANGE HISTORY
 ;
-; V4.18 (2026-09-24) - ROMEND $0E82 -> $0E09 (121 bytes)
+; V4.19 (2026-09) - ROMEND $0E09 -> $0DDE (43 bytes)
+;   - SWSP/FORSP (GOSUB and FOR stack pointers) ported from uBASIC2650wip's
+;     GSSP/FSP: plain 0-based byte count (0=empty), replacing the $FF/$F9
+;     sentinel scheme. Removes DGS_FIRST/DGS_NEXT, DRT_SUB, DN_POP_EMPTY,
+;     and DO_FOR's CPSL/PPSL $02 COM-mode toggle (the sentinel needed
+;     signed interpretation under the program's global COM=1).
+;   - BUG-GSSTKLIM-01 (found while re-deriving the new limit constants,
+;     confirmed via a pipbug_wrap write-watchpoint on FORBASE): the old
+;     GSSTKLIM=$0F let a 9th nested GOSUB push write 2 bytes past GSBASE's
+;     16-byte allocation, silently corrupting FORBASE's first byte. Capacity
+;     is now correctly 8 levels (GSSTKLIM=$10); a 9th nested GOSUB raises
+;     ?3 (ERR_OOM) before any write, as the header always claimed it did.
+;     FOR's own capacity was already correct (FORSTKLIM re-expressed as
+;     $1C=28 for the new count-based scheme; still exactly 4 levels).
+;   - DO_FOR now caches the loop variable's precomputed VARS offset in
+;     FORVAR (from DL_STORE's R1, free) instead of the raw A-Z letter;
+;     DO_NEXT loads it directly instead of recomputing (var-'A')*2 every
+;     call.
+;
+; V4.18 (2026-09) - ROMEND $0E82 -> $0E09 (121 bytes)
 ;   - PRINT_S16: Replaced the SW-recursive shift/divide-by-10 engine (PREC,
 ;     16 iterations of a 4-byte rotate + conditional subtract, plus the
 ;     SWBASE push/pop recursion machinery) with uBASIC2650wip's iterative
@@ -147,11 +172,8 @@
 ;   - PRINT_S16 no longer clobbers TMP (now clobbers R2 instead, which no
 ;     caller needs preserved across the call) or SC1/NEGFLG.
 ;   - SWRETURN kept in place (still shared with PARSE_EXPR's own recursion).
-;   - Regression: full showcase, PRINT of 0/positive/negative/-32768,
-;     LIST, RUN error-with-line-number (DO_ERROR), and FREE (DO_FREE) all
-;     re-run against V4.17 baseline output via pipbug_wrap after the change.
 ;
-; V4.17 (2026-09-22) - ROMEND $0EB9 -> $0E85 (52 bytes)
+; V4.17 (2026-09) - ROMEND $0EB9 -> $0E85 (52 bytes)
 ;   - MATCH_KW: TMP stays fixed at the table base (KW_TAB/FUNC_TAB); R1 walks
 ;     it via indirect-indexed addressing (*TMPH,R1) instead of advancing TMP
 ;     itself through ZBSR calls. Idea ported from uBASIC2650's MD_SCAN,
@@ -165,12 +187,8 @@
 ;   - Removed all case-folding (UPCASE deleted; call sites in GETCI_UC,
 ;     EATWORD, PARSE_VAR_SAVE, PARSE_FACTOR, MATCH_KW stripped): keywords
 ;     and variable letters now require UPPERCASE, matching the spec.
-;     -30 bytes.
-;   - Regression: full showcase, line-edit, keyword/function coverage,
-;     GOSUB/FOR depth, and INPUT-during-RUN all re-confirmed against
-;     V4.16h (this session's baseline) after each change.
 ;
-; V4.16 (2026-09-22) - ROMEND $0EBA 
+; V4.16 (2026-09) - ROMEND $0EBA 
 ;   - FL_CHKLO / FI_LH: Direct-indexed peek (*TMPH,R1) replaces INC16_TMP_TO_EXP.
 ;   - Stored record format: Changed line terminator CR ($0D) -> NUL ($00).
 ;   - Shared helpers: Added ADV_TMP_PAST_REC to scan past NUL-terminated records.
@@ -178,63 +196,63 @@
 ;   - FIXED BUG-PU16-01: Corrected PARSE_U16 pre-loop digit check bound (':' -> '9').
 ;   - Streamlined DO_NEW, SHOWCASE_END to PE setup deleted, now Assembly time.
 ;
-; V4.15 (2026-09-22) - ROMEND $0F26 
+; V4.15 (2026-09) - ROMEND $0F26 
 ;   - Shared helpers: Added CMP_TMP_PE for 16-bit TMP vs PE comparison.
 ;   - DELETE_LINE: Ported uBASIC2650 DEL_REC idiom (uses dst ptr as new PE).
 ;   - PARSE_U16 / TRY_STORE_LINE: Collapsed digit checks to single unsigned sub/cmp.
 ;   - STORE_LINE: Ported OPEN_GAP technique; indexed dst off walking PE (*PEH,R3).
 ;
-; V4.14 (2026-09-21) - ROMEND $0FB7 
+; V4.14 (2026-09) - ROMEND $0FB7 
 ;   - Unsigned comparison: Enabled global COM=1 mode.
 ;
-; V4.13 (2026-09-20) - ROMEND $0FB5 
+; V4.13 (2026-09) - ROMEND $0FB5 
 ;   - FIXED BUG-MUL-01: MU_LP decrement now checks carry flag (TPSL $01) instead
 ;     of raw CC, fixing 16-bit multiply for operands >= 256.
 ;
-; V4.12 (2026-09-20) - ROMEND $0FB3 
+; V4.12 (2026-09) - ROMEND $0FB3 
 ;   - Shared helpers: Added CARRY_INTO_EXPH to consolidate carry propagation
 ;     in MUL16 and PARSE_U16.
 ;
-; V4.11 (2026-09-20) - ROMEND $0FC8 
+; V4.11 (2026-09) - ROMEND $0FC8 
 ;   - CHIN: Removed hard ORG $286 pin to let subroutine space float naturally.
 ;
-; V4.10 (2026-09-20) - Renamed 4kBASIC - ROMEND $0FC8
+; V4.10 (2026-09) - Renamed 4kBASIC - ROMEND $0FC8
 ;   - ZPVEC-01: Vectored PUSH_EXP and PRINT_S16 via zero-page jump table (ZBSR).
 ;
-; V4.9 (2026-08-16) - ROMEND $0FDB 
+; V4.9 (2026-08) - ROMEND $0FDB 
 ;   - FIXED BUG-DL2-01: DL2_LP copy loop now tests carry flag (TPSL $01) instead
 ;     of signed CC, fixing premature loop exit on page-boundary wraps during deletes.
 ;
-; V4.8 (2026-08-15) - ROMEND $0FD9 
+; V4.8 (2026-08) - ROMEND $0FD9 
 ;   - PRINT HEX$(n): Added 4-digit unsigned 16-bit hex formatting in ROM slack.
 ;
-; V4.7 (2026-08-10) - ROMEND $0F98
+; V4.7 (2026-08) - ROMEND $0F98
 ;   - Shared helpers: Added PUSH_RET to handle 16-bit SWBASE push.
 ;   - Operators: Added ^ (power) operator with error handling.
 ;   - FIXED BUG-MINLP-01: Fixed hang printing -32768 (invalid indexed LODR).
 ;
-; V4.6 (2026-07-03) - 3879 bytes (ROMEND $0F27)
+; V4.6 (2026-07) - 3879 bytes (ROMEND $0F27)
 ;   - FIXED: FUNCATOM-01 - functions now work as non-leading atoms, e.g.
 ;     "PRINT 10+ABS(A)" (previously only "PRINT ABS(A)+10" worked).
 ;   - Added FT_SP/FT_STK/FT_SAVE_SP/FT_SAVE/FT_N/FT_R2SAVE (72 RAM bytes)
 ;     and FUNC_EPILOG; PE_SAFE/EAM_ATOM/PE_NOFUNC/DO_END updated. 
 ;
-; V4.5 (2026-06-30) - 3705 bytes
+; V4.5 (2026-06) - 3705 bytes
 ;   - FIXED: Function parser tracking for trailing operators (e.g., ABS(-5)+10).
 ;   - Relocated PEEK/USR/EXPH functions to optimize space post-COUT.
 ;
-; V4.4 (2026-06-30) - 3636 bytes
+; V4.4 (2026-06) - 3636 bytes
 ;   - FIXED: RND 16-bit seed rotation bug by correctly setting PSL WC bit.
 ;   - FIXED: Subtraction left-operand dropping bug in EAM_MH_RET.
 ;   - Unified 2-argument parsing for AND/OR/XOR/POKE/LIST to save ~25 bytes.
 ;   - Deduplicated bare assignments (LET-less statements).
 ;
-; V4.3 (2026-06-25) - 3672 bytes
+; V4.3 (2026-06) - 3672 bytes
 ;   - FIXED: Nested operator precedence clobbering bug using SWBASE stack.
 ;   - Added bitwise functions: AND(a,b), OR(a,b), XOR(a,b), NOT(a).
 ;   - Rewrote default showcase program with an expanded Mandelbrot finale.
 ;
-; V4.2 (2026-06-24) - 3485 bytes
+; V4.2 (2026-06) - 3485 bytes
 ;   - Rewrote RDLINE using R3 as an IBUF offset optimization.
 ;   - Merged sign-handling and addition paths into shared ADD16_SAVE_EXP.
 ;   - Added optional line-range filtering to LIST [start,end].
@@ -287,14 +305,18 @@ PSW_FLAG        EQU     $40
 ; System Defines
 PROGLIM         EQU $1FFF   ; top of program store (numeric constant, not address)
 ;  GOSUB stack (v3.2) -- managed by SWSP
-; Frame = [lo][hi] of NLP. SWSP=$FF=empty. 2 bytes/frame, 8 frames.
-GSSTKLIM        EQU $0F    ; max SWSP before overflow (numeric constant, not address)
+; Frame = [lo][hi] of NLP. SWSP=0=empty, counts up by 2/push (V4.19; was
+; a $FF-sentinel "top index" scheme). 2 bytes/frame, 8 frames = 16 bytes.
+GSSTKLIM        EQU $10    ; max SWSP before overflow (numeric constant, not address)
 ;  FOR/NEXT stack (v3.3) -- managed by FORSP
 ; Frame (7 bytes): [var][limH][limL][stpH][stpL][nlpH][nlpL]
-;   var=letter A-Z, lim=signed limit, stp=signed step, nlp=loop-back address.
-; FORSP=$FF=empty. Offsets: 0/7/14/21 for frames 1-4. 4 frames = 28 bytes.
+;   var=VARS offset (0/2/4/../50, precomputed at push -- was the raw A-Z
+;   letter pre-V4.19), lim=signed limit, stp=signed step, nlp=loop-back.
+; FORSP=0=empty, counts up by 7/push (V4.19; was a $FF/$F9-sentinel
+; scheme needing a local COM-mode toggle). Offsets: 0/7/14/21 for frames
+; 1-4. 4 frames = 28 bytes.
 ; Overflow: FORSP >= FORSTKLIM before push -> ERR_FOR.
-FORSTKLIM       EQU $15   ; max FORSP before overflow (numeric constant, not address)
+FORSTKLIM       EQU $1C   ; max FORSP before overflow (numeric constant, not address)
 
 ;  CODE starts at Zero (No Pipbug)
         ORG 0
@@ -600,13 +622,16 @@ DO_NEW:
 ;  DO_END -- Stop execution and clear all run state
 ; Syntax: END  (also called by DO_NEW, DO_ERROR, RESET)
 ; In:  nothing
-; Out: SWSP=$FF, FORSP=$FF, GOTOFLG=0, RUNFLG=0
+; Out: SWSP=0, FORSP=0 (V4.19: 0-based), GOTOFLG=0, RUNFLG=0
 ; Clobbers: R0
 DO_END:
-        BSTA,UN DN_POP_EMPTY
+        EORZ,R0                          ; V4.19: FORSP/SWSP are 0-based now
+        STRA,R0 FORSP                    ; clear FOR stack
         STRA,R0 SWSP                     ; clear GOSUB stack
-        STRA,R0 FT_SP                    ; FUNCATOM-01 (v4.6): clear dispatch-
-                                          ; origin stack (R0 still $FF here)
+        LODI,R0 $FF                      ; FT_SP/FT_SAVE_SP: separate
+        STRA,R0 FT_SP                    ; subsystem, still $FF=empty --
+                                          ; FUNCATOM-01 (v4.6) dispatch-
+                                          ; origin stack, untouched by V4.19
         STRA,R0 FT_SAVE_SP               ; ...and its byte-save stack too
         EORZ,R0
         STRA,R0 GOTOFLG
@@ -674,26 +699,20 @@ DO_GOTO:
 ; In:  SWSP = GOSUB stack pointer; GSBASE[SWSP]=lo, GSBASE[SWSP+1]=hi of NLP.
 ; Out: GOTOH:GOTOL = popped NLP; GOTOFLG=$03 (direct NLP, no FIND_LINE).
 ; Clobbers: R0, R1, GOTOH, GOTOL, GOTOFLG, SWSP.
-; Error: SWSP=$FF (underflow) -> ERR_RET.
+; Error: SWSP=0 (underflow) -> ERR_RET.
 ; BUG-RET-01 FIX: GOTOFLG must be $03 (direct address) not $01 (FIND_LINE).
 ;   GSBASE stores program-store addresses, not BASIC line numbers.
+; V4.19: SWSP is 0-based (0=empty) -- decrement first, then read at the
+;   new (post-decrement) index; no roll-to-sentinel special case needed.
 DO_RETURN:
-        LODA,R1 SWSP            ; R1 = original SWSP                    
-        COMI,R1 $FF             ; Is the stack empty?                   
-        BCTA,EQ DRT_UNDERFLOW   ; If underflow, bail out                
-
-        ; Update SWSP in RAM First 
-        LODZ R1                 ; R0 = copy of original SWSP            
-        BCFR,EQ DRT_SUB         ; If SWSP != 0, go subtract 2           
-        LODI,R0 $FF             ; If SWSP == 0, roll over to empty      
-        BCTR,UN DRT_WRITE       ; Jump to the unified store             
-DRT_SUB:
-        SUBI,R0 2               ; Decrement stack frame pointer         
-DRT_WRITE:
-        STRA,R0 SWSP            ; Store updated SWSP back to RAM        
+        LODA,R0 SWSP
+        BCTA,EQ DRT_UNDERFLOW   ; SWSP==0: nothing pushed
+        SUBI,R0 2
+        STRA,R0 SWSP            ; Store updated SWSP back to RAM
+        STRZ,R1                 ; R1 = new SWSP = read index
 
         ; Fetch 16-Bit Address 
-        LODA,R0 GSBASE,R1       ; Load Lo-Byte (R1 is now SWSP+1)       
+        LODA,R0 GSBASE,R1       ; Load Lo-Byte
         STRA,R0 GOTOL           ; Store Lo-Byte                         
         LODA,R0 GSBASE,R1+      ; Load Hi-Byte & auto-increment R1      
         STRA,R0 GOTOH           ; Store Hi-Byte                         
@@ -1064,32 +1083,26 @@ PHB_OUT2:
 ; In:  IP -> line number; SWSTK[0:1] = NLP from DR_EXEC; SWSP = stack ptr.
 ; Out: GOTOH:GOTOL = target line; GOTOFLG=$02; NLP pushed onto GSBASE.
 ; Clobbers: R0, R1, EXPH, EXPL, GOTOH, GOTOL, GOTOFLG, SWSP
-; Stack: GSBASE[SWSP]=lo, GSBASE[SWSP+1]=hi. SWSP=$FF=empty.
+; Stack: GSBASE[SWSP]=lo, GSBASE[SWSP+1]=hi. SWSP=0=empty (V4.19).
 DO_GOSUB:
         ZBSR *VWSKIP                      ; [+1]
         ZBSR *VPARSE_EXPR                 ; [+1] target line -> EXPH:EXPL
-        ; overflow check
-        LODA,R0 SWSP
-        COMI,R0 $FF
-        BCTR,EQ DGS_FIRST
-        COMI,R0 GSSTKLIM
-        BCTR,LT DGS_NEXT
+        ; overflow check: SWSP is 0-based (0=empty), so R1 (pre-push SWSP)
+        ; doubles as the store index -- no first-push special case needed.
+        LODA,R1 SWSP
+        COMI,R1 GSSTKLIM
+        BCTR,LT DGS_STORE
         LODI,R0 ERR_OOM
         ZBRR *VDO_ERROR 
-DGS_FIRST:
-        EORZ,R0
-        STRA,R0 SWSP
-        BCTR,UN DGS_STORE
-DGS_NEXT:
-        LODA,R0 SWSP
-        ADDI,R0 2
-        STRA,R0 SWSP
 DGS_STORE:
         LODA,R0 SWSTK+1                  ; NLP lo byte
-        LODA,R1 SWSP
-        STRA,R0 GSBASE,R1                ; GSBASE[SWSP] = lo
+        STRA,R0 GSBASE,R1                ; GSBASE[SWSP] = lo (plain: ,Rx+ PRE-
+                                          ; increments, so lo must come first
+                                          ; unindexed -- matches DO_RETURN's pop)
         LODA,R0 SWSTK                    ; NLP hi byte
-        STRA,R0 GSBASE,R1+                ; GSBASE[SWSP+1] = hi
+        STRA,R0 GSBASE,R1+                ; GSBASE[SWSP+1] = hi; R1 -> SWSP+1
+        ADDI,R1 1                        ; R1 = SWSP+2 = new SWSP
+        STRA,R1 SWSP
         BSTA,UN EXP16_TO_GOTO             ; GOTOH:GOTOL = EXPH:EXPL (target line)
         LODI,R0 2                        ; GOTOFLG=$02 = GOSUB pending
         STRA,R0 GOTOFLG
@@ -1113,20 +1126,9 @@ DO_FOR:
         STRA,R0 FORVAR
         STRZ,R2                          ; R2 = var letter (survives PARSE_EXPR)
 
-        ; --- stack overflow & initialization check ---
+        ; --- stack overflow check (FORSP is 0-based, 0=empty; V4.19) ---
         LODA,R0 FORSP
-        COMI,R0 $FF
-        BCFR,EQ DF_NOTFIRST              ; FIXED: Branch if False on Equal (Not Equal)
-        LODI,R0 $F9                      ; Math Hack: Load -7 ($F9) if empty.
-                                         ; -7 + 7 will result in 0 later
-DF_NOTFIRST:
-        ; V4.14 COM01: the $F9 (-7) "math hack" sentinel above relies on
-        ; signed interpretation; must run under COM=0 despite the global
-        ; COM=1 set in MAIN, or the very first FOR on an empty stack
-        ; false-fires ERR_FOR (stack overflow).
-        CPSL $02
         COMI,R0 FORSTKLIM
-        PPSL $02
         BCFA,LT JFORERR                  ; If NOT Less-Than limit (>=), fail!
         ADDI,R0 7                        ; Normal frame adds 7 / Empty frame ends up at 0
         STRA,R0 FORSP
@@ -1136,6 +1138,11 @@ DF_NOTFIRST:
         ZBSR *VGETCI_UC                   ; [+1] skip whitespace + consume '='
         ZBSR *VPARSE_EXPR                 ; [+1] start value -> EXPH:EXPL
         BSTA,UN DL_STORE                 ; [+1] VARS[R2] = EXPH:EXPL
+        STRA,R1 FORVAR                   ; V4.19: DL_STORE leaves the VARS
+                                          ; offset in R1 -- cache it here (in
+                                          ; place of the raw letter) so NEXT
+                                          ; can just load it instead of
+                                          ; recomputing (var-'A')*2 every time
         ; --- consume "TO" keyword ---
         ZBSR *VWSKIP                      ; [+1]
         ZBSR *VEATWORD                    ; [+1]
@@ -1176,27 +1183,23 @@ DF_LOOP:
 ; Syntax: NEXT [V]
 ; In:  FORSP = FOR stack pointer; top frame at FORBASE[FORSP].
 ;      Frame: [var][limH][limL][stpH][stpL][nlpH][nlpL]
+;      var = VARS offset, precomputed by DO_FOR (V4.19; was the raw letter,
+;      recomputed here every call via (var-'A')*2 pre-V4.19).
 ; Out: If looping: GOTOH:GOTOL=nlp, GOTOFLG=$03 (direct addr branch).
-;      If done: FORSP-=7 (or $FF if was 0), sequential return.
+;      If done: FORSP-=7 (0-based since V4.19; was $FF-sentinel), sequential return.
 ; Clobbers: R0, R1, EXPH, EXPL, LNUMH, LNUML, SC0, GOTOH, GOTOL, GOTOFLG.
-; Errors: FORSP=$FF -> ERR_NXT.
+; Errors: FORSP=0 -> ERR_NXT.
 ; Variable name after NEXT consumed but not checked against frame (smallest code).
 DO_NEXT:
         LODA,R0 FORSP
-        COMI,R0 $FF
-        BCTA,EQ JERR_NXT                    ; not $FF: Error
+        BCTA,EQ JERR_NXT                    ; FORSP==0 (V4.19): no FOR active
         ZBSR *VWSKIP                      ; [+1]
         ZBSR *VEATWORD                    ; [+1] consume optional var name
 
-        ; --- inline FOR_FP: compute VARS index for loop var ---
-        ; Read frame[0]=var letter; compute R1 = (var-'A')*2 for VARS indexing.
+        ; --- V4.19: frame[0] is now the VARS offset, precomputed by DO_FOR
+        ; (was the raw var letter, recomputed here every call -- see FORVAR) ---
         LODA,R1 FORSP
-        LODA,R0 FORBASE,R1               ; frame[0] = var letter
-        STRA,R0 FORVAR
-        SUBI,R0 A'A'                     ; 0..25
-        STRZ,R1                          ; R1 = index
-        ADDZ,R1                          ; R0 = index*2
-        STRZ,R1                          ; R1 = index*2
+        LODA,R0 FORBASE,R1               ; frame[0] = precomputed VARS offset
 
         ; --- read step from frame[3:4] -> EXPH:EXPL ---
         ; (need R1 restored to FORSP base for frame access; save index in SC0)
@@ -1278,13 +1281,10 @@ DN_VAR_GT:
         BCTR,LT DN_LOOP                  ; negative step: keep going down
         ; positive step: fall through to DN_EXIT
 DN_EXIT:
-        ; pop frame: FORSP -= 7, or $FF if was 0 (stack now empty)
+        ; pop frame: FORSP -= 7 (V4.19: 0-based, 0 uniformly means empty --
+        ; no sentinel roll-over special case needed, unlike the old $FF scheme)
         LODA,R0 FORSP
-        BCTR,EQ DN_POP_EMPTY
         SUBI,R0 7
-        db $EC                          ; consume next 2 bytes
-DN_POP_EMPTY:
-        LODI,R0 $FF
         STRA,R0 FORSP
         RETC,UN
 
@@ -2789,12 +2789,13 @@ RL_EOL:
 ; Clobbers: R0
 EATWORD:
         LODA,R0 *IPH
-        SUBI,R0 A'A'                      ; shift 'A' down to 0 (also lets
-        COMI,R0 A'Z'-A'A'                 ; the '$' test below reuse R0
-        BCFR,GT EW_ADV                    ; without restoring it first)
-        COMI,R0 A'$'-A'A'                 ; '$' compared in the same shifted
-        BCFR,EQ EW_RET                    ; frame (wraps mod 256; EQ test is
-                                          ; unaffected by signedness either way)
+        COMI,R0 A'A'
+        BCTR,LT EW_DS
+        COMI,R0 A'Z'+1
+        BCTR,LT EW_ADV
+EW_DS:
+        COMI,R0 A'$'
+        BCFR,EQ WSKIPRET
 EW_ADV:
         ZBSR *VINC_IP 
         BCTR,UN EATWORD
@@ -2821,7 +2822,6 @@ GETCI_UC:
         STRZ,R1                          ; save before INC_IP clobbers R0
         ZBSR *VINC_IP                    ; [+1]
         LODZ,R1                          ; restore
-EW_RET:
 WSKIPRET:
         RETC,UN
 
@@ -3213,7 +3213,7 @@ CURH    RES 1       ; current line hi  (error reporting)
 CURL    RES 1       ; current line lo
 
 ; FOR stack frame ordering
-FORVAR  RES 1       ; FOR loop variable letter (A-Z)
+FORVAR  RES 1       ; FOR loop var's precomputed VARS offset (V4.19; was A-Z letter)
 LNUMH   RES 1       ; scratch line number hi       (DEC_ET offset 12 = LNUMH-IPH)
 LNUML   RES 1       ; scratch line number lo
 EXPH    RES 1       ; expression result hi         (INC_ET offset 4 = EXPH-IPH)
@@ -3256,8 +3256,8 @@ RNDSEED RES 2       ; 16 bit Random
 RUNFLG  RES 1       ; $01=running $00=immediate
 R3SAVE  RES 1       ; Save/restore R3 across PARSE_U16 multiply loop
 NEGFLG  RES 1       ; Sign flag
-FORSP   RES 1       ; FOR stack pointer ($FF=empty, 0/7/14/21=frame offsets)
-SWSP    RES 1       ; GOSUB stack pointer ($FF=empty)
+FORSP   RES 1       ; FOR stack pointer (0=empty, V4.19; 0/7/14/21=frame offsets)
+SWSP    RES 1       ; GOSUB stack pointer (0=empty, V4.19)
 RELOP   RES 1       ; Relational op bitmask: bit0=LT bit1=EQ bit2=GT
 
 ;  SW call stack -- used by PARSE_EXPR / PRINT_S16 only
