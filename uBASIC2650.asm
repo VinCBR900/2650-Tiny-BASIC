@@ -1,12 +1,12 @@
 ; =============================================================================
-; uBASIC2650 v2.10  --  Minimal Tiny BASIC for the Signetics 2650
+; uBASIC2650 v2.11  --  Minimal Tiny BASIC for the Signetics 2650
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: standalone build - I/O is bit-banged in software, no PIPBUG ROM or
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : <2 KB target, $0000 upward (currently 2024 bytes - see ROMEND)
+;   ROM    : <2 KB target, $0000 upward (currently 2000 bytes - see ROMEND)
 ;   RAM    : ~213 bytes, $1000 upward (half an 8 KB page above the code)
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
@@ -130,6 +130,12 @@
 ; =============================================================================
 ; VERSION HISTORY 
 ; =============================================================================
+;
+; v2.11 (Sep 2026) - Code golf: REG16_TO_REG16 generic 16-bit copy.
+;   - Replaced EXP16_TO_ET/TMP_TO_ET and DE_LOOP, DR_SWSTK,DN_LIM, GR_LP, OG_SAV
+;     copy loops with REG16_TO_REG16 using R0 = packed (SRC_IDX<<4)|DST_IDX pair. 
+;   - RAM reorg: PEH/PEL and SC0/SC1 moved contiguous for use with REG16.
+;   - ROMEND $07EF (2031) -> $07D0 (2000 bytes)
 ;
 ; v2.10 (Sep 2026) - BUG FIX: mid-list line insert corrupted following line.
 ;   - OPEN_GAP's move loop decrements PE via an inlined former DEC_PE.
@@ -255,6 +261,19 @@ PSW_RS          EQU     $10
 PSW_WC          EQU     $08             ; WC (With Carry) bit in PSL (bit 3)
 PSW_FLAG        EQU     $40
 
+; REG16_TO_REG16 register indices (idx*2 = byte offset from IPH; see the
+; "Ordered group" RAM comment). v2.11.
+IDX_IP    EQU 0
+IDX_TMP   EQU 1
+IDX_GOTO  EQU 2
+IDX_CUR   EQU 3
+IDX_SWSTK EQU 4
+IDX_EXP   EQU 5
+IDX_LNUM  EQU 6
+IDX_PE    EQU 8
+IDX_SC0   EQU 9
+IDX_RND   EQU 10
+
 ;  CODE starts at Zero (No Pipbug)
         ORG 0
 
@@ -297,8 +316,8 @@ VCMP_TMP_PE:
         DW CMP_TMP_PE
 VNEG_EXP_BODY:
         DW NEG_EXP_BODY
-VEXP16_TO_ET:
-        DW EXP16_TO_ET
+VREG16_TO_REG16:
+        DW REG16_TO_REG16    ; v2.11: generic nibble-packed 16-bit copy
 VPUSH_RET:
         DW PUSH_RET
 VPARSER_RET:
@@ -375,11 +394,8 @@ DO_ERROR:
         BCTR,EQ DE_NL                   ; not running, no line number
         LODI,R0 '@'                     
         ZBSR *VCOUT                     ; Print at line
-        LODI,R1 2
-DE_LOOP:
-        LODA,R0 CURH,R1-                 ; 
-        STRA,R0 EXPH,R1                   ; 
-        BRNR,R1 DE_LOOP
+        LODI,R0 (IDX_CUR*16)+IDX_EXP
+        ZBSR *VREG16_TO_REG16
         BSTA,UN PRINT_S16                ; [+1]
 DE_NL:
         BSTR,UN PRT_CRLF
@@ -559,12 +575,14 @@ PARSE_VAR_SAVE:
 ; In:  nothing
 ; Out: IBUF = NUL-terminated input line; IPH:IPL = IBUF (both callers used
 ;      to re-point IP via a separate SET_IP_IBUF call right after this -
-;      folded in here instead, since IBUF's address ($1010) has hi==lo,
-;      so one LODI sets both bytes)
+;      folded in here instead). Was a single shared LODI while IBUF sat at
+;      a hi==lo address; IBUF moved (v2.11, nibble-index RAM reorg) so this
+;      is now two LODIs (+2 bytes, accepted cost - see VERSION HISTORY)
 ; Clobbers: R0, R1
 GETLINE:
-        LODI,R0 <IBUF                    ; IBUF hi byte == lo byte ($10) -
-        STRA,R0 IPH                      ; one load sets both IPH and IPL
+        LODI,R0 <IBUF
+        STRA,R0 IPH
+        LODI,R0 >IBUF
         STRA,R0 IPL
         LODI,R1 $FF                      ; R1 = empty-buffer sentinel (pre-inc convention)
 GL_LP:
@@ -624,9 +642,11 @@ DO_GOTO:
         ZBSR *VPARSE_EXPR                 ; [+1] EXPR_ATOM WSKIPs itself
         LODA,R0 RUNFLG
         RETC,EQ                           ; not running: safe no-op
-        BSTA,UN EXP16_TO_LNUM              ; LNUMH:LNUML = EXPH:EXPL (target line)
+        LODI,R0 (IDX_EXP*16)+IDX_LNUM
+        ZBSR *VREG16_TO_REG16              ; LNUMH:LNUML = EXPH:EXPL (target line)
         BSTA,UN FIND_LINE                  ; [+1] TMPH:TMPL = found record
-        BCTA,UN TMP_TO_SWSTK              ; Tail call
+        LODI,R0 (IDX_TMP*16)+IDX_SWSTK
+        ZBRR *VREG16_TO_REG16              ; Tail call
 
 ; =============================================================================
 ;  DO_RETURN -- Return from subroutine.  Reached only from DO_RU.
@@ -696,8 +716,8 @@ DR_HDR:
         ; of PROG, no copy. Bodies are NUL-terminated in storage now, so
         ; every NUL-terminated-string assumption already baked into
         ; STMT_EXEC/EXPR/etc. just works.
-        EORZ,R0                           ; offset 0 (IPH-IPH)
-        BSTA,UN TMP_TO_ET
+        LODI,R0 IDX_TMP*16                ; +IDX_IP (0)
+        ZBSR *VREG16_TO_REG16
         
         ZBSR *VINC_IP
         ZBSR *VINC_IP
@@ -706,16 +726,14 @@ DR_HDR:
         ; GOTO's redirection). Reuses the same shared scan FIND_LINE/
         ; FIND_INS/TSL_MATCH already use - one routine, one terminator.
         BSTA,UN ADV_TMP_PAST_REC
-        BSTA,UN TMP_TO_SWSTK
+        LODI,R0 (IDX_TMP*16)+IDX_SWSTK
+        ZBSR *VREG16_TO_REG16
         ; execute line
         BSTA,UN STMT_EXEC                ; [+1]
 
         ; resume from SWSTK unconditionally
-        LODI,R1 2
-DR_SWSTK:
-        LODA,R0 SWSTK,R1-                 ; 
-        STRA,R0 TMPH,R1                   ; 
-        BRNR,R1 DR_SWSTK
+        LODI,R0 (IDX_SWSTK*16)+IDX_TMP
+        ZBSR *VREG16_TO_REG16
         BCTR,UN DR_LP
 
 ; =============================================================================
@@ -778,11 +796,8 @@ DN_POP5:
         BSTA,UN DL_STORE                 ; var = var + step
         LODZ,R1
         STRZ,R2                          ; R2 = step's sign
-        LODI,R1 2
-DN_LIM:
-        LODA,R0 LNUMH,R1-                ; TMP = limit (CMP_OPS's left operand)
-        STRA,R0 TMPH,R1
-        BRNR,R1 DN_LIM
+        LODI,R0 (IDX_LNUM*16)+IDX_TMP     ; TMP = limit (CMP_OPS's left operand)
+        ZBSR *VREG16_TO_REG16
         BSTA,UN CMP_OPS                  ; limit (TMP) : var (EXP), signed
         BCTR,EQ DN_GO                    ; var = limit: one more pass
         BCTR,GT DN_UP                    ; limit above var
@@ -892,11 +907,8 @@ DP_C_KW:
 ; Out: EXPH:EXPL = pseudorandom 16-bit value (the seed BEFORE this call)
 ; Clobbers: R0, R1, RNDSEED (falls through into RND_SHUFFLE - one shared RETC)
 GET_RND:
-        LODI,R1 2
-GR_LP:
-        LODA,R0 RNDSEED,R1-                
-        STRA,R0 EXPH,R1                 
-        BRNR,R1 GR_LP
+        LODI,R0 (IDX_RND*16)+IDX_EXP
+        ZBSR *VREG16_TO_REG16
         ; drop through
 ; =============================================================================
 ;  RND_SHUFFLE -- Advance 16-bit Galois LFSR (Little-Endian) in place
@@ -1036,7 +1048,8 @@ TSL_NUM:
         BSTA,UN PARSE_S16                ; [+1] IP already on the digit just tested
         LODA,R0 EXPH                     ; digits only, so bit 7 set means the
         BCTA,LT JSYNERR                  ; number is > 32767 ("negative"): reject
-        BSTA,UN EXP16_TO_LNUM             ; LNUMH:LNUML = parsed line number
+        LODI,R0 (IDX_EXP*16)+IDX_LNUM
+        ZBSR *VREG16_TO_REG16             ; LNUMH:LNUML = parsed line number
 TSL_FND:
         BSTA,UN FIND_LINE                ; [+1] TMP = insertion point (first record
                                           ; >= LNUM); CC=EQ iff that record IS LNUM
@@ -1083,8 +1096,8 @@ TSL_DONE:                                 ; PE was already updated by OPEN_GAP
 ; Out: PE reduced by the record's length
 ; Clobbers: R0, TMPH:TMPL, EXPH:EXPL
 DEL_REC:
-        LODI,R0 EXPH-IPH
-        BSTA,UN TMP_TO_ET                ; EXP = dst = start of the doomed record
+        LODI,R0 (IDX_TMP*16)+IDX_EXP
+        ZBSR *VREG16_TO_REG16                ; EXP = dst = start of the doomed record
         BSTA,UN ADV_TMP_PAST_REC          ; TMP = src = start of the next record
 DEL_LP:
         ZBSR *VCMP_TMP_PE
@@ -1096,8 +1109,8 @@ DEL_LP:
         ZBSR *VINC_ET                   ; dst++
         BCTR,UN DEL_LP
 DEL_END:
-        LODI,R0 PEH-IPH
-        ZBRR *VEXP16_TO_ET               ; PE = dst (tail call)
+        LODI,R0 (IDX_EXP*16)+IDX_PE
+        ZBRR *VREG16_TO_REG16               ; PE = dst (tail call)
 
 ; =============================================================================
 ;  OPEN_GAP -- Open an R3-byte gap at TMP by moving [TMP,PE) up R3 bytes, and
@@ -1112,11 +1125,8 @@ DEL_END:
 ;      Store full: jumps to DO_ERROR (ERR_OOM); PE and the store are unchanged.
 ; Clobbers: R0, R1, R2, EXPH:EXPL
 OPEN_GAP:
-        LODI,R1 2                        ; EXP = PE
-OG_SAV:
-        LODA,R0 PEH,R1-                  ; R1 2->1: PEL; 1->0: PEH
-        STRA,R0 EXPH,R1
-        BRNR,R1 OG_SAV
+        LODI,R0 (IDX_PE*16)+IDX_EXP      ; EXP = PE
+        ZBSR *VREG16_TO_REG16
         LODZ,R3
         STRZ,R2                          ; R2 = size, as the INC_ET step count
 OG_ADD:
@@ -1153,8 +1163,8 @@ OG_CPY:
         STRA,R0 *PEH,R3                  ; ... goes to PE+R3
         BCTR,UN OG_LP
 OG_FIX:
-        LODI,R0 PEH-IPH
-        ZBRR *VEXP16_TO_ET               ; PE = EXP (tail call)
+        LODI,R0 (IDX_EXP*16)+IDX_PE
+        ZBRR *VREG16_TO_REG16               ; PE = EXP (tail call)
 
 ; =============================================================================
 ;  FIND_LINE -- Search for line LNUMH:LNUML in program store
@@ -1554,8 +1564,8 @@ PU16_DIG:
                                          ; EXP16_TO_ET and CLR_EXP below,
                                          ; which all leave primary R1 alone)
         ZBSR *VINC_IP
-        LODI,R0 SC0-IPH
-        ZBSR *VEXP16_TO_ET              ; SC0:SC1 = EXP (the value so far)
+        LODI,R0 (IDX_EXP*16)+IDX_SC0
+        ZBSR *VREG16_TO_REG16              ; SC0:SC1 = EXP (the value so far)
         ZBSR *VCLR_EXP                   ; EXP = 0 ...
         LODZ,R1                          ; ... R1 consumed here - MULT_LOOP
                                          ; below now clobbers R1 (via
@@ -1705,8 +1715,8 @@ DO_MUL:
         ; unconditionally regardless of any prior value
         BSTA,UN ABS_TMP                  ; [+1] sets NEGFLG from TMP's sign
         BSTR,UN ABS_EXP                  ; [+1] toggles NEGFLG if EXP was negative
-        LODI,R0 SC0-IPH                 ; offset to SCO and 1, SC1 = |EXP| lo
-        ZBSR *VEXP16_TO_ET             ; SC0 = |EXP| hi
+        LODI,R0 (IDX_EXP*16)+IDX_SC0     ; offset to SCO and 1, SC1 = |EXP| lo
+        ZBSR *VREG16_TO_REG16             ; SC0 = |EXP| hi
         ZBSR *VCLR_EXP                  ; clear EXP (accumulator starts at 0)
 
         ; Check if we are on Mul or Div path
@@ -1891,34 +1901,31 @@ ET_RET:
         RETC,UN
 
 ; =============================================================================
-;  EXP16_TO_ET family -- copy EXPH:EXPL to any RAM register pair.
-;  TMP_TO_ET family -- copy TMPH:TMPL to any RAM register pair.
-;
-;  Each entry loads its offset (XYZH-IPH) into R0 (always bank-0, unaffected
-;  by PSW_RS), falls through to body.  STRZ R1 copies R0 into alt-R1 for
-;  indexed addressing.  Primary R1/R2/R3 fully preserved via CPSL PSW_RS.
-;  Clobbers R0 only.  NO BSTA inside body.
-;  Direct BSTA,UN (no ZP slot): CUR_TO_EXP16 (1 site).
-EXP16_TO_LNUM:
-        LODI,R0 LNUMH-IPH       ; LNUMH offset from IPH (= 12)
-EXP16_TO_ET:
+;  REG16_TO_REG16 -- generic 16-bit copy between any two IPH-relative
+;  register pairs, addressed by a packed nibble pair (v2.11 code-golf:
+;  replaces the single-parameter EXP16_TO_ET/TMP_TO_ET family below plus
+;  5 previously-inline manual copy loops -- see VERSION HISTORY).
+; In:  R0 = (SRC_IDX<<4)|DST_IDX; each idx*2 = byte offset from IPH.
+;      Use the IDX_* EQUs above. Valid idx range 0-15 (offsets 0-30).
+; Out: dest 16-bit value = source 16-bit value
+; Clobbers: R0. Primary R1/R2/R3 fully preserved via CPSL PSW_RS.
+; =============================================================================
+REG16_TO_REG16:
         PPSL PSW_RS             ; switch to alternate register bank
-        STRZ R1                 ; alt-R1 = R0 = destination offset
-        LODA,R0 EXPL
-        STRA,R0 IPL,R1          ; store lo byte to dest+1
-        LODA,R0 EXPH
-        BCTR,UN ET_STORE        ; store hi byte, restore bank, return
-
-; Same for TMP
-TMP_TO_SWSTK:
-        LODI,R0 SWSTK-IPH
-TMP_TO_ET:
-        PPSL PSW_RS             ; switch to alternate register bank
-        STRZ R1                 ; alt-R1 = R0 = destination offset
-        LODA,R0 TMPL
-        STRA,R0 IPL,R1          ; store lo byte to dest+1
-        LODA,R0 TMPH
-        BCTR,UN ET_STORE        ; store hi byte, restore bank, return
+        STRZ,R2                 ; alt-R2 = R0 (packed byte SSSSDDDD)
+        ANDI,R2 $0F             ; isolate dest nibble -> R2 = 0000DDDD
+        EORZ,R2                 ; R0 ^= R2 -> SSSS0000 (cancels the low nibble)
+        RRR,R0                  ; /2
+        RRR,R0                  ; /2
+        RRR,R0                  ; /2 -> R0 = source offset
+        STRZ,R1                 ; alt-R1 = R0 (source offset)
+        RRL,R2                  ; *2 -> alt-R2 = dest offset
+        LODA,R0 IPH,R1
+        STRA,R0 IPH,R2
+        LODA,R0 IPL,R1
+        STRA,R0 IPL,R2
+        CPSL PSW_RS             ; restore primary bank
+        RETC,UN
 
 ; =============================================================================
 ;  DO_FOR -- FOR var=start TO limit        (step 1; the body always runs once)
@@ -1940,8 +1947,8 @@ DO_FOR:
         BCFA,EQ JSYNERR                  ; must be TO
         ZBSR *VEATWORD
         ZBSR *VPARSE_EXPR                ; EXP = limit
-        LODI,R0 LNUMH-IPH
-        ZBSR *VEXP16_TO_ET               ; LNUM = limit (safe across the STEP expression)
+        LODI,R0 (IDX_EXP*16)+IDX_LNUM
+        ZBSR *VREG16_TO_REG16               ; LNUM = limit (safe across the STEP expression)
         ZBSR *VWSKIP
         COMI,R0 A'S'
         BCTR,EQ DF_STEP
@@ -2136,45 +2143,48 @@ ROMEND:
  
         ORG     4096    ; half a 2650 8kbyte page
 
-; --- Ordered group: offsets from IPH used by INC_ET/DEC_ET/NEG_SHARED ---
-; Exactly 16 bytes (IPH..SC1) so IBUF, right after, lands at $1010 - hi
-; byte == lo byte, letting GETLINE set IPH:IPL with a single LODI (see
-; GETLINE and the now-deleted SET_IP_IBUF).
-IPH     RES 1       ; interpreter pointer hi       (INC_ET offset 0)
+; --- Ordered group: offsets from IPH used by INC_ET/DEC_ET/NEG_SHARED and
+; by REG16_TO_REG16's packed-nibble index scheme (see IDX_* EQUs, v2.11).
+; IBUF's hi==lo GETLINE trick was dropped when this group grew past 16
+; bytes to bring PE/SC0/RNDSEED into nibble range (+2B in GETLINE, noted
+; in VERSION HISTORY).
+IPH     RES 1       ; interpreter pointer hi       (INC_ET offset 0; IDX_IP=0)
 IPL     RES 1       ; interpreter pointer lo
-TMPH    RES 1       ; temp 16-bit hi               (INC_ET offset 2 = TMPH-IPH)
+TMPH    RES 1       ; temp 16-bit hi               (INC_ET offset 2 = TMPH-IPH; IDX_TMP=1)
 TMPL    RES 1       ; temp 16-bit lo
-GOTOH   RES 1       ; pending target hi            (DEC_ET offset 8 = GOTOH-IPH)
+GOTOH   RES 1       ; pending target hi            (DEC_ET offset 8 = GOTOH-IPH; IDX_GOTO=2)
 GOTOL   RES 1       ; pending target lo
-CURH    RES 1       ; current line hi  (error reporting)
+CURH    RES 1       ; current line hi  (error reporting; IDX_CUR=3)
 CURL    RES 1       ; current line lo
 
 ; SWSTK, EXP, LNUM and FVAR MUST stay contiguous, in this order: DO_FOR pushes
 ; the seven bytes with one loop and DO_NEXT pops them back the same way.
 ; During a FOR: EXP = step, LNUM = limit (LNUM is untouched by expression
 ; evaluation, so it can hold the limit while the STEP expression is parsed).
-SWSTK   RES 2       ; next-line pointer cache [NLP_H][NLP_L] written by DR_EXEC
-EXPH    RES 1       ; expression result hi
+SWSTK   RES 2       ; next-line pointer cache [NLP_H][NLP_L] written by DR_EXEC (IDX_SWSTK=4)
+EXPH    RES 1       ; expression result hi                                     (IDX_EXP=5)
 EXPL    RES 1       ; expression result lo
-LNUMH   RES 1       ; scratch line number hi
+LNUMH   RES 1       ; scratch line number hi                                   (IDX_LNUM=6)
 LNUML   RES 1       ; scratch line number lo
-FVAR    RES 1       ; FOR: variable's VARS offset (staging for frame push/pop)
-FSP     RES 1       ; bytes used in FSTK: 0,7,14,21; 28=full
+FVAR    RES 1       ; FOR: variable's VARS offset (staging for frame push/pop) - NOT nibble-indexed
+NIBPAD  RES 1       ; unused - restores even alignment after odd-length FVAR so
+                     ; everything below is reachable by REG16_TO_REG16 (idx*2)
+PEH     DB <SHOWCASE_END       ; Program end pointer hi                        (IDX_PE=8)
+PEL     DB >SHOWCASE_END       ; Program end pointer lo
+SC0     RES 1       ; Scratch byte 0                                          (IDX_SC0=9)
+SC1     RES 1       ; Scratch byte 1
+RNDSEED  RES 2      ; pseudo random number                                    (IDX_RND=10)
+FSP     RES 1       ; bytes used in FSTK: 0,7,14,21; 28=full - NOT nibble-indexed
 
-; Buffers - IBUF MUST be exactly 16 bytes from IPH (see above)
+; Buffers
 IBUF    RES 64      ; Input buffer 64 bytes
 
-; --- Remaining --- (order doesn't matter - none of these sit in the
-; offset-from-IPH group above; PEH-IPH is still a valid, just larger,
-; assembly-time constant wherever PEH ends up)
-PEH     DB <SHOWCASE_END       ; Program end pointer hi
-PEL     DB >SHOWCASE_END       ; Program end pointer lo
+; --- Remaining --- (order doesn't matter; not nibble-indexed)
 TEMPRETH RES 1      ; SWRETURN scratch: popped continuation addr hi (was PDEPTH -
                      ; PDEPTH itself removed, see CHANGE HISTORY: paren nesting
                      ; no longer needs a separate SW-tracked depth counter, the
                      ; PUSH_RET/PARSER_RET continuation stack IS the tracking)
 TEMPRETL RES 1      ; SWRETURN scratch: popped continuation addr lo
-RNDSEED  RES 2      ; pseudo random number
 
 ;  --- Flags & Stuff --- 
 RUNFLG  RES 1       ; $01=running $00=immediate
@@ -2187,8 +2197,6 @@ GSSTK   RES 8       ; GOSUB return-address stack, 4 levels x [hi][lo]
 GSSP    RES 1       ; GOSUB stack offset into GSSTK: 0,2,4,6; 8=full
 FSTK    RES 28      ; FOR frames, 4 levels x 7 bytes, pushed in this order:
                     ; [VARS offset][limit lo][limit hi][step lo][step hi][body lo][body hi]
-SC0     RES 1       ; Scratch byte 0
-SC1     RES 1       ; Scratch byte 1
 
 ;  SW call stack -- used by PARSE_EXPR / PRINT_S16 only
 ; R3 = index ($FF=empty, grows up). Each frame = [lo][hi].
