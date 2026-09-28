@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.18
+ * Version: 1.19
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -28,6 +28,22 @@
  *            grouping. Division by zero is an error. Trailing text the
  *            grammar can't parse is a hard error (was silently dropped
  *            pre-1.17 — BUG-ASM-15).
+ *
+ * Changes v1.18 -> v1.19:
+ *   BUG-ASM-18 FIXED: register-indexed absolute addressing (,Rn[+/-]) accepted
+ *     any target register. On the 2650 the index register occupies the opcode's
+ *     register field, so the target is implicitly R0 and only ,R0 is
+ *     encodable. The alu[] handler overwrote r with the index register and
+ *     dropped the written target, so e.g. LODA,R1 ADDR,R2 assembled to
+ *     $0E hh ll, byte-identical to LODA,R0 ADDR,R2, with no diagnostic
+ *     (v1.16 BUG-ASM-08 only restricted the mode, not the target). Now a hard
+ *     ERROR on pass 2 when an indexed A-mode operand is used with a target
+ *     other than R0. Applies to LODA/EORA/ANDA/IORA/ADDA/SUBA/COMA/STRA, with
+ *     plain ,Rn and auto ,Rn+ / ,Rn- forms, direct or indirect (*). The error
+ *     is unconditional: no command-line option affects it, errors gate the
+ *     .hex/.bin output as for every other ERROR. The instruction is still
+ *     sized and emitted as before so later addresses stay aligned and no
+ *     cascading errors appear. Non-indexed forms (LODA,R1 ADDR) unaffected.
  *
  * Changes v1.17 -> v1.18:
  *   BUG-ASM-16 FIXED: a DB whose operand can't be evaluated yet in pass 1 (a
@@ -264,7 +280,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.18"
+#define ASM2650_VERSION "1.19"
 
 typedef struct { char name[64]; int value; int referenced; int def_line; } Label;
 static Label labels[MAX_LABELS];
@@ -959,6 +975,15 @@ static void assemble_line(char *line){
                 if(mode!=3){
                     if(pass==2){ fprintf(stderr,"ERROR line %d: %s does not support indexed addressing (,Rn) — only A-mode does\n",lineno,mn); errors++; }
                     return;
+                }
+                /* BUG-ASM-18: the index register takes the opcode's register
+                 * field, so the target is implicitly R0. Any other written
+                 * target cannot be encoded -> hard error (pass 2). Encoding
+                 * continues below so pc stays aligned across passes. */
+                if(r!=0 && pass==2){
+                    fprintf(stderr,"ERROR line %d: %s,R%d with indexed addressing (,R%c%s) — target must be R0 (index register replaces the register field)\n",
+                            lineno,mn,r,ops[1][1],ops[1][2]=='+'?"+":ops[1][2]=='-'?"-":"");
+                    errors++;
                 }
                 r=ops[1][1]-'0';  /* register field = index register */
                 if     (ops[1][2]=='+') idxctl=1;
