@@ -127,9 +127,11 @@
 ;
 ; CHANGE HISTORY
 ;
-; V4.28 (2026-09-29) - ROMEND $0ED5 -> $0E92 (3730 bytes)
+; V4.28 (2026-09-29) - ROMEND $0ED5 -> $0E70 (3696 bytes)
 ;   - Deleted GETCI and vector - WSKIP leaves char in R0, uses INC_IP instead. 
-;     Cleaned up multiple unecessary LODA,R0 *IPH after WSKIP calls.
+;     Cleaned up multiple unnecessary LODA,R0 *IPH after WSKIP calls.
+;   - Abused EXPR for single arg function, deleted CHECK_LPARENS/Check_RPARENS 
+;     and vectors. Inlined left Paren check at PARSE_2ARGS. 
 ;   - Zero-page vector sweep, added common REG16_TO_REG16 vector and shims.
 ;
 ; V4.27 (2026-09-29) - ROMEND $0EEF -> $0ED6 (3798 bytes)
@@ -178,7 +180,7 @@
 ;     superseded in V4.24 by TKH:TKL pair.
 ;   - TL_LP letter typo BCFR,LT instead of BCTR,LT
 ;   - TL_STR_LP tested R0 for the closing quote after ZBSR *VINC_IP clobber.
-;     Fix: cachein SC0 across the call. 
+;     Fix: cache in SC0 across the call. 
 ;   - TSL_CPY copied TOKBUF up to the first $00 byte, truncating records at
 ;     a TOK_DEC/TOK_HEX payload zero byte. Fix: copy by count (R3-2=body+NUL)
 ;   - TL_MULADD: STRZ,R3 (multiplier) ran after EXP16_TO_TMP/CLR_EXP had
@@ -216,12 +218,9 @@
 ;     [full keyword text][NUL][hi][lo] rows, matched on the COMPLETE
 ;     spelling. This table doubles as the LIST detokenizer's text
 ;     source once tokens land (Step 2) -- avoids 2nd duplicate table.
-;   - MATCH_KW/SE_SCAN rewritten: no more up-front 2-char GETCI prefetch
-;     into SC0/SC1 (dropped from the clobbers list entirely -- nothing else
-;     in the file depended on MATCH_KW leaving them set). Each row is now
-;     compared char-by-char directly against IP (peeked via *IPH, not
-;     consumed) using R0/R1 only 
-;   - Dispatch now requires the FULL keyword spelling; trailing garbage after
+;   - MATCH_KW/SE_SCAN rewritten: Each row now compared char-by-char directly
+;     against IP (peeked via *IPH, not consumed) using R0/R1 only. 
+;   - Dispatch  requires FULL keyword spelling; trailing garbage after
 ;     a complete keyword is still swallowed by EATWORD like before.
 ;
 ; V4.20 (2026-09-24) - ROMEND $0DDE -> $0D99 
@@ -487,10 +486,6 @@ VFETCH16_IP:
         DW FETCH16_IP           ; 4 sites (V4.26: EXP = word at [IP], IP += 2)
 VSET_TMP_PROG:
         DW SET_TMP_PROG ; 3 sites
-VCHECK_LPAREN:
-        DW CHECK_LPAREN          ; 7 sites (v4.5 FUNCCONT-01: ABS/NEG/NOT/
-VCHECK_RPAREN:
-        DW CHECK_RPAREN          ; 6 sites (ABS/NEG/NOT/PEEK/USR/RND)
 VFUNC_CONT:
         DW FUNC_EPILOG            ; 5 sites (ABS/NEG/RND + P2A_RET shared by
 VPUSH_RET:
@@ -895,17 +890,10 @@ RND_SKIP:
 ; =============================================================================
 ; DO_RND_FUNC  RND(n) -> pseudo-random value in [0,n)
 ; BUG-RND-01 fix: a single LFSR shift/call left consecutive RND() draws in a
-; tight loop highly correlated (only 1 bit of mixing between draws). Now
-; shuffles a full byte (8 shifts) per call; CHIN's incidental shuffle on
-; keypress still adds independent async entropy on top.
-; v4.4: loop via R2+BDRR instead of unrolled (R2 is untouched by RND_SHUFFLE
-; and not live here - this is a FUNC_TAB-dispatched call, see PARSE_2ARGS
-; header note on register lifetimes) - 6 bytes vs the unroll's 16.
+; tight loop highly correlated (only 1 bit of mixing between draws).
 ; =============================================================================
 DO_RND_FUNC:
-        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR       ; get range in EXP 
-        ZBSR *VCHECK_RPAREN
         LODI,R2 8               ; shuffle a full byte's worth of taps
 RNDF_MIX:
         BSTR,UN RND_SHUFFLE
@@ -918,22 +906,16 @@ RNDF_MIX:
 
 ; =============================================================================
 ;  DO_PEEK_FUNC / DO_USR_FUNC -- relocated here in v4.5 (see header note at
-;  their old pre-CHIN location): both paren-bounded now (CHECK_LPAREN/
-;  CHECK_RPAREN) and resume via FUNC_CONT (shared EXPH_Z tail), part of the
 ;  FUNCCONT-01 fix.
 DO_PEEK_FUNC:
-        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
-        ZBSR *VCHECK_RPAREN
         LODA,R0 *EXPH
         BCTR,UN EXPH_Z                   ; clear top byte
 
 ; =============================================================================
 ; Calling function retval in R0
 DO_USR_FUNC:
-        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
-        ZBSR *VCHECK_RPAREN
         BSTA,UN *EXPH   
 EXPH_Z:        
         STRA,R0 EXPL
@@ -2196,22 +2178,6 @@ PARSER_RET:
         BCTA,UN SWRETURN
 
 ; =============================================================================
-;  CHECK_LPAREN -- require and consume '(' at IP (v4.5, FUNCCONT-01 fix)
-;  CHECK_RPAREN -- require and consume ')' at IP (v4.5, FUNCCONT-01 fix)
-; Out: IP advanced past parens; tail-jumps to JSYNERR (no return) if missing
-; Clobbers: R0, R1
-CHECK_LPAREN:
-        LODI,R1 A'('
-        DB $EC
-        ; drop through
-CHECK_RPAREN:
-        LODI,R1 A')'
-        ZBSR *VWSKIP
-        COMZ,R1
-        BCFA,EQ JSYNERR
-        ZBRR *VINC_IP            ; tail call: consumes ')' and returns to caller
-
-; =============================================================================
 ;  FUNC_EPILOG -- shared exit for all function handlers (FUNCATOM-01 fix,
 ;  v4.6). VFUNC_CONT now points here so none of the 5 ZBRR *VFUNC_CONT call
 ;  sites need to change. Pops the origin marker pushed by PE_SAFE/EAM_ATOM
@@ -2424,11 +2390,8 @@ NEG_EXP_BODY:
 
 ; =============================================================================
 ;  DO_NEG_FUNC -- NEG(a), arithmetic negation (v4.5: paren-bounded, see
-;  CHECK_LPAREN/CHECK_RPAREN/FUNC_CONT for the FUNCCONT-01 fix)
 DO_NEG_FUNC:
-        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
-        ZBSR *VCHECK_RPAREN
         BSTR,UN NEG_EXP_BODY              ; real call now (was tail-jump) so
         ZBRR *VFUNC_CONT                  ; control returns here for FUNC_CONT
 
@@ -2463,11 +2426,8 @@ NEG_SHARED:
 
 ; =============================================================================
 ;  DO_ABS_FUNC -- ABS(a), absolute value (v4.5: paren-bounded, see
-;  CHECK_LPAREN/CHECK_RPAREN/FUNC_CONT for the FUNCCONT-01 fix)
 DO_ABS_FUNC:
-        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
-        ZBSR *VCHECK_RPAREN
         BSTR,UN ABS_EXP                    ; real call now (was fall-through)
         ZBRR *VFUNC_CONT                   ; control returns here for FUNC_CONT
 
@@ -2523,7 +2483,7 @@ DLS_ARG:
         LODI,R0 P2A_LISTOP-P2A_ANDOP
         STRA,R0 FUNCOP
         BCTR,UN P2A_NOPAREN
-
+        
 ; =============================================================================
 ;  DO_AND_FUNC / DO_OR_FUNC / DO_XOR_FUNC -- bitwise AND(a,b)/OR(a,b)/XOR(a,b)
 ; FUNCOP = assembly-time literal offset into P2A_ANDOP (see DO_AND_FUNC etc
@@ -2550,8 +2510,13 @@ DO_XOR_FUNC:
 ;      FUNCOP = target offset from P2A_ANDOP
 ; Out: per-handler (see P2A_ANDOP/OROP/XOROP/POKEOP/LISTOP below)
 ; Clobbers: R0, R3, SAVEH, SAVEL, NEGFLG, SC0, SC1, TMPH, TMPL, ARGAH, ARGAL
-;PARSE_2ARGS:
-        ZBSR *VCHECK_LPAREN              ; require+consume '(' 
+PARSE_2ARGS:
+        ; require+consume '(' 
+        ZBSR *VWSKIP
+        COMI,R0 A'('
+        BCFA,EQ JSYNERR
+        ZBSR *VINC_IP            ; consumes ')' 
+
 P2A_NOPAREN:
         ZBSR *VPARSE_EXPR               ; a -> EXP
         LODI,R0 (IDX_EXP*16)+IDX_ARGA
@@ -2600,9 +2565,7 @@ P2A_POKEOP:
 ;  bug as ABS/NEG before their fix: "NOT(0)+1" computed NOT(0+1) instead of
 ;  NOT(0)+1). Continuation handled by the shared P2A_RET tail below.
 DO_NOT_FUNC:
-        ZBSR *VCHECK_LPAREN
         ZBSR *VPARSE_EXPR
-        ZBSR *VCHECK_RPAREN
         LODA,R0 EXPH
         EORI,R0 $FF
         STRA,R0 EXPH
