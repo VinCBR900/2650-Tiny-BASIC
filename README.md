@@ -11,11 +11,11 @@
 You can play with these online at [https://vincbr900.github.io/2650-Tiny-BASIC/](https://vincbr900.github.io/2650-Tiny-BASIC/)
 
 These integer Tiny BASIC interpreter explores what can be achieved on a processor designed before personal computers existed, embracing the constraints of the 2650, particularly its limited hardware stack and memory model, while demonstrating that capable interactive language can still fit within those restrictions.  There is a history article available [here](/docs/history.md), summarized below. Three versions are available
-  * **pBASIC2650 PoC** - Proof of Concept, Smallest Useful 2650 Tiny BASIC.  Only has `<` and `=` relops, flat precedence math but full signed 16 bit `+`/`-`/`*`/`/`. Checks 2nd char is a letter, Dispatches on 1st char. Delete/Append only BASIC line entry, less than 1380 ROM bytes including bitbang serial.
-  * **uBASIC2650 2kByte** - <2kbyte Minimal Tiny BASIC with `GOSUB`/`RETURN` and `FOR`/`NEXT`, both 4 level .  BODMAS lite operator precedence, relops are `<`,`>`, `=` and `!=`, `!>` and `!<` to emulate others.  Checks 2nd char is a letter, dispatches on 1st char and checks 3rd char when collision e.g. `NEW` vs `NEXT`. Has proper random replacement BASIC line handling.
-  * **4kBASIC2650 FAST** - Standard Tiny BASIC with `GOSUB`/`RETURN`, `FOR`/`NEXT`, Functions, six proper relops, and normal BASIC line entry. Full keyword matching and tokenization.  Was previously called uBASIC but renamed since chunky.    
+  * **pBASIC2650 - Small** - Proof of Concept, Smallest Useful 2650 Tiny BASIC.  Only has `<` and `=` relops, flat precedence math but full signed 16 bit `+`/`-`/`*`/`/`. Checks 2nd char is a letter, Dispatches on 1st char. Delete/Append only BASIC line entry, less than 1380 ROM bytes including bitbang serial. I wanted 1kbyte bit oh well.
+  * **uBASIC2650 - 2kByte** - <2kbyte Minimal Tiny BASIC with `GOSUB`/`RETURN` and `FOR`/`NEXT`, both 4 level .  BODMAS lite operator precedence, relops are `<`,`>`, `=` and `!=`, `!>` and `!<` to emulate others.  Checks 2nd char is a letter, dispatches on 1st char and checks 3rd char when collision e.g. `NEW` vs `NEXT`. Has proper random replacement BASIC line handling.
+  * **4kBASIC2650 - FAST** - Standard Tiny BASIC with `GOSUB`/`RETURN`, `FOR`/`NEXT`, Functions, six proper relops, and normal BASIC line entry. Full keyword matching and tokenization.  Was previously called uBASIC but renamed since chunky.    
 
-Development first started with uBASIC but as I was new to **Signetics 2650** assembly I coudln't get it to less than ~2.5kbyte when the target was 2kbyte, so I padded it out with features e.g. `HEX$(num)` to 4kbyte.  It was only after I developed pBASIC65c02 I realised I could use same techniques here, which led to minimal pBASIC, then expanded pBASIC which become V2 uBASIC and original uBASIC became 4kBASIC.
+Development first started with uBASIC but as I was new to **Signetics 2650** assembly I coudln't get it to less than ~2.5kbyte when the target was 2kbyte, so I padded it out with features e.g. `HEX$(num)` to 4kbyte.  It was only after I developed pBASIC65c02 I realised I could use same techniques here, which led to minimal pBASIC, then expanded pBASIC which become V2 uBASIC and original uBASIC became 4kBASIC. 4kBASIC has since been size optimized and expanded with tokenization.
 
 If you just want a proper BASIC for your Signetics 2650 system then the vintage [MicroWorld BASIC interpreter](https://binnie.id.au/MicroByte/BASIC%20Manual.pdf) is significantly more capable with floating point and string support. It is scattered around on the internet but I found a version at [https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main](https://github.com/jim11662418/Signetics_2650_Single_Board_Computer/tree/main).
 
@@ -56,8 +56,6 @@ Type `LIST` to see the embedded BASIC program and `RUN` to execute it - Pressing
 
 ##  Notes
 
-No tokeniser — program lines are stored as raw ASCII and re-parsed on every execution.  You must leave spaces between keyword e.g. `FOR A=1 TO 5` will work, `FORA+1TO5` will not. 
-
 This has been much more difficult than writing the [6502 Tiny BASIC](https://github.com/VinCBR900/65c02-Tiny-BASIC). Architectural Challanges are: 
 - 8 level hardware Return Address Stack (RAS). Recursion trades speed for code size (e.g. expression parser, printing digits), but here the standard stack too small
   - One of the tricks for reduced size (sometimes called _Code Golf_) is for any code used twice or more, make it a subroutine.  That's Not possible here due to the small RAS, so we have lots of duplicate inline code.
@@ -75,8 +73,7 @@ The biggest challange is that, unlike MOS 6502, Claude, Gemini and CODEX dont re
 
 | File | Description |
 |------|-------------|
-| `uBASIC2650.asm` | uBASIC source (~2500 lines, heavily commented) |
-| `Instruction_Oracle_2650.md`| Op-code Crib sheet for the AI|
+| `Instruction_Oracle_2650.md`| Op-code Crib sheet for Claude
 | `tools/ASM2650.c`| Native 2650 Assembler, ported from [https://ztpe.nl/2650/development/as2650-a-2650-assembler/](https://ztpe.nl/2650/development/as2650-a-2650-assembler/)|
 | `tools/Pipbug_Wrap.c`| Batch and interactive simulator.  Levearges `2650.c` CPU core from the [Winarcadia project](https://amigan.yatho.com/)|
 
