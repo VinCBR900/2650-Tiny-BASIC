@@ -127,9 +127,10 @@
 ;
 ; CHANGE HISTORY
 ;
-; V4.28 (2026-09-29) - ROMEND $0ED5 -> $0EBF (3775 bytes)
-;   - Deleted GETCI and vector - WSKIP leaves char in R0, uses INC_IP instead.
-;   - Zero-page vector sweep.
+; V4.28 (2026-09-29) - ROMEND $0ED5 -> $0E92 (3730 bytes)
+;   - Deleted GETCI and vector - WSKIP leaves char in R0, uses INC_IP instead. 
+;     Cleaned up multiple unecessary LODA,R0 *IPH after WSKIP calls.
+;   - Zero-page vector sweep, added common REG16_TO_REG16 vector and shims.
 ;
 ; V4.27 (2026-09-29) - ROMEND $0EEF -> $0ED6 (3798 bytes)
 ;   - DO_FOR STEP test now peeks (WSKIP) instead of GETCI/DEC_IP on default-step.
@@ -666,7 +667,6 @@ STMT_EXEC:
 ; Clobbers: R0, R1, EXPH, EXPL, GOTOH, GOTOL
 MATCH_KW:
         ZBSR *VWSKIP                      ; [+1]
-        LODA,R0 *IPH                      ; peek (not consumed)
         
         ; Golf #1: Pre-subtract the statement base. This collapses the token bounds 
         ; checks and completely eliminates the need to subtract it again in SF_STMT.
@@ -728,7 +728,6 @@ SE_HI_LO:
 SE_NOTKW:
         BSTA,UN PARSE_VAR_SAVE            ; validates A-Z, SC0/R2 = letter
         ZBSR *VWSKIP
-        LODA,R0 *IPH
         COMI,R0 A'='
         BCFA,EQ JSYNERR
         ZBSR *VINC_IP
@@ -779,7 +778,6 @@ DO_END:
 DO_LET:
         BSTA,UN PARSE_VAR_SAVE
         ZBSR *VWSKIP                      ; [+1]
-        LODA,R0 *IPH
         COMI,R0 A'='
         BCTR,EQ DL_EQC
         ZBRR *VJSYNERR 
@@ -951,7 +949,6 @@ EXPH_Z:
 ; Clobbers: R0, R1, R2, SC0
 PARSE_VAR_SAVE:
         ZBSR *VWSKIP  
-        LODA,R0 *IPH
         COMI,R0 A'A'
         BCTA,LT JERRVAR       ; out of range low  -- tail jump, no return
         COMI,R0 A'Z'+1
@@ -1129,13 +1126,11 @@ TAB_LOOP:
 
 DP_SEP:
         ZBSR *VWSKIP  
-        LODA,R0 *IPH
         COMI,R0 $3B              ; semicolon?
         BCFA,EQ PRT_CRLF         ; If not, tail call to newline directly
 
         ZBSR *VINC_IP            ; Eat semicolon
         ZBSR *VWSKIP  
-        LODA,R0 *IPH
         RETC,EQ                  ; bail if NUL
         BCTA,UN DP_ITEM
 
@@ -1974,8 +1969,7 @@ EAM0_RET:
         ZBRR *VEAM_HI 
 EAM_HI0_RET:
 EAM_LO_LOOP:
-;        ZBSR *VWSKIP  
-        LODA,R0 *IPH
+        ZBSR *VWSKIP  
         COMI,R0 A'+'
         BCTR,EQ EAM_PLUS
         COMI,R0 A'-'
@@ -2063,7 +2057,6 @@ ADD16_SAVE_EXP:
 
 EAM_HI:
         ZBSR *VWSKIP  
-        LODA,R0 *IPH
         COMI,R0 A'*'
         BCTR,EQ EAM_MUL
         COMI,R0 A'/'
@@ -2122,7 +2115,6 @@ POP_SAVE_TO_TMP:
         RETC,UN
 EAM_ATOM:
         ZBSR *VWSKIP  
-        LODA,R0 *IPH
         COMI,R0 A'-'
         BCTA,EQ EAM_NEG
         COMI,R0 A'+'
@@ -2205,23 +2197,17 @@ PARSER_RET:
 
 ; =============================================================================
 ;  CHECK_LPAREN -- require and consume '(' at IP (v4.5, FUNCCONT-01 fix)
-; Out: IP advanced past '('; tail-jumps to JSYNERR (no return) if missing
-; Clobbers: R0
-CHECK_LPAREN:
-        ZBSR *VWSKIP
-        LODA,R0 *IPH
-        COMI,R0 A'('
-        BCFA,EQ JSYNERR
-        ZBRR *VINC_IP            ; tail call: consumes '(' and returns to caller
-
-; =============================================================================
 ;  CHECK_RPAREN -- require and consume ')' at IP (v4.5, FUNCCONT-01 fix)
-; Out: IP advanced past ')'; tail-jumps to JSYNERR (no return) if missing
-; Clobbers: R0
+; Out: IP advanced past parens; tail-jumps to JSYNERR (no return) if missing
+; Clobbers: R0, R1
+CHECK_LPAREN:
+        LODI,R1 A'('
+        DB $EC
+        ; drop through
 CHECK_RPAREN:
+        LODI,R1 A')'
         ZBSR *VWSKIP
-        LODA,R0 *IPH
-        COMI,R0 A')'
+        COMZ,R1
         BCFA,EQ JSYNERR
         ZBRR *VINC_IP            ; tail call: consumes ')' and returns to caller
 
@@ -2511,7 +2497,6 @@ ABS_EXP:
 DO_LIST:
         ; Peek first char: MATCH_KW leaves IP at space before args (if any).
         ZBSR *VWSKIP                      ; skip whitespace
-        LODA,R0 *IPH
         COMI,R0 CR                       ; no args
         BCFR,LT DLS_ARG                  ; digits - get args
 ;DLS_FULL:
@@ -2572,13 +2557,11 @@ P2A_NOPAREN:
         LODI,R0 (IDX_EXP*16)+IDX_ARGA
         ZBSR *VREG16_TO_REG16             
         ZBSR *VWSKIP
-        LODA,R0 *IPH
         COMI,R0 A','
         BCFA,EQ JSYNERR                 ; require comma
         ZBSR *VINC_IP
         ZBSR *VPARSE_EXPR               ; b -> EXP
         ZBSR *VWSKIP
-        LODA,R0 *IPH
         COMI,R0 A')'
         BCFR,EQ P2A_DISPATCH            ; no ')' (POKE/LIST): don't consume
         ZBSR *VINC_IP                    ; consume ')' (AND/OR/XOR)
@@ -3623,5 +3606,6 @@ SHOWCASE_END:
 ;     bytes, -2 RAM for TEMPRET) but it would nest one extra RAS level at the
 ;     point where PARSER_RET can already be at depth 6-7 -- needs a depth audit.
 ;   - PARSE_VAR_SAVE/DL_STORE use var in SC0 and R2 - clean up as per pbasic 
+;   - In why is LODA,R0 *IPH,R1 necessary in DP_ITEM 
 
         END
