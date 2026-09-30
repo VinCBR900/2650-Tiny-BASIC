@@ -1,5 +1,5 @@
 ; 4kBASIC2650.asm       4k Tiny BASIC interpreter for Signetics 2650 (was uBASIC)
-; Version: v5.0
+; Version: v5.3
 ; By Vincent Crabtree, 2026.  MIT License
 ; Date:    Sep 2026
 ;
@@ -58,9 +58,10 @@
 ; literals" are taken verbatim regardless of case, as always.
 ;
 ; HEX LITERALS ($HHHH)
-;   Only stored (numbered) lines can use Hex Literals as Direct/immediate
-;   entry has no untokenized hex parser. The tokenizer accepts any number 
-;   of hex digits, LIST always prints 4.
+;   Accepted in stored lines and in direct/immediate entry (V5.1). Digits 0-9
+;   and UPPERCASE A-F only; '$' not followed by a hex digit is a syntax error
+;   (in a stored line it is kept as a plain '$'). Any number of digits is
+;   accepted and wraps mod 65536 ($10000 = 0, $FFFF = -1). LIST always prints 4.
 ;
 ; GOSUB/RETURN NESTING
 ;   Up to 8 levels deep (GSSTKLIM=16 bytes, 2 per level).
@@ -125,35 +126,57 @@
 ;
 ;        KNOWN OPEN ITEMS
 ;   COLON-01: ':' multi-statement not supported - likely never due to RAS.
-;   OPT-16:   MUL16/DIV16 uses O(N) loop for size - O(16) bit-serial deferred.
 ;   FOR-01:   NEXT variable not checked against frame var (smallest code, by spec).
 ;   FOR-02:   Body always executes at least once (no skip-if-false-at-entry, by spec).
 ;   REC-01:   Triple-nested atom-dispatch (1+ABS(NEG(AND(...)))) hits RAS limit guard
 ;
 ; CHANGE HISTORY
 ;
-; V5.0 (2026-09-29) - ROMEND $0E6A, 3690 bytes; PROG 1543 -> 1403 bytes
+; V5.3 (2026-09) - ROMEND $0E61 -> $0EDC (3804 bytes)
+;   - MUL16: MSB-first shift-add (Horner), 16 passes or 8 if multiplier<256.
+;   - DIV16: restoring shift-subtract, 16 passes or 8 if dividend<256.
+;   - MATCH_KW early-out: anything but two letters in a row no longer scans table.
+;   - INC_IP: dedicated ~4-instruction path (was ~10 via the shared INC_ET).
+;   - ADV_TMP_PAST_REC: indexed scan, TMP advanced once
+;
+; V5.2 (2026-09) - ROMEND $0E78 -> $0E61 (3681 bytes)
+;   - Variable plumbing clean up: PARSE_VAR_SAVE now leaves R2 = VARS byte offset
+;     (2*(letter-'A')) instead of ASCII letter, and drops dead SC0 copy.
+;     DL_STORE uses R2 directly as index register: no letter->offset conversion.
+;   - PARSE_VAR_SAVE range test is one SUBI/COMI (relies on global COM=1).
+;   - DO_FOR now takes its variable via PARSE_VAR_SAVE (was: unvalidated letter,
+;     dead STRA FORVAR, own INC_IP). 
+;   - BUG FIXED: FOR with a non-A-Z variable (e.g. FOR [=1 TO 2) computed a VARS
+;     offset outside VARS; it now raises the same variable error as LET/INPUT.
+;   - PF_LOADVAR: index kept in R1 across INC_IP (bank-1, R1 survives).
+;
+; V5.1 (2026-09) - ROMEND $0E6A -> $0E78 (3704 bytes, +14)
+;   - Direct/immediate-mode hex constants ($BEEF): PF_NUM now hands '$' to the
+;     new PARSE_HEX. HEX_PEEK/PARSE_HEX are TL_MAYBEHEX's former inline code,
+;     factored out so the tokenizer and the expression parser share one loop.
+;   - PARSE_HEX is tail-jumped from PF_NUM (not called) to stay within the
+;     PE_RAS_LIMIT budget: worst legal nesting peaks at SP=7, as for decimal.
+;
+; V5.0 (2026-09) - ROMEND $0E6A, 3690 bytes; PROG 1543 -> 1403 bytes
 ;   - Minor DO_PRINT code refactor.
 ;   - Added keyword token EQUs (TOK_END..TOK_RUN, TOK_ABS..TOK_XOR), generated
 ;     from KW_TAB/FUNC_TAB row order by tools/tokshowcase.py.
-;   - SHOWCASE now stored pre-tokenized (73 records), generated from showcase.bas
-;     by tools/tokshowcase.py, which mirrors TOKENIZE_LINE (V4.24). Source text is
-;     recoverable with 'tokshowcase.py extract'.
+;   - SHOWCASE now stored pre-tokenized (73 records)
 ;
-; V4.28 (2026-09-29) - ROMEND $0ED5 -> $0E70 (3696 bytes)
+; V4.28 (2026-09) - ROMEND $0ED5 -> $0E70 (3696 bytes)
 ;   - Deleted GETCI and vector - WSKIP leaves char in R0, uses INC_IP instead. 
 ;     Cleaned up multiple unnecessary LODA,R0 *IPH after WSKIP calls.
 ;   - Abused EXPR for single arg function, deleted CHECK_LPARENS/Check_RPARENS 
 ;     and vectors. Inlined left Paren check at PARSE_2ARGS. 
 ;   - Zero-page vector sweep, added common REG16_TO_REG16 vector and shims.
 ;
-; V4.27 (2026-09-29) - ROMEND $0EEF -> $0ED6 (3798 bytes)
+; V4.27 (2026-09) - ROMEND $0EEF -> $0ED6 (3798 bytes)
 ;   - DO_FOR STEP test now peeks (WSKIP) instead of GETCI/DEC_IP on default-step.
 ;   - Deleted DEC_IP, DEC_ET body and VDEC_IP zero-page vector as no callers.
 ;   - BUG-FOREQ-01: space before '=' (FOR I = 1 TO 3, FOR I =1 TO 3) gave ?0.
 ;     DO_FOR used GETCI which does not skip whitespace, replaced with WSKIP.
 ;
-; V4.26 (2026-09-29) - ROMEND $0F1F -> $0EEF 
+; V4.26 (2026-09) - ROMEND $0F1F -> $0EEF 
 ;   - FETCH16_IP - Replaces four inline LODA *IPH/STRA/INC_IP x2
 ;     sequences: DLS_BODY, PF_CONST (tail-called), DLS_CONST, and DR_EXEC.
 ;   - DR_EXEC: the 2-byte line-number header is now IP=TMP, FETCH16_IP,
@@ -165,7 +188,7 @@
 ;   (DO_GOSUB/DO_RETURN), PF_LOADVAR/DL_STORE (VARS,R1 element access), 
 ;   PUSH_EXP/PUSH_RET, and SWRETURN (see To-DO).
 ;
-; V4.25 (2026-09-28) - ROMEND $0F8E -> $0F1F 
+; V4.25 (2026-09) - ROMEND $0F8E -> $0F1F 
 ;   - Added REG16_TO_REG16, zero-page vector VREG16_TO_REG16 and IDX_* EQUs.
 ;   - Deleted superseded helpers: EXP16_TO_TMP, EXP16_TO_GOTO,
 ;     EXP16_TO_LNUM, EXP16_TO_ET, CUR_TO_EXP16, TMP_TO_EXP16, ET_TO_EXP16,
@@ -177,7 +200,7 @@
 ;     read again before the next statement re-parses).
 ;   - RAM: reordered so every copied pair is hi/lo even offset from IPH. 
 ;
-; V4.24 (2026-09-28) - ROMEND $1019 -> $0FEE
+; V4.24 (2026-09) - ROMEND $1019 -> $0FEE
 ;   Golf pass on the V4.23 tokenizer fixes -- no behaviour change
 ;   - TOKENIZE_LINE / TOK_MATCH_ROW / TL_MULADD added dedicated TKH:TKL
 ;     pair instead of TMPH:TMPL, TSL_WRITE no longer saves/restores TMP.
@@ -187,7 +210,7 @@
 ;     (TL_EMIT_CONST); they differed only in the token byte.
 ;   - ORG 4096 re-enabled; memory map is back to the real split (IPH=$1000).
 ;
-; V4.23 (2026-09-28) - ROMEND $0FFC -> $1019 overflow
+; V4.23 (2026-09) - ROMEND $0FFC -> $1019 overflow
 ;   Tokenizer step 3 (encode side: TOKENIZE_LINE + TRY_STORE_LINE)
 ;   - TSL_WRITE: TOKENIZE_LINE clobbers TMPH:TMPL. Fix: TMPSAVEH/TMPSAVEL, 
 ;     superseded in V4.24 by TKH:TKL pair.
@@ -203,7 +226,7 @@
 ;   - TOKBUF (80) overflowed into VARS on dense-constant lines, expanded 
 ;     so TOKBUF now RES 128. 
 ;
-; V4.22 (2026-09-26) - ROMEND $0DA3 -> $0E8D (+234 bytes)
+; V4.22 (2026-09) - ROMEND $0DA3 -> $0E8D (+234 bytes)
 ;   Tokenizer project, step 2: dispatch + detokenization infrastructure.
 ;   - Token space: TOK_STMT_BASE=$80 (16 rows, $80-$8F), gap to
 ;     TOK_FUNC_BASE=$A0 (9 rows, $A0-$A8) reserved for future statements,
@@ -224,7 +247,7 @@
 ;   - DLS_BLPX (LIST) is now the detokenizer: statement/function tokens
 ;     print their full keyword text 
 ;
-; V4.21 (2026-09-25) - ROMEND $0D99 -> $0DA3 
+; V4.21 (2026-09) - ROMEND $0D99 -> $0DA3 
 ;  Tokenizer project step 1 - Table expansion.
 ;   - KW_TAB/FUNC_TAB expanded from a fixed 5-byte-stride [c1][c2][c3][hi]
 ;     [lo] row (matched on the first 2-3 chars only) to variable-length
@@ -236,7 +259,7 @@
 ;   - Dispatch  requires FULL keyword spelling; trailing garbage after
 ;     a complete keyword is still swallowed by EATWORD like before.
 ;
-; V4.20 (2026-09-24) - ROMEND $0DDE -> $0D99 
+; V4.20 (2026-09) - ROMEND $0DDE -> $0D99 
 ;   - Line storage/deletion (TRY_STORE_LINE/STORE_LINE/DELETE_LINE/MEMCPY/
 ;     DEC_PE) ported from uBASIC2650wip v2.10: merged into TRY_STORE_LINE
 ;     (find-and-delete loop shared by pure-delete and overwrite, then a
@@ -245,15 +268,10 @@
 ;     checked against PROGLIM's high byte -- valid because PROGLIM=$1FFF
 ;     ends in $FF -- before touching anything, then shifts backward with
 ;     DEC_PE inlined, its only caller). MEMCPY deleted (no longer called).
-;   - Calling-convention adaptations for 4k (which doesn't vector CMP_TMP_PE
-;     or INC_ET/EXP16_TO_ET the way wip does): direct BSTA/BSTR calls to
-;     CMP_TMP_PE, EXP16_TO_ET; the two "preload offset then call the
-;     generic INC_ET" sites both happened to be incrementing EXP
-;     specifically, so both use 4k's existing VINC_EXP vector directly
 ;   - Line-number range validation (rejecting >32767, silently ignoring
 ;     line 0) unchanged from 4k's existing behavior
 ;
-; V4.19 (2026-09-24) - ROMEND $0E09 -> $0DDE 
+; V4.19 (2026-09) - ROMEND $0E09 -> $0DDE 
 ;   - SWSP/FORSP (GOSUB and FOR stack pointers) ported from uBASIC2650wip's
 ;     GSSP/FSP: plain 0-based byte count (0=empty), replacing the $FF/$F9
 ;     sentinel scheme. Removes DGS_FIRST/DGS_NEXT, DRT_SUB, DN_POP_EMPTY,
@@ -266,20 +284,16 @@
 ;     FORVAR (from DL_STORE's R1, free) instead of the raw A-Z letter;
 ;     DO_NEXT loads directly vs recomputing (var-'A')*2 every call.
 ;
-; V4.18 (2026-09-24) - ROMEND $0E82 -> $0E09 
+; V4.18 (2026-09) - ROMEND $0E82 -> $0E09 
 ;   - PRINT_S16: Replaced the SW-recursive shift/divide-by-10 engine (PREC,
 ;     16 iterations of a 4-byte rotate + conditional subtract, plus the
 ;     SWBASE push/pop recursion machinery) with uBASIC2650wip's iterative
 ;     repeated-subtraction-by-power-of-10 approach (P10_HI/P10_LO tables).
-;   - Removed MSG_MIN/MIN_LP (the BUG-MINLP-01 -32768 special case): the
-;     ported algorithm's WC-based unsigned subtraction is correct for the
-;     full 0-65535 range regardless of sign, so 32768 no longer needs
-;     separate handling.
 ;   - PRINT_S16 no longer clobbers TMP (now clobbers R2 instead, which no
 ;     caller needs preserved across the call) or SC1/NEGFLG.
 ;   - SWRETURN kept in place (still shared with PARSE_EXPR's own recursion).
 ;
-; V4.17 (2026-09-22) - ROMEND $0EB9 -> $0E85 
+; V4.17 (2026-09) - ROMEND $0EB9 -> $0E85 
 ;   - MATCH_KW: TMP stays fixed at the table base (KW_TAB/FUNC_TAB); R1 walks
 ;     it via indirect-indexed addressing (*TMPH,R1) instead of advancing TMP
 ;     itself through ZBSR calls. Idea ported from uBASIC2650's MD_SCAN,
@@ -294,7 +308,7 @@
 ;     EATWORD, PARSE_VAR_SAVE, PARSE_FACTOR, MATCH_KW stripped): keywords
 ;     and variable letters now require UPPERCASE, matching the spec.
 ;
-; V4.16 (2026-09-22) - ROMEND $0EBA 
+; V4.16 (2026-09) - ROMEND $0EBA 
 ;   - FL_CHKLO / FI_LH: Direct-indexed peek (*TMPH,R1) replaces INC16_TMP_TO_EXP.
 ;   - Stored record format: Changed line terminator CR ($0D) -> NUL ($00).
 ;   - Shared helpers: Added ADV_TMP_PAST_REC to scan past NUL-terminated records.
@@ -302,63 +316,63 @@
 ;   - FIXED BUG-PU16-01: Corrected PARSE_U16 pre-loop digit check bound (':' -> '9').
 ;   - Streamlined DO_NEW, SHOWCASE_END to PE setup deleted, now Assembly time.
 ;
-; V4.15 (2026-09-22) - ROMEND $0F26 
+; V4.15 (2026-09) - ROMEND $0F26 
 ;   - Shared helpers: Added CMP_TMP_PE for 16-bit TMP vs PE comparison.
 ;   - DELETE_LINE: Ported uBASIC2650 DEL_REC idiom (uses dst ptr as new PE).
 ;   - PARSE_U16 / TRY_STORE_LINE: Collapsed digit checks to single unsigned sub/cmp.
 ;   - STORE_LINE: Ported OPEN_GAP technique; indexed dst off walking PE (*PEH,R3).
 ;
-; V4.14 (2026-09-21) - ROMEND $0FB7 
+; V4.14 (2026-09) - ROMEND $0FB7 
 ;   - Unsigned comparison: Enabled global COM=1 mode.
 ;
-; V4.13 (2026-09-20) - ROMEND $0FB5 
+; V4.13 (2026-09) - ROMEND $0FB5 
 ;   - FIXED BUG-MUL-01: MU_LP decrement now checks carry flag (TPSL $01) instead
 ;     of raw CC, fixing 16-bit multiply for operands >= 256.
 ;
-; V4.12 (2026-09-20) - ROMEND $0FB3 
+; V4.12 (2026-09) - ROMEND $0FB3 
 ;   - Shared helpers: Added CARRY_INTO_EXPH to consolidate carry propagation
 ;     in MUL16 and PARSE_U16.
 ;
-; V4.11 (2026-09-20) - ROMEND $0FC8 
+; V4.11 (2026-09) - ROMEND $0FC8 
 ;   - CHIN: Removed hard ORG $286 pin to let subroutine space float naturally.
 ;
-; V4.10 (2026-09-20) - Renamed 4kBASIC - ROMEND $0FC8
+; V4.10 (2026-09) - Renamed 4kBASIC - ROMEND $0FC8
 ;   - ZPVEC-01: Vectored PUSH_EXP and PRINT_S16 via zero-page jump table (ZBSR).
 ;
-; V4.9 (2026-08-16) - ROMEND $0FDB 
+; V4.9 (2026-08) - ROMEND $0FDB 
 ;   - FIXED BUG-DL2-01: DL2_LP copy loop now tests carry flag (TPSL $01) instead
 ;     of signed CC, fixing premature loop exit on page-boundary wraps during deletes.
 ;
-; V4.8 (2026-08-15) - ROMEND $0FD9 
+; V4.8 (2026-08) - ROMEND $0FD9 
 ;   - PRINT HEX$(n): Added 4-digit unsigned 16-bit hex formatting in ROM slack.
 ;
-; V4.7 (2026-08-10) - ROMEND $0F98
+; V4.7 (2026-08) - ROMEND $0F98
 ;   - Shared helpers: Added PUSH_RET to handle 16-bit SWBASE push.
 ;   - Operators: Added ^ (power) operator with error handling.
 ;   - FIXED BUG-MINLP-01: Fixed hang printing -32768 (invalid indexed LODR).
 ;
-; V4.6 (2026-07-03) - 3879 bytes (ROMEND $0F27)
+; V4.6 (2026-07) - 3879 bytes (ROMEND $0F27)
 ;   - FIXED: FUNCATOM-01 - functions now work as non-leading atoms, e.g.
 ;     "PRINT 10+ABS(A)" (previously only "PRINT ABS(A)+10" worked).
 ;   - Added FT_SP/FT_STK/FT_SAVE_SP/FT_SAVE/FT_N/FT_R2SAVE (72 RAM bytes)
 ;     and FUNC_EPILOG; PE_SAFE/EAM_ATOM/PE_NOFUNC/DO_END updated. 
 ;
-; V4.5 (2026-06-30) - 3705 bytes
+; V4.5 (2026-06) - 3705 bytes
 ;   - FIXED: Function parser tracking for trailing operators (e.g., ABS(-5)+10).
 ;   - Relocated PEEK/USR/EXPH functions to optimize space post-COUT.
 ;
-; V4.4 (2026-06-30) - 3636 bytes
+; V4.4 (2026-06) - 3636 bytes
 ;   - FIXED: RND 16-bit seed rotation bug by correctly setting PSL WC bit.
 ;   - FIXED: Subtraction left-operand dropping bug in EAM_MH_RET.
 ;   - Unified 2-argument parsing for AND/OR/XOR/POKE/LIST to save ~25 bytes.
 ;   - Deduplicated bare assignments (LET-less statements).
 ;
-; V4.3 (2026-06-25) - 3672 bytes
+; V4.3 (2026-06) - 3672 bytes
 ;   - FIXED: Nested operator precedence clobbering bug using SWBASE stack.
 ;   - Added bitwise functions: AND(a,b), OR(a,b), XOR(a,b), NOT(a).
 ;   - Rewrote default showcase program with an expanded Mandelbrot finale.
 ;
-; V4.2 (2026-06-24) - 3485 bytes
+; V4.2 (2026-06) - 3485 bytes
 ;   - Rewrote RDLINE using R3 as an IBUF offset optimization.
 ;   - Merged sign-handling and addition paths into shared ADD16_SAVE_EXP.
 ;   - Added optional line-range filtering to LIST [start,end].
@@ -389,6 +403,7 @@ DQ      EQU     $22
 ;  Token Defines (V4.22 -- tokenizer project step 2). Statement/function
 ;  tokens are the row index (in KW_TAB/FUNC_TAB source order) plus a base;
 ;  a gap is left between the two ranges for future statement growth.
+FUNC_COUNT      EQU FUNC_TOKS_END-TOK_FUNC_OFS   ; number of function rows (assembler-computed)
 TOK_STMT_BASE   EQU $80         ; statement token = TOK_STMT_BASE + KW_TAB row (16 rows: $80-$8F)
 TOK_FUNC_BASE   EQU $A0         ; function token  = TOK_FUNC_BASE + FUNC_TAB row (9 rows: $A0-$A8)
                                  ; $90-$9F reserved (more statements later)
@@ -442,7 +457,9 @@ ERR_OV          EQU '9'         ; ^ (power): negative exponent, or result overfl
 ; RAS (hardware Return Address Stack) Defines
 RAS_DEPTH       EQU 8           ; 2650 HW RAS depth (SPSU field is 3 bits, 0-7)
 PE_RAS_LIMIT    EQU 5           ; PARSE_EXPR entry guard threshold; margin of
-                                 ; RAS_DEPTH-3 covers PARSE_FACTOR+PARSE_S16+INC_IP
+                                 ; RAS_DEPTH-3 covers PARSE_FACTOR+PARSE_S16+INC_IP,
+                                 ; or (hex) PARSE_FACTOR+HEX_PEEK+TL_HEXVAL and
+                                 ; PARSE_HEX(tail)+TL_MULADD+REG16_TO_REG16
 
 ; PSW Defines
 PSW_RS          EQU     $10
@@ -682,6 +699,7 @@ STMT_EXEC:
         STRA,R0 TMPH
         LODI,R0 >KW_TAB
         STRA,R0 TMPL
+        LODI,R1 >(KW_MISS-KW_TAB)         ; miss-row offset for MATCH_KW's early-out
         ; drop through
 
 ; =============================================================================
@@ -698,6 +716,8 @@ STMT_EXEC:
 ;   (KW_TAB) and function dispatch (FUNC_TAB, 2 call sites).
 ; In:  IPH:IPL -> first char of statement (after any leading whitespace)
 ;      TMPH:TMPL -> table to search
+;      R1 = offset of that table's miss row (KW_MISS-KW_TAB / FUNC_MISS-FUNC_TAB),
+;      used only by the early-out for text that cannot be a word (see WORD_START)
 ; Out: handler called; IP advanced past the matched word/token (miss: IP
 ;      unchanged, see above)
 ; Clobbers: R0, R1, EXPH, EXPL, GOTOH, GOTOL
@@ -732,6 +752,8 @@ SF_GOT_OFS:
         BCTR,UN SE_HI_LO                  ; Dispatch via shared jump
 
 SE_SLOW:
+        BSTA,UN WORD_START                ; two letters? (EQ = maybe a word)
+        BCFR,EQ SE_HI_LO                  ; no: cannot match any row -> miss row (R1 = its offset)
         LODI,R1 $FF                       ; pre-increment mode (2650 quirk)
 SE_SCAN:
         LODI,R0 (IDX_IP*16)+IDX_EXP
@@ -765,7 +787,7 @@ SE_HI_LO:
         BCTA,UN *GOTOH                    ; indirect jump
 
 SE_NOTKW:
-        BSTA,UN PARSE_VAR_SAVE            ; validates A-Z, SC0/R2 = letter
+        BSTA,UN PARSE_VAR_SAVE            ; validates A-Z, R2 = VARS byte offset
         ZBSR *VWSKIP
         COMI,R0 A'='
         BCFA,EQ JSYNERR
@@ -813,7 +835,7 @@ DO_END:
 ; In:  IP -> variable letter
 ; Out: VARS[V] = EXPH:EXPL
 ; Clobbers: R0, R2, SC0, SC1, EXPH, EXPL, TMPH, TMPL, R1
-; Note: DO_INPUT jumps to DL_STORE with variable letter in SC0 and R2.
+; Note: DO_INPUT jumps to DL_STORE with R2 = VARS byte offset (see PARSE_VAR_SAVE).
 DO_LET:
         BSTA,UN PARSE_VAR_SAVE
         ZBSR *VWSKIP                      ; [+1]
@@ -824,15 +846,16 @@ DL_EQC:
         ZBSR *VINC_IP  
 DL_EX:
         ZBSR *VPARSE_EXPR                 ; [+1]
+;  DL_STORE -- store EXPH:EXPL into a variable (shared: DO_LET/bare assign,
+;  DO_INPUT, DO_FOR)
+; In:  R2 = VARS byte offset = 2*(letter-'A') (from PARSE_VAR_SAVE); EXPH:EXPL
+; Out: VARS[R2..R2+1] = EXPH:EXPL; R2 unchanged
+; Clobbers: R0
 DL_STORE:
-        LODZ,R2          ; R0 = R2 (Variable character letter)
-        SUBI,R0 A'A'     ; R0 = R0 - 'A' (0 to 25)
-        ADDZ,R0          ; R0 = R0 * 2 (Double for 16-bit word stride)
-        STRZ,R1          ; R1 = R0 (Transfer offset to Index Register R1)
         LODA,R0 EXPH     ; R0 = High byte of expression
-        STRA,R0 VARS,R1  ; Store directly to VARS array + offset
+        STRA,R0 VARS,R2  ; Store directly to VARS array + offset (R2 is a valid index reg)
         LODA,R0 EXPL     ; R0 = Low byte of expression
-        STRA,R0 VARS+1,R1; Store directly to VARS array + offset + 1
+        STRA,R0 VARS+1,R2; Store directly to VARS array + offset + 1
         ; fall through to DO_REM (RETC,UN)
 
 ; =============================================================================
@@ -969,18 +992,19 @@ EXPH_Z:
 
 ; =============================================================================
 ; PARSE_VAR_SAVE -- skip whitespace, read var letter, range-check,
-;                   save to SC0 and R2, advance IP.
-; Out: SC0=R2=letter (A-Z); IP advanced past letter
+;                   save its VARS byte offset in R2, advance IP.
+; Out: R2 = 2*(letter-'A') = byte offset into VARS (A-Z); IP advanced past letter
 ; Error: tail-jumps to JERRVAR (no return)
-; Clobbers: R0, R1, R2, SC0
+; Clobbers: R0, R2.  RAS: +2 (WSKIP's INC_IP nests inside; INC_IP is tail-called)
+; Range test relies on the global COM=1 (unsigned) set in MAIN: any char below
+; 'A' wraps to a large unsigned value, so one compare catches both ends.
 PARSE_VAR_SAVE:
         ZBSR *VWSKIP  
-        COMI,R0 A'A'
-        BCTA,LT JERRVAR       ; out of range low  -- tail jump, no return
-        COMI,R0 A'Z'+1
-        BCFA,LT JERRVAR       ; out of range high -- tail jump, no return
-        STRA,R0 SC0
-        STRZ,R2                          ; save in R2 for DL_STORE
+        SUBI,R0 A'A'                     ; 'A'-'Z' -> 0-25
+        COMI,R0 A'Z'-A'A'
+        BCTA,GT JERRVAR                  ; out of range (either end) -- tail jump, no return
+        ADDZ,R0                          ; R0 = index*2 (16-bit word stride)
+        STRZ,R2                          ; R2 = byte offset, consumed by DL_STORE
         ZBRR *VINC_IP           ; tail call  
 
 ; =============================================================================
@@ -1224,11 +1248,8 @@ DGS_STORE:
 ; Frame layout (7 bytes at FORBASE+FORSP): [var][limH][limL][stpH][stpL][nlpH][nlpL]
 ; Loop body always executes at least once; exit tested at NEXT.
 DO_FOR:
-        ; --- get variable letter ---
-        ZBSR *VWSKIP                      ; [+1] skip whitespace; R0 = var letter (peek)
-        STRA,R0 FORVAR
-        STRZ,R2                          ; R2 = var letter (survives PARSE_EXPR)
-        ZBSR *VINC_IP                     ; [+1] consume the letter (R0 clobbered; kept in R2)
+        ; --- get variable: validates A-Z, R2 = VARS byte offset (survives PARSE_EXPR) ---
+        BSTA,UN PARSE_VAR_SAVE            ; [+1] IP past the letter
 
         ; --- stack overflow check (FORSP is 0-based, 0=empty; V4.19) ---
         LODA,R0 FORSP
@@ -1242,7 +1263,7 @@ DO_FOR:
         ZBSR *VINC_IP                     ; [+1] consume '='
         ZBSR *VPARSE_EXPR                 ; [+1] start value -> EXPH:EXPL
         BSTA,UN DL_STORE                 ; [+1] VARS[R2] = EXPH:EXPL
-        STRA,R1 FORVAR                   ; DL_STORE leavesVARSin R1 -- cache it here
+        STRA,R2 FORVAR                   ; cache the VARS offset for the frame
         ; --- consume "TO" keyword ---
         ZBSR *VWSKIP                      ; [+1]
         ZBSR *VEATWORD                    ; [+1]
@@ -1489,26 +1510,27 @@ TMR_MISS:
 ; =============================================================================
 ;  TL_HEXVAL -- test/convert one uppercase hex digit character
 ; In:  R0 = character to test
-; Out: is a hex digit ('0'-'9' or 'A'-'F'): R0 = value (0-15), R2 = 0
-;      not a hex digit: R2 = $FF (R0 clobbered)
-; Clobbers: R0, R2
+; Out: is a hex digit ('0'-'9' or 'A'-'F'): R0 = value (0-15), R1 = 0
+;      not a hex digit: R1 = $FF (R0 clobbered)
+; Clobbers: R0, R1   (NOT R2: it is PARSE_EXPR's live variable letter, and
+;   this is now also reached from PARSE_FACTOR via HEX_PEEK/PARSE_HEX)
 TL_HEXVAL:
-        STRZ,R2                           ; R2 = original char (temp use)
+        STRZ,R1                           ; R1 = original char (temp use)
         SUBI,R0 A'0'
         COMI,R0 9
         BCTR,GT TL_HV_ALPHA                ; >9: not 0-9, check A-F
-        LODI,R2 0                          ; matched: R0 already = value (0-9)
+        LODI,R1 0                          ; matched: R0 already = value (0-9)
         RETC,UN
 TL_HV_ALPHA:
-        LODZ,R2                            ; R0 = original char again
+        LODZ,R1                            ; R0 = original char again
         SUBI,R0 A'A'
         COMI,R0 5
         BCTR,GT TL_HV_NONE                  ; not 'A'-'F' either
         ADDI,R0 10                          ; rebase 0-5 -> 10-15
-        LODI,R2 0
+        LODI,R1 0
         RETC,UN
 TL_HV_NONE:
-        LODI,R2 $FF
+        LODI,R1 $FF
         RETC,UN
 
 ; =============================================================================
@@ -1633,7 +1655,7 @@ TL_DEC_LP:
         BCTR,UN TL_DEC_LP
 TL_DEC_DONE:
         LODI,R0 TOK_DEC
-TL_EMIT_CONST:                                ; V4.24: shared by TL_HEX_DONE
+TL_EMIT_CONST:                                ; V4.24: shared by TL_DEC_DONE, TL_MAYBEHEX
         STRA,R0 TOKBUF,R3+                    ;   In: R0 = TOK_DEC or TOK_HEX
         LODA,R0 EXPH
         STRA,R0 TOKBUF,R3+
@@ -1641,26 +1663,46 @@ TL_EMIT_CONST:                                ; V4.24: shared by TL_HEX_DONE
         STRA,R0 TOKBUF,R3+
         BCTA,UN TL_LP
 TL_MAYBEHEX:
+        BSTR,UN HEX_PEEK                      ; '$' + hex digit?
+        BCTR,EQ TL_DOLLAR_PLAIN               ; no: plain '$'
+        BSTR,UN PARSE_HEX                     ; EXP = value, IP past the digits
+        LODI,R0 TOK_HEX
+        BCTR,UN TL_EMIT_CONST
+
+; =============================================================================
+;  HEX_PEEK -- is IP -> '$' immediately followed by a hex digit?
+;  (shared: TL_MAYBEHEX and PARSE_FACTOR)
+; In:  IPH:IPL -> '$'
+; Out: CC=EQ: no (R1 = $FF).  CC!=EQ: yes.  IP unchanged.
+; Clobbers: R0, R1.  RAS: +2 (TL_HEXVAL nests inside)
+HEX_PEEK:
         LODI,R1 1
-        LODA,R0 *IPH,R1                      ; peek the char AFTER '$'
+        LODA,R0 *IPH,R1                      ; the char AFTER '$'
         BSTA,UN TL_HEXVAL
-        COMI,R2 $FF
-        BCTR,EQ TL_DOLLAR_PLAIN               ; not a hex digit: plain '$'
-        ZBSR *VINC_IP                          ; consume '$'
+        COMI,R1 $FF
+        RETC,UN
+
+; =============================================================================
+;  PARSE_HEX -- consume '$' and its hex digits into EXPH:EXPL
+;  (shared: TL_MAYBEHEX and, via PF_NUM, direct-entry expressions)
+; In:  IPH:IPL -> '$' followed by >= 1 hex digit (caller checked via HEX_PEEK)
+; Out: EXPH:EXPL = value (16-bit, wraps mod 65536); IP -> first non-hex char
+; Clobbers: R0, R1, SC0, EXPH, EXPL, TKH, TKL, R3SAVE.  R3 preserved.
+; RAS: +2 (TL_MULADD nests its helpers). Tail-jump it (BCTA,UN) from
+;   PARSE_FACTOR, never BSTA it, or the worst case reaches depth 8.
+PARSE_HEX:
+        ZBSR *VINC_IP                         ; consume '$'
         ZBSR *VCLR_EXP
-TL_HEX_LP:
+PH_LP:
         LODA,R0 *IPH
         BSTA,UN TL_HEXVAL
-        COMI,R2 $FF
-        BCTR,EQ TL_HEX_DONE
-        STRA,R0 SC0                            ; this digit's value (0-15)
-        ZBSR *VINC_IP                         
+        COMI,R1 $FF
+        RETC,EQ                               ; non-hex char: done
+        STRA,R0 SC0                           ; this digit's value (0-15)
+        ZBSR *VINC_IP
         LODI,R0 16
-        BSTR,UN TL_MULADD                      ; EXP = EXP*16 + SC0
-        BCTR,UN TL_HEX_LP
-TL_HEX_DONE:
-        LODI,R0 TOK_HEX
-        BCTR,UN TL_EMIT_CONST                 
+        BSTR,UN TL_MULADD                     ; EXP = EXP*16 + SC0
+        BCTR,UN PH_LP
 TL_DOLLAR_PLAIN:
         LODA,R0 *IPH                             ; the '$' itself
         BCTA,UN TL_COPY1
@@ -1763,7 +1805,7 @@ TSL_DONE:                                 ; PE was already updated by OPEN_GAP
 ;  deleting the last record simply runs the loop zero times.
 ; In:  TMP = start of the record to delete
 ; Out: PE reduced by the record's length
-; Clobbers: R0, TMPH:TMPL, EXPH:EXPL
+; Clobbers: R0, R1, TMPH:TMPL, EXPH:EXPL
 DEL_REC:
         ZBSR *VTMP_TO_EXP ; EXP = dst = start of the doomed record
         BSTA,UN ADV_TMP_PAST_REC          ; TMP = src = start of the next record
@@ -1843,22 +1885,31 @@ CMP_TMP_PE:
 ;  ADV_TMP_PAST_REC -- advance TMPH:TMPL past a stored record (2-byte header,
 ;  NUL-terminated body, and the NUL itself), landing on the next record
 ;  (ported from uBASIC2650).
+;  V5.3: the body is scanned with an index register (*TMPH,R1) and TMP is
+;  advanced ONCE at the end; the old byte-at-a-time INC_TMP walk cost ~14
+;  instructions per body byte and ran for every statement executed (DR_EXEC).
 ; In:  TMPH:TMPL -> start of a record (its line-number hi byte)
 ; Out: TMPH:TMPL -> start of the next record
-; Clobbers: R0
+; Clobbers: R0, R1.  Leaf (no RAS use).  Record length must be < 256 bytes.
 ADV_TMP_PAST_REC:
-        ZBSR *VINC_TMP
+        LODI,R1 1                        ; pre-increment: first body byte is at index 2
 APR_LP:
-        ZBSR *VINC_TMP
-        LODA,R0 *TMPH
+        LODA,R0 *TMPH,R1+
         BCTR,EQ APR_DONE                 ; NUL: body ends here
         COMI,R0 TOK_HEX                  ; unsigned: >= TOK_HEX ($FD)?
         BCTR,LT APR_LP                   ; ordinary body byte: keep scanning
-        ZBSR *VINC_TMP                   ; constant token: skip its 2-byte
-        ZBSR *VINC_TMP                   ;   payload without NUL-testing it
-        BCTR,UN APR_LP
-APR_DONE:
-        ZBSR *VINC_TMP                    ; skip the NUL itself
+        ADDI,R1 2                        ; constant token: skip its 2-byte
+        BCTR,UN APR_LP                   ;   payload without NUL-testing it
+APR_DONE:                                ; R1 = index of the NUL
+        ADDI,R1 1                        ; step past it
+        LODA,R0 TMPL
+        ADDZ,R1                          ; TMPL += R1
+        STRA,R0 TMPL
+        TPSL $01                         ; carry out of the lo byte?
+        RETC,LT                          ;   no: done
+        LODA,R0 TMPH
+        ADDI,R0 1
+        STRA,R0 TMPH
         RETC,UN
 
 ; =============================================================================
@@ -1955,6 +2006,7 @@ PE_SAFE:
         STRA,R0 TMPH
         LODI,R0 >FUNC_TAB
         STRA,R0 TMPL
+        LODI,R1 >(FUNC_MISS-FUNC_TAB)   ; miss-row offset for MATCH_KW's early-out
         BCTA,UN MATCH_KW                ; resumes at PE_NOFUNC if not match
 PE_NOFUNC:
         ; FUNCATOM-01: pop the origin marker pushed above (by PE_SAFE or
@@ -2146,6 +2198,19 @@ EAM_ATOM:
         BCTA,EQ EAM_POS
         COMI,R0 A'('
         BCTA,EQ EAM_PAREN
+        ; V5.3: only a function token or a multi-letter word can be a function.
+        ; A variable/constant skips the FT save/scan/restore machinery (PE_NOFUNC's
+        ; EAM-origin path did exactly this PARSE_FACTOR call after undoing it).
+        ; Statement tokens fall to PARSE_FACTOR -> syntax error (they used to be
+        ; dispatched through FUNC_TAB's offset table).
+        SUBI,R0 TOK_FUNC_BASE
+        COMI,R0 FUNC_COUNT
+        BCTR,LT EA_FUNC                  ; function token: MATCH_KW's O(1) path
+        BSTA,UN WORD_START               ; raw text: letter followed by letter?
+        BCTR,EQ EA_FUNC
+        BSTA,UN PARSE_FACTOR             ; plain atom: variable / constant / number
+        ZBRR *VPARSER_RET
+EA_FUNC:
         LODA,R0 FT_SP
         ADDI,R0 1
         STRZ,R1
@@ -2177,6 +2242,8 @@ EAMS_SAVE_LP:
         STRA,R0 TMPH
         LODI,R0 >FUNC_TAB
         STRA,R0 TMPL
+        ; R1 is not set: only a function token or a two-letter word gets here,
+        ; so MATCH_KW's non-word early-out (which needs R1) cannot trigger.
         BCTA,UN MATCH_KW                 ; hit -> handler -> FUNC_EPILOG
                                           ; miss -> PE_NOFUNC
 EAM_NEG:
@@ -2285,9 +2352,10 @@ FUNC_CONT:
 ;   see TOKENIZE_LINE) is recognized up front and loaded directly -- O(1),
 ;   vs. PARSE_S16's per-digit accumulation for untokenized/direct-entry
 ;   text, which still works exactly as before for every other case.
+; V5.1: an untokenized '$'+hex digit (direct entry) goes to PARSE_HEX.
 ; In:  IPH:IPL -> first char of factor
 ; Out: EXPH:EXPL = value
-; Clobbers: R0, R1, SC0
+; Clobbers: R0, R1, SC0 (+ TKH, TKL, R3SAVE on the hex path). R2, R3 preserved.
 PARSE_FACTOR:
         LODA,R0 *IPH
         COMI,R0 TOK_DEC                  ; V4.22: tokenized decimal constant?
@@ -2299,7 +2367,11 @@ PARSE_FACTOR:
         COMI,R0 A'Z'+1
         BCTR,LT PF_LOADVAR
 PF_NUM:
-        BCTA,UN PARSE_S16                ; tail call: PARSE_S16's RETC,UN returns to our caller
+        COMI,R0 '$'
+        BCFA,EQ PARSE_S16                ; not hex: decimal (tail: RETC,UN returns to our caller)
+        BSTA,UN HEX_PEEK
+        BCFA,EQ PARSE_HEX                ; '$' + hex digit: tail, returns to our caller
+        ZBRR *VJSYNERR                   ; '$' + non-hex: syntax error
 PF_CONST:
         ZBSR *VINC_IP                    ; [+1] past the token byte
         ZBRR *VFETCH16_IP                ; tail: EXP = payload, IP past it; returns to our caller
@@ -2307,21 +2379,18 @@ PF_CONST:
 ; =============================================================================
 ;  PF_LOADVAR -- Load variable value from VARS
 ; In:  R0 = uppercase variable letter A-Z; IP -> that char
-; Out: EXPH:EXPL = variable value
-; Clobbers: R0, R1, SC0
+; Out: EXPH:EXPL = variable value; IP past the letter (INC_IP is tail-called,
+;      so CC is INC_IP's)
+; Clobbers: R0, R1.  INC_IP works in register bank 1, so R1 survives it.
 PF_LOADVAR:
-        STRA,R0 SC0
-        ZBSR *VINC_IP  
-        LODA,R0 SC0
         SUBI,R0 A'A'
-        STRZ,R1                          ; R1 = index (0..25)
-        ADDZ,R1                          ; R0 = index*2
-        STRZ,R1                          ; R1 = index*2
+        ADDZ,R0                          ; R0 = index*2
+        STRZ,R1                          ; R1 = VARS byte offset
         LODA,R0 VARS,R1                  ; hi byte
         STRA,R0 EXPH
-        LODA,R0 VARS+1,R1               ; lo byte
+        LODA,R0 VARS+1,R1                ; lo byte
         STRA,R0 EXPL
-        RETC,UN
+        ZBRR *VINC_IP                    ; tail call: consume the letter, return to caller
 
 ; =============================================================================
 ;  PARSE_RELOP -- Parse relational operator at IP, build bitmask in RELOP
@@ -2725,26 +2794,6 @@ DLS_NL:
         BCTA,UN DLS_LP
 
 ; =============================================================================
-;  SETUP_MULDIV -- Common preamble for MUL16 and DIV16
-; Clears NEGFLG, takes absolute values of TMP and EXP (toggling NEGFLG for
-; each negative operand), then saves |EXP| in SC0:SC1 and clears EXP to zero
-; ready for the multiply/divide accumulation loop.
-; In:  TMPH:TMPL = left operand; EXPH:EXPL = right operand
-; Out: NEGFLG = result sign (0=positive, 1=negative); SC0:SC1 = |EXP|; EXP = 0
-; Clobbers: R0, R1, NEGFLG, SC0, SC1, TMPH, TMPL, EXPH, EXPL
-; RAS: called at depth 6 (MUL16/DIV16 call sites); max depth inside = 8 (at limit).
-;   ABS_TMP/ABS_EXP use only BCTR/BCTA internally -- no further RAS consumption.
-SETUP_MULDIV:
-        EORZ,R0
-        STRA,R0 NEGFLG
-        BSTA,UN ABS_TMP                  ; [+1] sets NEGFLG=1 if TMP was negative
-        BSTA,UN ABS_EXP                  ; [+1] toggles NEGFLG if EXP was negative
-        LODI,R0 (IDX_EXP*16)+IDX_SC0
-        ZBSR *VREG16_TO_REG16           ; SC0:SC1 = |EXP|
-        ZBSR *VCLR_EXP                  ; clear EXP (accumulator starts at 0)
-        RETC,UN
-
-; =============================================================================
 ;  CARRY_INTO_EXPH -- store R0 into EXPL, propagate carry into EXPH.
 ; In:  R0 = EXPL + <addend>, i.e. caller has just done LODA,R0 EXPL /
 ;      ADDA,R0 <addend> and Carry still reflects that add (STRA and a
@@ -2764,33 +2813,61 @@ CARRY_INTO_EXPH:
 
 ; =============================================================================
 ;  MUL16 -- Signed 16-bit multiply: TMPH:TMPL * EXPH:EXPL -> EXPH:EXPL
-; In:  TMPH:TMPL = left operand; EXPH:EXPL = right operand
-; Out: EXPH:EXPL = product (16-bit two's complement wrap)
-; Clobbers: R0, NEGFLG, SC0, SC1, TMPH, TMPL
+; v5.3: shift-and-add (was O(|TMP|) repeated addition).
+; Method: MSB-first (Horner).  acc = 0; for each multiplier bit, MSB first:
+;   acc = 2*acc; if bit then acc += |TMP|.  Multiplier |EXP| is shifted left
+;   through EXPL:EXPH so the bit falls out into C.  16 passes, or 8 when the
+;   multiplier is < 256 (its high byte is 0, so 8 leading zero bits are
+;   skipped by pre-shifting EXP left one byte).  Low 16 bits kept (two's
+;   complement wrap, same as before).
+;   acc lives in the ALTERNATE bank (R1=lo, R2=hi) so primary R2 (variable
+;   letter) and R3 (SW stack ptr) are untouched; R3' is the pass counter.
+;   WC=1 chains carry through ADDA/RRL pairs.
+; In:  TMPH:TMPL = left operand (multiplicand); EXPH:EXPL = right operand
+; Out: EXPH:EXPL = product; TMP = |left operand|; NEGFLG = 0
+; Clobbers: R0, R1, NEGFLG, TMPH, TMPL (abs), PSL C/CC.  RS,WC restored to 0.
+; RAS: +1 (SETUP_MULDIV) +1 (ABS_TMP), NEG_EXP at MU_DONE: never deeper than
+;   v5.2.  Loop calls nothing.
 MUL16:
-        BSTR,UN SETUP_MULDIV             ; [+1] sign setup, |EXP|->SC0:SC1, EXP=0
-MU_LP:
-        LODA,R0 TMPH
-        BCTR,GT MU_ADD
-        LODA,R0 TMPL
-        BCTR,EQ MU_DONE
-MU_ADD:
-        LODA,R0 EXPL
-        ADDA,R0 SC1
-        BSTR,UN CARRY_INTO_EXPH
-        LODA,R0 EXPH
-        ADDA,R0 SC0
+        BSTA,UN SETUP_MULDIV             ; [+1] NEGFLG, |TMP|, |EXP|
+        PPSL PSW_RS + PSW_WC             ; alt bank R1-R3, WC=1 (carry chains)
+        LODI,R3 16                       ; pass count
+        EORZ,R0
+        STRZ,R1                          ; acc lo = 0
+        STRZ,R2                          ; acc hi = 0
+        LODA,R0 EXPH                     ; SKIP8: multiplier < 256 ?
+        BCFR,EQ MU_LP                    ;   no: full 16 passes
+        LODA,R0 EXPL                     ;   yes: EXP <<= 8 (8 zero bits gone)
         STRA,R0 EXPH
-        LODA,R0 TMPL
-        SUBI,R0 1
-        STRA,R0 TMPL
-        TPSL $01                         ; BUG-MUL-01 FIX: test carry, not raw CC
-        BCTR,EQ MU_TNB                   ; C=1 (no borrow): skip hi decrement
-        LODA,R0 TMPH
-        SUBI,R0 1
-        STRA,R0 TMPH
-MU_TNB:
-        BCTR,UN MU_LP
+        EORZ,R0
+        STRA,R0 EXPL
+        LODI,R3 8
+MU_LP:
+        CPSL $01                         ; C=0
+        RRL,R1                           ; acc *= 2
+        RRL,R2
+        CPSL $01                         ; C=0
+        LODA,R0 EXPL
+        RRL,R0
+        STRA,R0 EXPL
+        LODA,R0 EXPH
+        RRL,R0
+        STRA,R0 EXPH                     ; C = multiplier bit (MSB first)
+        TPSL $01
+        BCTR,LT MU_NX                    ; bit 0: no add
+        CPSL $01
+        ADDA,R1 TMPL                     ; acc += |TMP|
+        ADDA,R2 TMPH
+MU_NX:
+        BDRR,R3 MU_LP
+        STRA,R1 EXPL                     ; EXP = acc
+        STRA,R2 EXPH
+        CPSL PSW_RS + PSW_WC             ; back to primary bank, WC=0
+; -----------------------------------------------------------------------------
+;  MU_DONE -- shared MUL16/DIV16 epilogue: apply result sign, clear NEGFLG
+; In:  EXPH:EXPL = |result|; NEGFLG = 1 if result negative; RS=WC=0
+; Out: EXPH:EXPL = signed result; NEGFLG = 0
+; Clobbers: R0, R1
 MU_DONE:
         BSTA,UN NEG_EXP
         EORZ,R0
@@ -2798,49 +2875,96 @@ MU_DONE:
         RETC,UN
 
 ; =============================================================================
-;  DIV16 -- Signed 16-bit divide: TMPH:TMPL / EXPH:EXPL -> EXPH:EXPL
-; Remainder left in TMPH:TMPL.
-; In:  TMPH:TMPL = dividend; EXPH:EXPL = divisor
-; Out: EXPH:EXPL = quotient; TMPH:TMPL = remainder
-; Clobbers: R0, NEGFLG, SC0, SC1
-; Error: divisor=0 -> ERR_DIV_ZERO
-DIV16:
-        LODA,R0 EXPH
-        BCFR,EQ DV_NZ   ; check for zero
-        LODA,R0 EXPL
-        BCTR,EQ JERRDIVZER
-        
-        ; not zero
-DV_NZ:
-        BSTA,UN SETUP_MULDIV             ; [+1] sign setup, |EXP|->SC0:SC1, EXP=0
-DV_LP:
-        LODA,R0 TMPH
-        SUBA,R0 SC0
-        BCTR,LT MU_DONE ; DV_DONE
-        BCTR,GT DV_SUB
-        LODA,R0 TMPL
-        SUBA,R0 SC1
-        TPSL $01
-        BCFR,EQ MU_DONE
-DV_SUB:
-        LODA,R0 TMPL
-        SUBA,R0 SC1
-        STRA,R0 TMPL
-        TPSL $01
-        BCTR,EQ DV_SNB
-        LODA,R0 TMPH
-        SUBI,R0 1
-        STRA,R0 TMPH
-DV_SNB:
-        LODA,R0 TMPH
-        SUBA,R0 SC0
-        STRA,R0 TMPH
-        ZBSR *VINC_EXP  
-        BCTR,UN DV_LP
+;  SETUP_MULDIV -- Common sign preamble for MUL16 and DIV16
+; Clears NEGFLG, then takes |TMP| and |EXP| (toggling NEGFLG for each negative
+; operand).  No copies or clears: MUL16/DIV16 work in place (v5.3).
+; In:  TMPH:TMPL = left operand; EXPH:EXPL = right operand
+; Out: TMP = |TMP|; EXP = |EXP|; NEGFLG = result sign (0=positive, 1=negative)
+; Clobbers: R0, R1, NEGFLG, TMPH, TMPL, EXPH, EXPL
+; RAS: costs 1 level, ABS_TMP 1 more.  ABS_EXP is a tail jump (no extra level).
+SETUP_MULDIV:
+        EORZ,R0
+        STRA,R0 NEGFLG
+        BSTA,UN ABS_TMP                  ; [+1] sets NEGFLG=1 if TMP was negative
+        BCTA,UN ABS_EXP                  ; tail: toggles NEGFLG if EXP was negative
 
+; -----------------------------------------------------------------------------
+;  JERRDIVZER -- divide-by-zero exit (DIV16 only); does not return
+; In: none.  Out: ERR_DIV_ZERO raised via DO_ERROR.  Clobbers: R0
 JERRDIVZER:
         LODI,R0 ERR_DIV_ZERO
         ZBRR *VDO_ERROR 
+
+; =============================================================================
+;  DIV16 -- Signed 16-bit divide: TMPH:TMPL / EXPH:EXPL -> EXPH:EXPL
+; Remainder left in TMPH:TMPL (magnitude, i.e. |dividend| mod |divisor|, as in
+; v5.2: only the quotient takes the sign).
+; v5.3: restoring shift-subtract (was O(quotient) repeated subtraction).
+; Method: 32-bit chain [rem | EXP] shifted LEFT one bit per pass (EXP holds
+;   |dividend|, its top bit enters rem; vacated bit0 becomes the quotient
+;   bit).  rem -= |divisor| (SC); no borrow -> keep, set quotient bit;
+;   borrow -> add back.  rem < |divisor| <= 32768 always, so 2*rem+1 never
+;   overflows 16 bits.  16 passes, or 8 when |dividend| < 256 (SKIP8: the 8
+;   leading zero bits would only shift zeros into rem).
+;   rem lives in ALTERNATE bank R1(lo)/R2(hi), R3' = pass counter.
+; In:  TMPH:TMPL = dividend; EXPH:EXPL = divisor
+; Out: EXPH:EXPL = quotient; TMPH:TMPL = remainder; SC0:SC1 = |divisor|
+; Clobbers: R0, R1, NEGFLG, SC0, SC1, TMP, EXP, PSL C/CC.  RS,WC restored to 0.
+; Error: divisor=0 -> ERR_DIV_ZERO
+; RAS: max +3 (TMP_TO_EXP / REG16_TO_REG16 are leaf) -- same as v5.2 worst case.
+DIV16:
+        LODA,R0 EXPH
+        BCFR,EQ DV_NZ                    ; check for zero
+        LODA,R0 EXPL
+        BCTR,EQ JERRDIVZER
+
+        ; not zero
+DV_NZ:
+        BSTR,UN SETUP_MULDIV             ; [+1] NEGFLG, TMP=|N|, EXP=|D|
+        LODI,R0 (IDX_EXP*16)+IDX_SC0
+        ZBSR *VREG16_TO_REG16            ; SC0:SC1 = |D|
+        ZBSR *VTMP_TO_EXP                ; EXP = |N| (dividend, becomes quotient)
+        PPSL PSW_RS + PSW_WC             ; alt bank R1-R3, WC=1
+        LODI,R3 16
+        EORZ,R0
+        STRZ,R1                          ; rem lo = 0
+        STRZ,R2                          ; rem hi = 0
+        LODA,R0 EXPH                     ; SKIP8: dividend < 256 ?
+        BCFR,EQ DV_LP                    ;   no: full 16 passes
+        LODA,R0 EXPL                     ;   yes: EXP <<= 8, 8 passes
+        STRA,R0 EXPH
+        EORZ,R0
+        STRA,R0 EXPL
+        LODI,R3 8
+DV_LP:
+        CPSL $01                         ; C=0: bit shifted into EXP bit0
+        LODA,R0 EXPL
+        RRL,R0
+        STRA,R0 EXPL
+        LODA,R0 EXPH
+        RRL,R0
+        STRA,R0 EXPH                     ; C = old dividend top bit
+        RRL,R1                           ; rem = rem*2 + C
+        RRL,R2
+        PPSL $01                         ; C=1: SUB without borrow-in
+        SUBA,R1 SC1                      ; rem -= |D|
+        SUBA,R2 SC0                      ; C=1 <=> no borrow
+        TPSL $01
+        BCTR,EQ DV_Q1                    ; no borrow: keep, quotient bit = 1
+        CPSL $01
+        ADDA,R1 SC1                      ; borrow: restore rem
+        ADDA,R2 SC0
+        BCTR,UN DV_NX
+DV_Q1:
+        LODA,R0 EXPL
+        IORI,R0 1
+        STRA,R0 EXPL
+DV_NX:
+        BDRR,R3 DV_LP
+        STRA,R1 TMPL                     ; remainder -> TMP
+        STRA,R2 TMPH
+        CPSL PSW_RS + PSW_WC             ; back to primary bank, WC=0
+        BCTA,UN MU_DONE                  ; NEG_EXP on quotient, clear NEGFLG
 
 ; =============================================================================
 ;  PRINT_S16 -- Print signed 16-bit value EXPH:EXPL as decimal
@@ -2913,7 +3037,6 @@ NEXT_DIG:
 SWRETURN:
         LODA,R0 SWBASE,R3
         STRA,R0 TEMPRETH
-        ;SUBI,R3 1
         LODA,R0 SWBASE,R3-
         STRA,R0 TEMPRETL
         SUBI,R3 1
@@ -2991,6 +3114,29 @@ EW_ADV:
         BCTR,UN EATWORD
 
 ; =============================================================================
+;  WORD_START -- can the text at IP be a multi-letter keyword/function word?
+;  Every table row is 2+ letters, so a single letter (a variable) or anything
+;  that does not start with two letters (constant, number, token) can never
+;  match: callers use this to skip the table scan / FT save machinery.
+; In:  IPH:IPL -> char (after WSKIP)
+; Out: CC=EQ: two letters A-Z in a row (maybe a word).  CC=GT: no.
+; Clobbers: R0 and CC only -- works in register bank 1, so R1-R3 survive.
+; RAS: leaf.  Relies on the global COM=1 (unsigned) set in MAIN.
+WORD_START:
+        PPSL PSW_RS
+        LODI,R1 $FF                      ; pre-increment index
+WS_LP:
+        LODA,R0 *IPH,R1+
+        SUBI,R0 A'A'
+        COMI,R0 A'Z'-A'A'
+        BCTR,GT WS_RET                   ; not a letter: CC=GT
+        COMI,R1 1
+        BCFR,EQ WS_LP                    ; test the 2nd char too
+WS_RET:
+        CPSL PSW_RS                      ; CPSL leaves CC alone
+        RETC,UN
+
+; =============================================================================
 ;  WSKIP -- Skip spaces at IP
 ; In:  IPH:IPL -> current position
 ; Out: IPH:IPL -> first non-space char
@@ -3009,20 +3155,34 @@ WSKIPRET:
 ;  SHARED 16-BIT POINTER INCREMENT  - INC_ET family
 ; INC_EXP : EXPH:EXPL += 1   (offset EXPH-IPH from IPH)
 ; INC_TMP : TMPH:TMPL += 1   (offset TMPH-IPH from IPH)
-; INC_IP  : IPH:IPL  += 1    (offset 0 from IPH)
-; All share INC_ET body using register bank switch.
+; INC_IP  : IPH:IPL  += 1    (dedicated fast path above; INC_ET with R0=0 also works)
+; INC_EXP/INC_TMP share the INC_ET body using register bank switch.
 ; Rule: NO BSTA inside these -- must not consume extra RAS depth.
 ; Offsets are assembly-time expressions (e.g. EXPH-IPH=4) -- sequential
 ; ordering of the IPH..LNUML block must be preserved or these silently break.
+; =============================================================================
+;  INC_IP -- IPH:IPL += 1   (dedicated fast path; ~4 instructions vs ~10 via
+;  the generic INC_ET body, and IP is advanced from nearly every parse loop)
+; In:  IP.  Out: IP += 1.  Clobbers: R0, CC.  Leaf (no RAS use).
+; Wrap of IPL is the only case that reaches the hi-byte increment: after
+; ADDI the CC is EQ only for a zero result, so both non-zero returns fall out.
+INC_IP:
+        LODA,R0 IPL
+        ADDI,R0 1
+        STRA,R0 IPL
+        RETC,GT                          ; result 1..127: no wrap
+        RETC,LT                          ; result 128..255: no wrap
+        LODA,R0 IPH                      ; result 0: carry into the hi byte
+        ADDI,R0 1
+        STRA,R0 IPH
+        RETC,UN
+
 INC_EXP:
         LODI,R0 EXPH-IPH        ; EXP offset from IPH (= 4); assembly-time expression
-        db $EC                  ; COMA,R0 -- consume next 2 bytes (skip to INC_IP path)
+        db $EC                  ; COMA,R0 -- consume next 2 bytes (skip to INC_ET)
 INC_TMP:
         LODI,R0 TMPH-IPH        ; TMP offset from IPH (= 2); assembly-time expression
-        db $C4                  ; COMI,R0 -- consume next 1 byte
-INC_IP:
-        EORZ,R0                 ; offset = 0 (IPH itself)
-; Can jump in here with R0 set for offset
+; Can jump in here with R0 set for offset (INC_ET with R0=0 still works for IP)
 INC_ET:
         PPSL PSW_RS                 ; switch to alternate register bank
         STRZ R1                 ; R1 = offset
@@ -3296,7 +3456,7 @@ CP_CHAIN:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V5.0", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V5.3", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword dispatch table (V4.21: full text, was 3-char prefix)
 ; Format: [full keyword text][NUL][hi][lo], variable-length rows, each row's
@@ -3355,6 +3515,7 @@ KWH_RETURN:
         DB "RUN",    NUL
 KWH_RUN:
         DB <DO_RUN,    >DO_RUN
+KW_MISS:
         DB NUL,      <SE_NOTKW,  >SE_NOTKW   ; No match handler
 
 ; Row order here MUST match KW_TAB's row order above (token = TOK_STMT_BASE
@@ -3401,6 +3562,7 @@ FNH_USR:
         DB "XOR",  NUL
 FNH_XOR:
         DB <DO_XOR_FUNC,  >DO_XOR_FUNC
+FUNC_MISS:
         DB NUL,    <PE_NOFUNC,   >PE_NOFUNC        ; No match handler
 
 ; Row order MUST match FUNC_TAB's row order above (token = TOK_FUNC_BASE +
@@ -3410,6 +3572,7 @@ TOK_FUNC_OFS:
         DB >(FNH_NOT-FUNC_TAB), >(FNH_OR-FUNC_TAB),  >(FNH_PEEK-FUNC_TAB)
         DB >(FNH_RND-FUNC_TAB), >(FNH_USR-FUNC_TAB), >(FNH_XOR-FUNC_TAB)
 
+FUNC_TOKS_END:
 ROMEND: 
 
 ;  RAM variables -- sequential RES block 
@@ -3620,11 +3783,8 @@ SHOWCASE_END:
 ;   - Full pass over the file for inaccurate/stale comments
 ;   - Review scratch lifetimes: TMP,LNUM,SC0/1,TKH/L,ARGA,POWCNT,SAVE
 ;     TEMPRET, and potential to consolidate
-;   - Add $FFFF hex entry on direct path, leveraging TL_HEXVAL,TL_MULADD like  
-;     TL_MAYBE_HEX
 ;   - SWRETURN could pop via POP_SAVE_TO_TMP and BCTA,UN *TMPH (about -12
 ;     bytes, -2 RAM for TEMPRET) but it would nest one extra RAS level at the
 ;     point where PARSER_RET can already be at depth 6-7 -- needs a depth audit.
-;   - PARSE_VAR_SAVE/DL_STORE use var in SC0 and R2 - clean up as per pbasic 
 
         END
