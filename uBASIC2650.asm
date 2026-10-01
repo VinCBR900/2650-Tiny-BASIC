@@ -1981,7 +1981,7 @@ P10_LO:
         db $10, $E8, $64, $0A, $01
 
 BANNER:
-        DB CR, LF, "uBASIC 2.9", CR, LF, NUL        
+        DB CR, LF, "uBASIC 2.9", CR, LF, "Free:",NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
