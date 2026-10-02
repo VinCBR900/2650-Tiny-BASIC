@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.19
+ * Version: 1.20
  * Build: gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
@@ -28,6 +28,28 @@
  *            grouping. Division by zero is an error. Trailing text the
  *            grammar can't parse is a hard error (was silently dropped
  *            pre-1.17 — BUG-ASM-15).
+ *
+ * Changes v1.19 -> v1.20:
+ *   Added --no-warn-tail-call (on by default): warns when an UNCONDITIONAL
+ *     call is immediately followed by an unconditional return, i.e. a tail
+ *     call that can be a plain jump:
+ *       BSTA,UN addr / RETC,UN   ->  BCTA,UN addr   (also BSTR,UN -> BCTR,UN)
+ *       ZBSR (*)addr / RETC,UN   ->  ZBRR (*)addr   (direct or indirect)
+ *       BSXA addr,R3 / RETC,UN   ->  BXA  addr,R3
+ *     Saves the RETC,UN byte, a return-stack level and its cycles; the jump
+ *     form has the same operand and range as the call form, so the suggestion
+ *     is always encodable. Message format:
+ *       WARN line 120: BSTA,UN FOO followed by RETC,UN (line 121) -- tail call:
+ *         suggest BCTA,UN FOO and drop RETC,UN
+ *     Detected in assemble_line() (pass 2) from the decoded mnemonic/operands,
+ *     so labels without colons, case and spacing are handled, and blank or
+ *     comment-only lines between the pair are ignored. Deliberately NOT
+ *     warned: conditional calls (BSTx,cc / BSFx), conditional returns
+ *     (RETC,EQ/GT/LT), RETE (also re-enables interrupts), any other
+ *     instruction or directive between the pair, and any LABEL between the
+ *     call and the RETC,UN (label-only line, or a label on the RETC,UN line
+ *     itself) since the RETC,UN is then a branch target and must stay.
+ *     Warnings only: the emitted .hex/.bin/.LST bytes are unchanged.
  *
  * Changes v1.18 -> v1.19:
  *   BUG-ASM-18 FIXED: register-indexed absolute addressing (,Rn[+/-]) accepted
@@ -280,7 +302,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.19"
+#define ASM2650_VERSION "1.20"
 
 typedef struct { char name[64]; int value; int referenced; int def_line; } Label;
 static Label labels[MAX_LABELS];
@@ -319,6 +341,12 @@ static int  lineno = 0;
 static int  warn_inline_label = 1;
 static int  warn_local_abs_branch = 1;
 static int  warn_branch_skip = 1;
+static int  warn_tail_call = 1;
+/* Tail-call warning state (pass 2 only; see tailcall_check). tc_pending is set
+ * by an unconditional call and cleared by anything else, including a label. */
+static int  tc_pending = 0;
+static int  tc_line = 0;           /* source line of the pending call */
+static char tc_call[16], tc_jump[16], tc_opnd[260];
 static int  list_enabled = 1;
 
     /* Upcase the assembler line but preserve content inside single-quoted literals.
@@ -676,6 +704,62 @@ static int rel_offset_if_possible(int target, int base_pc, int *off_out){
     return (off>=-64 && off<=63);
 }
 
+/* tailcall_reset: forget any pending call (start of each pass).
+ * Inputs: none.  Outputs: none.  Clobbers: tc_pending. */
+static void tailcall_reset(void){ tc_pending=0; }
+
+/* tailcall_label: a label-only line was seen; a label between call and
+ * RETC,UN makes the RETC,UN a branch target, so the warning is suppressed.
+ * Inputs: none.  Outputs: none.  Clobbers: tc_pending. */
+static void tailcall_label(void){ tc_pending=0; }
+
+/* tailcall_check: tail-call detector, called once per line that has a
+ * mnemonic (after split_ops, before dispatch). See header v1.19 -> v1.20.
+ * Inputs:  mn, ops, nops = mnemonic and operands as parsed by assemble_line;
+ *          has_label = nonzero if this line carries a label definition.
+ * Outputs: WARN on stderr when mn is RETC,UN directly after a pending
+ *          unconditional call and the RETC,UN line has no label.
+ * Clobbers: tc_pending, tc_line, tc_call, tc_jump, tc_opnd. No-op in pass 1
+ *          or with --no-warn-tail-call. */
+static void tailcall_check(const char *mn, char ops[][128], int nops, int has_label){
+    if(pass!=2 || !warn_tail_call) return;
+    if(tc_pending && !has_label && strcmp(mn,"RETC")==0 && strcmp(ops[0],"UN")==0){
+        fprintf(stderr,"WARN line %d: %s %s followed by RETC,UN (line %d) -- tail call: suggest %s %s and drop RETC,UN\n",
+                tc_line,tc_call,tc_opnd,lineno,tc_jump,tc_opnd);
+        tc_pending=0; return;
+    }
+    tc_pending=0;
+    if(strcmp(mn,"BSTR")==0 || strcmp(mn,"BSTA")==0){
+        /* operand layout as PARSE_FIELD: "UN,ADDR" or "UN ADDR" */
+        char field[128]; const char *a;
+        if(nops>1 && ops[1][0]){ snprintf(field,sizeof(field),"%.127s",ops[0]); a=ops[1]; }
+        else {
+            const char *q=ops[0]; size_t n;
+            while(*q && *q!=' ' && *q!='\t') q++;
+            n=(size_t)(q-ops[0]); if(n>=sizeof(field)) n=sizeof(field)-1;
+            memcpy(field,ops[0],n); field[n]=0;
+            while(*q==' '||*q=='\t') q++;
+            a=q;
+        }
+        if(strcmp(field,"UN")!=0 || !*a) return;
+        snprintf(tc_call,sizeof(tc_call),"%s,UN",mn);
+        snprintf(tc_jump,sizeof(tc_jump),"%s,UN",strcmp(mn,"BSTR")==0?"BCTR":"BCTA");
+        snprintf(tc_opnd,sizeof(tc_opnd),"%.127s",a);
+    } else if(strcmp(mn,"ZBSR")==0){
+        if(!ops[0][0]) return;
+        snprintf(tc_call,sizeof(tc_call),"ZBSR");
+        snprintf(tc_jump,sizeof(tc_jump),"ZBRR");
+        snprintf(tc_opnd,sizeof(tc_opnd),"%.127s",ops[0]);
+    } else if(strcmp(mn,"BSXA")==0){
+        if(!ops[0][0]) return;
+        snprintf(tc_call,sizeof(tc_call),"BSXA");
+        snprintf(tc_jump,sizeof(tc_jump),"BXA");
+        if(nops>1 && ops[1][0]) snprintf(tc_opnd,sizeof(tc_opnd),"%.127s,%.127s",ops[0],ops[1]);
+        else snprintf(tc_opnd,sizeof(tc_opnd),"%.127s",ops[0]);
+    } else return;
+    tc_pending=1; tc_line=lineno;
+}
+
 static void assemble_line(char *line){
     line_start_pc = pc;  /* BUG-ASM-13: fix '$' to this line's start address before anything emits */
     char buf[MAX_LINE]; strncpy(buf,line,MAX_LINE-1); buf[MAX_LINE-1]=0;
@@ -713,7 +797,7 @@ static void assemble_line(char *line){
     /* v1.4 FIX: allow "LABEL: OPCODE operands" on one line.
      * After defining the label, continue to assemble any instruction that follows.
      * A colon with nothing after it (label-only line) is handled by the !*p check. */
-    if(!*p) return;
+    if(!*p){ if(pass==2) tailcall_label(); return; }
     char mn[32]=""; int mi=0;
     while((isalpha((unsigned char)*p)||isdigit((unsigned char)*p))&&mi<31) mn[mi++]=*p++;
     mn[mi]=0;
@@ -724,6 +808,7 @@ static void assemble_line(char *line){
     char ops[64][128];
     for(int _i=0;_i<64;_i++) ops[_i][0]=0;
     int nops=split_ops(p,ops,64);
+    tailcall_check(mn,ops,nops,*lbl!=0);
 
     if(strcmp(mn,"ORG")==0){
         int ok,v=eval_expr(ops[0],&ok);
@@ -1239,6 +1324,7 @@ static void print_usage(FILE *f){
     fprintf(f,"  -NoList                        Suppress default .LST listing sidecar\n");
     fprintf(f,"  --no-warn-inline-label         Disable warning for LABEL: INSTR on same line\n");
     fprintf(f,"  --no-warn-local-branch         Disable warning when absolute branch could be relative\n");
+    fprintf(f,"  --no-warn-tail-call            Disable warning for BSTx,UN/ZBSR/BSXA followed by RETC,UN (use jump)\n");
     fprintf(f,"  --no-warn-branch-skip          Disable warning for BCTR/BCTA-skips-BCTx,UN idiom (see BCFR/BCFA)\n");
     fprintf(f,"  -h, --help                     Show this help and exit\n");
 }
@@ -1277,6 +1363,7 @@ int main(int argc,char *argv[]){
         } else if(!strcmp(argv[i],"--no-warn-inline-label")) warn_inline_label=0;
         else if(!strcmp(argv[i],"--no-warn-local-branch")) warn_local_abs_branch=0;
         else if(!strcmp(argv[i],"--no-warn-branch-skip")) warn_branch_skip=0;
+        else if(!strcmp(argv[i],"--no-warn-tail-call")) warn_tail_call=0;
         else if(!strcmp(argv[i],"-h") || !strcmp(argv[i],"--help")){
             print_usage(stdout);
             return 0;
@@ -1300,6 +1387,7 @@ int main(int argc,char *argv[]){
         if(pass==2) memset(rom_emitted,0,sizeof(rom_emitted));
         FILE *f=fopen(src_file,"r"); if(!f){fprintf(stderr,"Cannot open '%s'\n",src_file);return 1;}
         pc=0; lineno=0; char line[MAX_LINE];
+        tailcall_reset();
         /* Rolling 3-line window for the branch-skip warning (match_skip_branch /
          * match_uncond_branch / line_defines_label above). Fresh each pass since
          * these are ordinary locals re-created every time this for-loop body
