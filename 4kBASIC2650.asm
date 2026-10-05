@@ -136,7 +136,7 @@
 ;   - MUL16: MSB-first shift-add (Horner), 16 passes or 8 if multiplier<256.
 ;   - DIV16: restoring shift-subtract, 16 passes or 8 if dividend<256.
 ;   - MATCH_KW early-out: anything but two letters in a row no longer scans table.
-;   - INC_IP: dedicated ~4-instruction path (was ~10 via the shared INC_ET).
+;   - INC_IP: dedicated ~4-instruction path vs ~10 via  shared INC_ET.
 ;   - ADV_TMP_PAST_REC: indexed scan, TMP advanced once
 ;
 ; V5.2 (2026-09) - ROMEND $0E78 -> $0E61 (3681 bytes)
@@ -965,6 +965,7 @@ DO_RND_FUNC:
 RNDF_MIX:
         BSTR,UN RND_SHUFFLE
         BDRR,R2 RNDF_MIX
+
         LODI,R0 (IDX_RND*16)+IDX_TMP
         ZBSR *VREG16_TO_REG16   ; TMP = RNDSEED
         BSTA,UN DIV16          ; Divide
@@ -1030,8 +1031,9 @@ DO_INPUT:
 ; --cout addresses from the LST after each build, so nothing depends on
 ; these being fixed). Floating frees the slack this boundary kept eating
 ; every time code ahead of it grew (see v4.10 ZPVEC-01 note below).
-CHIN:
+PRE_CHIN:
         BSTA,UN RND_SHUFFLE
+CHIN:
         PPSL PSW_RS
         LODI,R0 $80
 ;        WRTC,R0        ; make space for shuffle
@@ -1039,7 +1041,7 @@ CHIN:
         LODI,R2 8
 ;ACHI:   
         SPSU
-        BCTR,LT CHIN
+        BCTR,LT PRE_CHIN
         EORZ,R0
 ;        WRTC,R0        ; make space for shuffle
         BSTR,UN DLY
@@ -1489,7 +1491,7 @@ TMR_CHAR:
         BCFR,EQ TMR_MISMATCH
         ZBSR *VINC_IP                     ; matched: consume this input char
         LODA,R0 *TKH,R1+                 ; next table char
-        BCTR,EQ TMR_MATCH                 ; row exhausted: full match
+        BCTA,EQ *VEATWORD                 ; row exhausted: full match
         BCTR,UN TMR_CHAR
 TMR_MISMATCH:
         LODI,R0 (IDX_EXP*16)+IDX_IP
@@ -1500,9 +1502,6 @@ TMR_SKIP:
         ADDI,R1 2                         ; skip hi/lo -> next row's start
         ADDI,R2 1                         ; next row's index
         BCTR,UN TMR_SCAN
-TMR_MATCH:
-        ZBSR *VEATWORD                    ; consume any trailing garbage
-        RETC,UN
 TMR_MISS:
         LODI,R2 $FF
         RETC,UN
@@ -1735,10 +1734,9 @@ TL_MULADD_LP:
         LODA,R3 R3SAVE                       ; restore caller's R3
         LODA,R0 EXPL
         ADDA,R0 SC0
-        ZBSR *VCARRY_INTO_EXPH
-        RETC,UN
+        ZBRR *VCARRY_INTO_EXPH
 TL_DONE:
-        LODI,R0 0
+        EORZ,R0
         STRA,R0 TOKBUF,R3+                        ; NUL-terminate
      
 ; =============================================================================
@@ -2798,8 +2796,6 @@ DLS_NL:
 ; In:  R0 = EXPL + <addend>, i.e. caller has just done LODA,R0 EXPL /
 ;      ADDA,R0 <addend> and Carry still reflects that add (STRA and a
 ;      BSTA/BCTA call in between don't disturb it -- confirmed empirically
-;      via pipbug_wrap regression; same technique already used in
-;      uBASIC2650's CARRY_INTO_EXPH).
 ; Out: EXPL = R0; EXPH += 1 iff the add into EXPL carried
 ; Clobbers: R0
 CARRY_INTO_EXPH:
@@ -3059,16 +3055,12 @@ P10_LO:
 RDLINE:
         LODI,R3 $FF                      ; R3 = empty-buffer sentinel (pre-inc convention)
 RL_LP:
-        BSTA,UN CHIN                     ; [+1] blocking read
-        COMI,R0 NUL
-        BCTR,EQ RL_EOL
+        BSTA,UN PRE_CHIN                     ; [+1] blocking read
         STRZ,R1
-        COMI,R1 CR
-        BCTR,EQ RL_EOL
-        COMI,R1 LF
-        BCTR,EQ RL_EOL
         COMI,R1 BS
         BCTR,EQ RL_BS
+        COMI,R1 CR+1
+        BCTR,LT RL_EOL
         ; buffer full check: room while R3 < 62 (last slot reserved for NUL)
         ; V4.14 COM01: R3=$FF is the empty-buffer sentinel, relying on signed
         ; interpretation (-1 < 62); must run under COM=0 despite the global
@@ -3423,7 +3415,7 @@ CP_EXP_OK:
 CP_POW_LOOP:
         LODI,R0 (IDX_EXP*16)+IDX_POW
         ZBSR *VREG16_TO_REG16             ; POWCNT = exponent (EXPH:EXPL becomes the result
-        LODI,R0 0                    ; result accumulator = 1
+        EORZ,R0                    ; result accumulator = 1
         STRA,R0 EXPH
         LODI,R0 1
         STRA,R0 EXPL
