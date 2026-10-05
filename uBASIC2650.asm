@@ -1,12 +1,12 @@
 ; =============================================================================
-; uBASIC2650 v2.11  --  Minimal Tiny BASIC for the Signetics 2650
+; uBASIC2650 v2.12  --  Minimal Tiny BASIC for the Signetics 2650
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: standalone build - I/O is bit-banged in software, no PIPBUG ROM or
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : <2 KB target, $0000 upward (currently 2000 bytes - see ROMEND)
+;   ROM    : <2 KB target, $0000 upward (currently 2009 bytes - see ROMEND)
 ;   RAM    : ~213 bytes, $1000 upward (half an 8 KB page above the code)
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
@@ -131,11 +131,15 @@
 ; VERSION HISTORY 
 ; =============================================================================
 ;
+; v2.12 (Oct 2026) - RND entropy: LFSR is stepped on every keystroke read and
+;   8 steps per RND call. 
+;   - ROMEND $07D9 (2009 bytes); 
+;
 ; v2.11 (Sep 2026) - Code golf: REG16_TO_REG16 generic 16-bit copy.
 ;   - Replaced EXP16_TO_ET/TMP_TO_ET and DE_LOOP, DR_SWSTK,DN_LIM, GR_LP, OG_SAV
 ;     copy loops with REG16_TO_REG16 using R0 = packed (SRC_IDX<<4)|DST_IDX pair. 
 ;   - RAM reorg: PEH/PEL and SC0/SC1 moved contiguous for use with REG16.
-;   - ROMEND $07EF (2031) -> $07D0 (2000 bytes)
+;   - ROMEND $07EF (2031) -> $07D5 (2005 bytes)
 ;
 ; v2.10 (Sep 2026) - BUG FIX: mid-list line insert corrupted following line.
 ;   - OPEN_GAP's move loop decrements PE via an inlined former DEC_PE.
@@ -335,7 +339,6 @@ VDIGIT_CHECK:
 ; MAIN - Program init
 ; =============================================================================
 MAIN:
-
         ; Initialize RND seed
         LODI,R1 $AC
         LODI,R0 $E1
@@ -586,7 +589,7 @@ GETLINE:
         STRA,R0 IPL
         LODI,R1 $FF                      ; R1 = empty-buffer sentinel (pre-inc convention)
 GL_LP:
-        BSTA,UN CHIN                     ; [+1] blocking read
+        BSTA,UN PRE_CHIN                     ; [+1] blocking read
         COMI,R0 CR+1
         BCTR,LT GL_EOL                  ; everything less than CR
         STRA,R0 IBUF,R1+                 ; R1++ (pre-inc); IBUF[R1]=char
@@ -599,7 +602,7 @@ GL_EOL:
 
 JERRVAR:
         LODI,R0 ERR_VAR
-        db $EC                  ; COMA,R0: consume next 2 bytes
+        db $EC                          ; COMA,R0: consume next 2 bytes
 DGS_OFLOW:                              ; all report ERR_OOM: GOSUB/FOR stack full,
 DRT_UFLOW:                              ; RETURN/NEXT with nothing pushed, program
         LODI,R0 ERR_OOM                 ; store full (OPEN_GAP) - one shared exit
@@ -902,19 +905,12 @@ DP_C_KW:
         BCTR,UN DP_SEP          ; 2b
 
 ; =============================================================================
-;  GET_RND -- snapshot current seed as the RND result, then advance it
-; In:  None
-; Out: EXPH:EXPL = pseudorandom 16-bit value (the seed BEFORE this call)
-; Clobbers: R0, R1, RNDSEED (falls through into RND_SHUFFLE - one shared RETC)
-GET_RND:
-        LODI,R0 (IDX_RND*16)+IDX_EXP
-        ZBSR *VREG16_TO_REG16
-        ; drop through
-; =============================================================================
 ;  RND_SHUFFLE -- Advance 16-bit Galois LFSR (Little-Endian) in place
 ; In:  None (reads RNDSEED)
 ; Out: RNDSEED advanced one step
-; Clobbers: R0, R1, RNDSEED
+; Clobbers: RNDSEED, PSL CC and Carry. Works in register bank 1 so the
+;      caller's bank-0 R0/R1 survive (GETLINE's index and DO_RND's counter
+;      rely on this). RS/WC are clear on return, as every caller expects.
 RND_SHUFFLE:
         ; 16-bit Galois LFSR. R0=high byte, R1=low byte.
         ; CRITICAL: WC (PSL bit 3) must be SET for RRR to chain carry between
@@ -926,20 +922,20 @@ RND_SHUFFLE:
         ; that feedback: CC=EQ if C=1 (apply XOR), CC=LT if C=0 (skip).
         ; Taps 0xB400 = x^16+x^14+x^13+x^11+1, standard maximal-length
         ; polynomial (period 65535).
+        PPSL    PSW_RS+PSW_WC   ; bank 1 (keeps caller's R0/R1) + WC on
         LODA,R0 RNDSEED         ; Load seed high byte
         LODA,R1 RNDSEED+1       ; Load seed low byte
         CPSL    1               ; Clear Carry (C=0 shifts into bit7 of R0)
-        PPSL    PSW_WC          ; Enable WC: RRR now chains carry between regs
         RRR,R0                  ; Shift R0 right: bit0 of R0 -> Carry; 0 -> bit7
         RRR,R1                  ; Shift R1 right: Carry (bit0 of R0) -> bit7 of R1
                                  ;                 bit0 of R1 -> Carry (feedback)
-        CPSL    PSW_WC          ; Disable WC (restore normal mode)
         TPSL    1               ; Test Carry: CC=EQ if C=1, CC=LT if C=0
         BCTR,LT RND_SKIP        ; C=0 (CC=LT): feedback bit was 0, skip XOR
         EORI,R0 $B4             ; Apply taps high byte (0xB400)
 RND_SKIP:
         STRA,R0 RNDSEED        ; Save seed high byte
         STRA,R1 RNDSEED+1      ; Save seed low byte
+        CPSL    PSW_RS+PSW_WC   ; back to bank 0, WC off
         RETC,UN
 
 ; =============================================================================
@@ -948,8 +944,13 @@ RND_SKIP:
 ; Simulator default expects CHIN $286 COUT $2B4
  ;       ORG $286
 
-CHIN:
+; PRE_CHIN -- stir the RND LFSR once per keystroke read, then fall into CHIN
+; In:  nothing
+; Out: R0 = character (from CHIN)
+; Clobbers: R0, RNDSEED (R1/R2 preserved: RND_SHUFFLE uses register bank 1)
+PRE_CHIN:
         BSTR,UN RND_SHUFFLE 
+CHIN:
         PPSL PSW_RS
         LODI,R0 $80
 ;        WRTC,R0        ; make space for shuffle
@@ -1206,8 +1207,7 @@ APR_LP:
         ZBSR *VINC_TMP
         LODA,R0 *TMPH
         BCFR,EQ APR_LP                  ; free zero-test: NUL ends the body
-        ZBSR *VINC_TMP                    ; skip the NUL itself
-        RETC,UN
+        ZBRR *VINC_TMP                    ; skip the NUL itself
 
 ; =============================================================================
 ;  FIND_INS -- Find sorted insertion point for LNUMH:LNUML
@@ -1311,9 +1311,19 @@ LO_NOMATCH:
 ; In:  IPH:IPL -> expression string
 ; Out: EXPH:EXPL = 16-bit result ($0000/$FFFF for relops - see DO_EQOP/
 ; Clobbers: R0, R1, R3, BANG, SAVEH, SAVEL, NEGFLG, SC0, TMPH, TMPL
+; DO_RND -- RND atom: step the LFSR 8 times, return the seed as the value
+; In:  IP -> "RND"
+; Out: EXPH:EXPL = new seed; IP advanced; tail-jumps to PARSER_RET
+; Clobbers: R0, R1, RNDSEED. R2 (target var offset) and R3 (SW stack pointer)
+;      are live across EXPR and must NOT be used here.
 DO_RND:
         ZBSR *VEATWORD          ; consume "RND"
-        BSTA,UN GET_RND         ; EXPH:EXPL = seed; advances LFSR
+        LODI,R1 8               ; shuffle a full byte's worth of taps
+RNDF_MIX:
+        BSTA,UN RND_SHUFFLE     ; preserves R0/R1 (bank 1)
+        BDRR,R1 RNDF_MIX
+        LODI,R0 (IDX_RND*16)+IDX_EXP
+        ZBSR *VREG16_TO_REG16
         ZBRR *VPARSER_RET
 
 DO_ABS:
@@ -1981,7 +1991,7 @@ P10_LO:
         db $10, $E8, $64, $0A, $01
 
 BANNER:
-        DB CR, LF, "uBASIC 2.9", CR, LF, "Free:",NUL        
+        DB CR, LF, "uBASIC 2.12", CR, LF, "Free:",NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
