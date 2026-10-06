@@ -1,14 +1,90 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.20
- * Build: gcc -Wall -O2 -o asm2650 asm2650.c
+ * Version: 1.21
+ * Build:   gcc -Wall -O2 -o asm2650 asm2650.c
  *
- * Usage: asm2650 source.asm [output.hex]   (stdout if no output file)
- *        asm2650 source.asm -s             (dump symbol table to stderr)
- *        asm2650 source.asm -NoList        (suppress default .LST file)
+ * USAGE
+ *   asm2650 [options] source.asm [output.hex]
+ *     Intel-hex goes to stdout unless output.hex is given. A listing sidecar
+ *     <source>.LST is written next to the source (also when there are errors).
+ *     Exit status 0 = assembled, 1 = errors (hex/binary withheld).
+ *
+ *   Output options:
+ *     -s                     dump the symbol table to stderr
+ *     --binary               write a flat 32768-byte binary image to stdout
+ *     -o <file>              write the binary image to <file> (implies --binary)
+ *     -r $HHHH-$HHHH         limit binary output to this inclusive range
+ *                            (requires --binary or -o)
+ *     -NoList                suppress the .LST listing sidecar
+ *     -h, --help             show usage and exit
+ *
+ *   Warning options (see WARNINGS AND HINTS below):
+ *     --warn=LIST            enable the named warnings/hints (comma-separated)
+ *     --no-warn=LIST         disable the named warnings/hints
+ *     --no-warn-inline-label, --no-warn-local-branch, --no-warn-tail-call,
+ *     --no-warn-branch-skip  older per-warning switches, same as
+ *                            --no-warn=label / rel / tail / skip
+ *
+ *   Examples:
+ *     asm2650 prog.asm prog.hex
+ *     asm2650 --warn=advisory prog.asm          (also run the advisory hints)
+ *     asm2650 --warn=all --no-warn=dead prog.asm
  *
  * Supported assembler directives:
  *   ORG, EQU, DS, RES, DB, DW, END
+ *
+ * WARNINGS AND HINTS  (all go to stderr as "WARN line N: ..."; none change the
+ * emitted code. Names are used by --warn= / --no-warn=; groups: advisory =
+ * condtail,loop,brn,thunk,dead; peephole = the 11 hint names; all = everything.)
+ *   Always on (not switchable): register omitted (BXA/BSXA default to R3);
+ *     ANDZ,R0 replaced with HALT; STRZ,R0 replaced with NOP; LODZ,R0 replaced
+ *     with IORZ,R0.
+ *   Older warnings, default on:
+ *     label     LABEL: INSTR on one line (colon-terminated labels only)
+ *     rel       absolute branch whose target is reachable by relative form
+ *     skip      BCTR/BCTA,cc that skips an unconditional branch (use BCF)
+ *     tail      unconditional call + RETC,UN: BSTx,UN -> BCTx,UN,
+ *               ZBSR -> ZBRR, BSXA -> BXA (the RETC,UN can be dropped)
+ *   Peephole hints, default on (reported after pass 2, sorted by line, tagged
+ *   "[name]", followed by a "Hints:" summary with the potential byte saving):
+ *     clear     LODI,R0 0 / ANDI,R0 0 -> EORZ,R0
+ *     test      IORI,R0 0 / ANDI,R0 $FF / EORI,R0 0 -> IORZ,R0
+ *     zpage     BCTA,UN / BSTA,UN to the zero page -> ZBRR / ZBSR
+ *     next      branch (not call) to the next instruction -> delete
+ *     psw       CPSL a / CPSL b (also CPSU, PPSL, PPSU) -> one instruction
+ *     retcc     BCTx,cc to a RETC,UN -> RETC,cc
+ *   Advisory hints, default off (need knowledge the assembler does not have,
+ *   e.g. that CC/carry/R0 are dead, or that a thunk has no outside users):
+ *     condtail  conditional call + RETC,UN -> conditional jump (RETC,UN kept)
+ *     loop      SUBI/ADDI,Rn 1 + BCFx,EQ -> BDRx/BIRx,Rn
+ *     brn       COMI,Rn 0 / LODZ,Rn / IORZ,R0 + BCFx,EQ -> BRNx,Rn
+ *     thunk     branch/call to a jump thunk -> branch/call the final target
+ *     dead      unlabelled code after an unconditional transfer
+ *
+ * VERSION HISTORY  (summary; the full change notes follow, newest first)
+ *   1.21  Peephole hints (clear, test, zpage, next, psw, retcc, condtail, loop,
+ *         brn, thunk, dead); --warn= / --no-warn=; label reference counts;
+ *         header and help text brought up to date.
+ *   1.20  Tail-call warning: unconditional call + RETC,UN (--no-warn-tail-call).
+ *   1.19  BUG-ASM-18: indexed absolute addressing with a target other than R0
+ *         is now an error.
+ *   1.18  BUG-ASM-16 (DB forward reference sized 0 bytes), BUG-ASM-17 (offset
+ *         shown by the "relative form" hint was off by one).
+ *   1.17  --no-warn-branch-skip; BUG-ASM-14/15 expression parser rewrite.
+ *   1.16  BUG-ASM-08..13: indexed-mode detection, silent expression failures,
+ *         silent-emission gaps, duplicate labels, buffer truncation, bare '$'.
+ *   1.15  Hex output covers only bytes actually emitted.
+ *   1.14  BUG-ASM-07: ORG backward over emitted code is an error.
+ *   1.13  BUG-ASM-05/06: quoted ';' in literals; DW forward-reference sizing.
+ *   1.12  (no change notes recorded)
+ *   1.11  BUG-ASM-02/03/04: TMI mask, ZBRR and ZBSR encoding.
+ *   1.10  .LST listing sidecar, -NoList.
+ *   1.9   DB "string"; previously silent register errors reported.
+ *   1.8   Inline-label warning only for colon-terminated labels.
+ *   1.7   --no-warn-inline-label/-local-branch, --binary, -o, -r, -h.
+ *   1.6   -s symbol table dump.
+ *   1.5   RES directive; EORZ checked against the datasheet.
+ *   1.4   BUG-ASM-01: LABEL: INSTR on one line.
  *
  * HI/LO OPERATOR CONVENTION (WinArcadia/asm2650.py standard):
  *   <ADDR = HIGH byte  (bits 15:8)   e.g. <$1584 = $15
@@ -28,6 +104,39 @@
  *            grouping. Division by zero is an error. Trailing text the
  *            grammar can't parse is a hard error (was silently dropped
  *            pre-1.17 — BUG-ASM-15).
+ *
+ * Changes v1.20 -> v1.21:
+ *   Added peephole / optimisation hints. Every instruction is recorded in
+ *   pass 2 and, if there were no errors, the final machine code is decoded and
+ *   checked after pass 2. Hints are warnings only (output bytes are unchanged),
+ *   are printed sorted by line as "WARN line N: ... [name]", followed by one
+ *   "Hints: name=count ... (about N byte(s) potential saving)" summary line.
+ *   Default on:
+ *     clear     LODI,R0 0 / ANDI,R0 0 -> EORZ,R0 (1 byte shorter, same cycles/CC)
+ *     test      IORI,R0 0 / ANDI,R0 $FF / EORI,R0 0 -> IORZ,R0
+ *     zpage     BCTA,UN / BSTA,UN (direct or *) to $0000-$003F / $1FC0-$1FFF that
+ *               is not reachable by relative form -> ZBRR / ZBSR
+ *     next      branch (not call) to the very next instruction -> delete
+ *     psw       CPSL a / CPSL b (same for CPSU, PPSL, PPSU) -> one op with a|b
+ *     retcc     BCTR/BCTA,cc to a label whose instruction is RETC,UN -> RETC,cc
+ *   Advisory, default off (enable with --warn=name or --warn=advisory):
+ *     condtail  conditional call + RETC,UN -> conditional jump, RETC,UN kept
+ *               (saves a return-stack level and cycles; no size change)
+ *     loop      SUBI,Rn 1 + BCFx,EQ -> BDRx,Rn ; ADDI,Rn 1 + BCFx,EQ -> BIRx,Rn
+ *               (BDRx/BIRx leave CC and carry unchanged: only if they are dead)
+ *     brn       COMI,Rn 0 / LODZ,Rn / IORZ,R0 + BCFx,EQ -> BRNx,Rn
+ *     thunk     branch/call to a jump thunk (ZBRR x; BCTx,UN x; ZBSR/BSTx,UN x +
+ *               RETC,UN; chains followed) -> branch/call the final target. Only
+ *               reported when the thunk is not entered by fall-through, has no
+ *               other (non-branch) label references, and the total byte change
+ *               over all its callers minus the dropped thunk is <= 0.
+ *     dead      unlabelled instruction right after BCTx,UN / ZBRR / BXA /
+ *               RETC,UN / RETE,UN / HALT (jump-table-like runs not reported)
+ *   New options: --warn=LIST and --no-warn=LIST, comma-separated names from
+ *   clear,test,zpage,next,psw,retcc,condtail,loop,brn,thunk,dead plus the older
+ *   label,rel,skip,tail and the groups advisory, peephole, all. The existing
+ *   --no-warn-* options still work.
+ *   Labels now carry a reference count (used by the thunk analysis).
  *
  * Changes v1.19 -> v1.20:
  *   Added --no-warn-tail-call (on by default): warns when an UNCONDITIONAL
@@ -297,14 +406,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
 
 #define MAX_LABELS  512
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.20"
+#define ASM2650_VERSION "1.21"
 
-typedef struct { char name[64]; int value; int referenced; int def_line; } Label;
+typedef struct { char name[64]; int value; int referenced; int def_line; int refs; } Label;
 static Label labels[MAX_LABELS];
 static int   nlabels = 0;
 
@@ -347,6 +457,10 @@ static int  warn_tail_call = 1;
 static int  tc_pending = 0;
 static int  tc_line = 0;           /* source line of the pending call */
 static char tc_call[16], tc_jump[16], tc_opnd[260];
+/* Per-line facts exported by assemble_line() for the peephole recorder. */
+static char cur_mn[32], cur_op0[128], cur_op1[128];
+static int  cur_nops = 0, cur_lbl_defined = 0;
+static char *xstrdup(const char *s);
 static int  list_enabled = 1;
 
     /* Upcase the assembler line but preserve content inside single-quoted literals.
@@ -407,7 +521,7 @@ static int label_find(const char *n){
 }
 static void label_mark_referenced(const char *n){
     int i=label_find_index(n);
-    if(i>=0) labels[i].referenced=1;
+    if(i>=0){ labels[i].referenced=1; labels[i].refs++; }
 }
 /* label_define: create or update a label/constant's value.
  * Inputs:  n = label name, v = value to assign.
@@ -431,7 +545,7 @@ static void label_define(const char *n, int v){
     }
     if(nlabels>=MAX_LABELS){ fprintf(stderr,"ERROR: label table full\n"); errors++; return; }
     strncpy(labels[nlabels].name,n,63); labels[nlabels].name[63]=0;
-    labels[nlabels].value=v; labels[nlabels].referenced=0; labels[nlabels].def_line=lineno; nlabels++;
+    labels[nlabels].value=v; labels[nlabels].referenced=0; labels[nlabels].refs=0; labels[nlabels].def_line=lineno; nlabels++;
 }
 
 /* ---------------------------------------------------------------------------
@@ -742,7 +856,7 @@ static void tailcall_check(const char *mn, char ops[][128], int nops, int has_la
             a=q;
         }
         if(strcmp(field,"UN")!=0 || !*a) return;
-        snprintf(tc_call,sizeof(tc_call),"%s,UN",mn);
+        snprintf(tc_call,sizeof(tc_call),"%.8s,UN",mn);
         snprintf(tc_jump,sizeof(tc_jump),"%s,UN",strcmp(mn,"BSTR")==0?"BCTR":"BCTA");
         snprintf(tc_opnd,sizeof(tc_opnd),"%.127s",a);
     } else if(strcmp(mn,"ZBSR")==0){
@@ -760,7 +874,412 @@ static void tailcall_check(const char *mn, char ops[][128], int nops, int has_la
     tc_pending=1; tc_line=lineno;
 }
 
+/* ===========================================================================
+ * Peephole / optimisation hints (v1.21)
+ *
+ * Every instruction assembled in pass 2 is recorded (address, length, source
+ * line, "label before it", source operand text). After pass 2 completes
+ * (and only if there were no errors) peep_report() decodes the final machine
+ * code in rom[] and runs the checks below. Hints are warnings only: the
+ * emitted bytes never change. They are collected, sorted by source line and
+ * printed together as "WARN line N: ... [name]" followed by a summary line.
+ * Names (for --warn= / --no-warn=):
+ *   clear     LODI,R0 0 / ANDI,R0 0            -> EORZ,R0              (default on)
+ *   test      IORI,R0 0 / ANDI,R0 $FF / EORI,R0 0 -> IORZ,R0           (default on)
+ *   zpage     BCTA,UN / BSTA,UN to zero page   -> ZBRR / ZBSR           (default on)
+ *   next      branch to the next instruction   -> delete                (default on)
+ *   psw       CPSL a + CPSL b (also CPSU/PPSL/PPSU) -> one instruction  (default on)
+ *   retcc     BCTx,cc to a RETC,UN             -> RETC,cc               (default on)
+ *   condtail  BSxx,cc / RETC,UN  -> BCxx,cc / RETC,UN (tail jump)       (advisory)
+ *   loop      SUBI,Rn 1 / BCFx,EQ -> BDRx ; ADDI,Rn 1 / BCFx,EQ -> BIRx (advisory)
+ *   brn       COMI,Rn 0 / LODZ,Rn / IORZ,R0 + BCFx,EQ -> BRNx,Rn       (advisory)
+ *   thunk     branch/call to a jump thunk with few callers -> go direct (advisory)
+ *   dead      unlabelled code after an unconditional transfer           (advisory)
+ * ======================================================================== */
+enum { PH_CLEAR=1, PH_TEST=2, PH_ZPAGE=4, PH_NEXT=8, PH_PSW=16, PH_RETCC=32,
+       PH_CONDTAIL=64, PH_LOOP=128, PH_BRN=256, PH_THUNK=512, PH_DEAD=1024 };
+#define PH_DEFAULT  (PH_CLEAR|PH_TEST|PH_ZPAGE|PH_NEXT|PH_PSW|PH_RETCC)
+#define PH_ADVISORY (PH_CONDTAIL|PH_LOOP|PH_BRN|PH_THUNK|PH_DEAD)
+#define PH_ALL      (PH_DEFAULT|PH_ADVISORY)
+static int ph_enabled = PH_DEFAULT;
+static const struct { const char *name; int bit; } ph_names[] = {
+    {"clear",PH_CLEAR},{"test",PH_TEST},{"zpage",PH_ZPAGE},{"next",PH_NEXT},{"psw",PH_PSW},
+    {"retcc",PH_RETCC},{"condtail",PH_CONDTAIL},{"loop",PH_LOOP},{"brn",PH_BRN},
+    {"thunk",PH_THUNK},{"dead",PH_DEAD},{NULL,0}};
+static int ph_count[11];
+static int ph_saved = 0;
+
+typedef struct { int addr, len, line, lab_before; char *opnd; } PInst;
+static PInst *pins = NULL;
+static int npins = 0, pinscap = 0;
+static int peep_pend_label = 0;
+static int ph_ins_at[MAX_ROM];
+
+typedef struct { int line, seq; char *text; } PWarn;
+static PWarn *pw = NULL;
+static int npw = 0, pwcap = 0;
+
+typedef struct { const char *name; unsigned char base, call, reg, rel; } BrFam;
+static const char *ph_cc[4] = {"EQ","GT","LT","UN"};
+
+/* ph_rb: read a byte of the assembled image, 0xFF if outside it.
+ * Inputs: a = address.  Outputs: byte.  Clobbers: none. */
+static int ph_rb(int a){ return (a>=0 && a<MAX_ROM) ? rom[a] : 0xFF; }
+
+/* ph_brfam: classify an opcode as a conditional/register branch or call.
+ * Inputs: op = opcode.  Outputs: family record (name, call/reg/rel flags) or
+ * NULL if op is not one. ZBRR/ZBSR/BXA/BSXA ($9B/$BB/$9F/$BF) are excluded.
+ * Clobbers: none. */
+static const BrFam *ph_brfam(unsigned char op){
+    static const BrFam t[] = {
+        {"BCTR",0x18,0,0,1},{"BCTA",0x1C,0,0,0},{"BSTR",0x38,1,0,1},{"BSTA",0x3C,1,0,0},
+        {"BCFR",0x98,0,0,1},{"BCFA",0x9C,0,0,0},{"BSFR",0xB8,1,0,1},{"BSFA",0xBC,1,0,0},
+        {"BRNR",0x58,0,1,1},{"BRNA",0x5C,0,1,0},{"BSNR",0x78,1,1,1},{"BSNA",0x7C,1,1,0},
+        {"BIRR",0xD8,0,1,1},{"BIRA",0xDC,0,1,0},{"BDRR",0xF8,0,1,1},{"BDRA",0xFC,0,1,0},
+        {NULL,0,0,0,0}};
+    if(op==0x9B||op==0xBB||op==0x9F||op==0xBF) return NULL;
+    for(int i=0;t[i].name;i++) if((op&0xFC)==t[i].base) return &t[i];
+    return NULL;
+}
+
+/* ph_mn: mnemonic text for an opcode (e.g. "BCFR,EQ", "BDRA,R1", "ZBRR").
+ * Inputs: b/n = output buffer and size, op = opcode.
+ * Outputs: text in b.  Clobbers: b. */
+static void ph_mn(char *b, size_t n, unsigned char op){
+    const BrFam *f = ph_brfam(op);
+    if(f){ if(f->reg) snprintf(b,n,"%s,R%d",f->name,op&3); else snprintf(b,n,"%s,%s",f->name,ph_cc[op&3]); }
+    else if(op==0x9B) snprintf(b,n,"ZBRR");
+    else if(op==0xBB) snprintf(b,n,"ZBSR");
+    else if(op==0x9F) snprintf(b,n,"BXA");
+    else if(op==0xBF) snprintf(b,n,"BSXA");
+    else if(op==0x17) snprintf(b,n,"RETC,UN");
+    else if(op==0x37) snprintf(b,n,"RETE,UN");
+    else if(op==0x40) snprintf(b,n,"HALT");
+    else snprintf(b,n,"$%02X",op);
+}
+
+/* ph_decode_target: decode the target of a branch/call/ZBRR/ZBSR at addr.
+ * Inputs: addr = instruction address.
+ * Outputs: *t = target address (for indirect: the pointer address),
+ *          *ind = 1 if indirect; returns 1 if the opcode is a branch, else 0.
+ * Clobbers: none. */
+static int ph_decode_target(int addr, int *t, int *ind){
+    unsigned char op=(unsigned char)ph_rb(addr), b1=(unsigned char)ph_rb(addr+1), b2=(unsigned char)ph_rb(addr+2);
+    const BrFam *f = ph_brfam(op);
+    if(f){
+        *ind = (b1&0x80)!=0;
+        if(f->rel){ int d=b1&0x7F; if(d&0x40) d-=128; *t=addr+2+d; }
+        else *t=((b1&0x7F)<<8)|b2;
+        return 1;
+    }
+    if(op==0x9B||op==0xBB){ int d=b1&0x7F; if(d&0x40) d-=128; *ind=(b1&0x80)!=0; *t=d&0x1FFF; return 1; }
+    return 0;
+}
+
+/* ph_can_fall: can execution continue into the next instruction?
+ * Inputs: op = opcode.  Outputs: 0 for unconditional jump/return/HALT, else 1.
+ * Clobbers: none. */
+static int ph_can_fall(unsigned char op){
+    return !(op==0x1B||op==0x1F||op==0x9B||op==0x9F||op==0x17||op==0x37||op==0x40);
+}
+
+/* ph_emit: queue one hint.
+ * Inputs: bit = PH_* category, line = source line, saving = bytes saved
+ *         (0 if speed only), fmt/... = message text (tag " [name]" appended).
+ * Outputs: none.  Clobbers: pw[], npw, pwcap, ph_count[], ph_saved. */
+static void ph_emit(int bit, int line, int saving, const char *fmt, ...){
+    char buf[640], tag[40]; va_list ap; const char *nm="?"; int bi=0;
+    for(int i=0;ph_names[i].name;i++) if(ph_names[i].bit==bit){ nm=ph_names[i].name; bi=i; }
+    va_start(ap,fmt); vsnprintf(buf,sizeof(buf)-40,fmt,ap); va_end(ap);
+    snprintf(tag,sizeof(tag)," [%s]",nm); strcat(buf,tag);
+    if(npw>=pwcap){
+        pwcap = pwcap ? pwcap*2 : 64;
+        pw = (PWarn*)realloc(pw,(size_t)pwcap*sizeof(PWarn));
+        if(!pw){ fprintf(stderr,"ERROR: out of memory\n"); exit(1); }
+    }
+    pw[npw].line=line; pw[npw].seq=npw; pw[npw].text=xstrdup(buf); npw++;
+    ph_count[bi]++; ph_saved+=saving;
+}
+
+/* is_directive_mn: non-instruction mnemonics (emit data or nothing).
+ * Inputs: mn.  Outputs: 1 if directive.  Clobbers: none. */
+static int is_directive_mn(const char *mn){
+    return !strcmp(mn,"ORG")||!strcmp(mn,"EQU")||!strcmp(mn,"DB")||!strcmp(mn,"DW")||
+           !strcmp(mn,"DS")||!strcmp(mn,"RES")||!strcmp(mn,"END");
+}
+
+/* ph_split_addr: address part of a "cc,addr" / "Rn,addr" operand list.
+ * Inputs: o0/o1 = first two operands, nops = operand count.
+ * Outputs: malloc'd text of the address operand (keeps a leading '*').
+ * Clobbers: heap. */
+static char *ph_split_addr(const char *o0, const char *o1, int nops){
+    if(nops>1 && o1[0]) return xstrdup(o1);
+    const char *q=o0;
+    while(*q && *q!=' ' && *q!='\t') q++;
+    while(*q==' '||*q=='\t') q++;
+    return xstrdup(q);
+}
+
+/* peep_label_only / peep_line_done: record state after each source line.
+ * peep_line_done is called by main() after assemble_line() on pass 2.
+ * Inputs: cur_* globals set by assemble_line().
+ * Outputs: appends a PInst for each instruction line; label-only lines set
+ *          the pending-label flag.  Clobbers: pins[], npins, peep_pend_label. */
+static void peep_line_done(void){
+    if(pass!=2) return;
+    if(!cur_mn[0]){ if(cur_lbl_defined) peep_pend_label=1; return; }
+    if(is_directive_mn(cur_mn) || pc<=line_start_pc) return;
+    if(npins>=pinscap){
+        pinscap = pinscap ? pinscap*2 : 512;
+        pins = (PInst*)realloc(pins,(size_t)pinscap*sizeof(PInst));
+        if(!pins){ fprintf(stderr,"ERROR: out of memory\n"); exit(1); }
+    }
+    PInst *r=&pins[npins++];
+    r->addr=line_start_pc; r->len=pc-line_start_pc; r->line=lineno;
+    r->lab_before = cur_lbl_defined || peep_pend_label; peep_pend_label=0;
+    r->opnd=NULL;
+    unsigned char op=(unsigned char)ph_rb(r->addr);
+    if(ph_brfam(op)) r->opnd=ph_split_addr(cur_op0,cur_op1,cur_nops);
+    else if(op==0x9B||op==0xBB) r->opnd=xstrdup(cur_op0);
+}
+
+typedef struct { int zp, len, levels; const char *opnd; char desc[220]; } Thunk;
+
+/* ph_thunk: is the instruction at address t a "jump thunk" (ZBRR x; BCTx,UN x;
+ * or ZBSR/BSTx,UN x followed by RETC,UN)? Follows chains of thunks.
+ * Inputs: t = address, depth = recursion guard.
+ * Outputs: returns 1 and fills *th (final target operand text, whether the
+ *          final target is reachable by ZBRR/ZBSR, size in bytes of THIS
+ *          thunk, number of levels, description); else 0.
+ * Clobbers: *th. */
+static int ph_thunk(int t, Thunk *th, int depth){
+    if(t<0||t>=MAX_ROM||ph_ins_at[t]<0||depth>8) return 0;
+    int ix=ph_ins_at[t]; const PInst *r=&pins[ix]; unsigned char op=(unsigned char)ph_rb(t);
+    const PInst *n=(ix+1<npins && pins[ix+1].addr==t+r->len && !pins[ix+1].lab_before)?&pins[ix+1]:NULL;
+    int tailret=(n && ph_rb(n->addr)==0x17);
+    char nm[48];
+    memset(th,0,sizeof(*th));
+    if(op==0x9B){ th->zp=1; th->len=r->len; }
+    else if(op==0xBB && tailret){ th->zp=1; th->len=r->len+n->len; }
+    else if(op==0x1B||op==0x1F){ th->len=r->len; }
+    else if((op==0x3B||op==0x3F) && tailret){ th->len=r->len+n->len; }
+    else return 0;
+    if(!r->opnd||!r->opnd[0]) return 0;
+    th->opnd=r->opnd; th->levels=1;
+    ph_mn(nm,sizeof(nm),op);
+    snprintf(th->desc,sizeof(th->desc),"%s %.120s%s",nm,r->opnd,tailret&&(op==0xBB||op==0x3B||op==0x3F)?" / RETC,UN":"");
+    int tt,ind;
+    if(ph_decode_target(t,&tt,&ind) && !ind && tt!=t){
+        Thunk t2;
+        if(ph_thunk(tt,&t2,depth+1)){ th->opnd=t2.opnd; th->zp=t2.zp; th->levels=t2.levels+1; }
+    }
+    return 1;
+}
+
+/* ph_caller: classify an instruction as a branch/call that could be
+ * retargeted. Inputs: a = record. Outputs: returns 1 and sets *t (direct
+ * target), *is_call, *is_un (unconditional, i.e. could become ZBRR/ZBSR);
+ * 0 if not a direct branch. Clobbers: *t,*is_call,*is_un. */
+static int ph_caller(const PInst *a, int *t, int *is_call, int *is_un){
+    unsigned char op=(unsigned char)ph_rb(a->addr); int ind;
+    const BrFam *f=ph_brfam(op);
+    if(f){ *is_call=f->call; *is_un=(!f->reg && (op&3)==3); }
+    else if(op==0x9B){ *is_call=0; *is_un=1; }
+    else if(op==0xBB){ *is_call=1; *is_un=1; }
+    else return 0;
+    if(!ph_decode_target(a->addr,t,&ind) || ind) return 0;
+    return 1;
+}
+
+/* ph_thunks: thunk-collapse analysis (see header v1.20 -> v1.21).
+ * A caller of a jump thunk can branch/call the final target directly: the
+ * caller grows by at most 1 byte (relative -> absolute), the thunk can be
+ * dropped when nothing else enters or references it. Reported only when the
+ * total byte change over all callers is <= 0.
+ * Inputs: pins[], ph_ins_at[], labels[] (with ref counts).
+ * Outputs: hints via ph_emit().  Clobbers: static scratch arrays. */
+static void ph_thunks(void){
+    static int ncall[MAX_ROM], sumd[MAX_ROM];
+    static unsigned char rep[MAX_ROM];
+    static int lsites[MAX_LABELS];
+    memset(ncall,0,sizeof(ncall)); memset(sumd,0,sizeof(sumd));
+    memset(rep,0,sizeof(rep)); memset(lsites,0,sizeof(lsites));
+    for(int pass2=0;pass2<2;pass2++){
+        for(int i=0;i<npins;i++){
+            const PInst *a=&pins[i]; int t,is_call,is_un; Thunk th;
+            if(!ph_caller(a,&t,&is_call,&is_un)) continue;
+            if(t<0||t>=MAX_ROM||!ph_thunk(t,&th,0)) continue;
+            int newlen=(is_un&&th.zp)?2:3;
+            if(pass2==0){
+                ncall[t]++; sumd[t]+=newlen-a->len;
+                if(a->opnd){
+                    const char *s=a->opnd; char id[64]; int k=0;
+                    if(*s=='*') s++;
+                    if(isalpha((unsigned char)*s)||*s=='_'){
+                        while((isalnum((unsigned char)*s)||*s=='_')&&k<63) id[k++]=*s++;
+                        id[k]=0;
+                        int li=label_find_index(id); if(li>=0) lsites[li]++;
+                    }
+                }
+                continue;
+            }
+            /* reporting pass */
+            int ix=ph_ins_at[t], falls=0, blocked=0;
+            if(ix>0){ const PInst *pv=&pins[ix-1]; if(pv->addr+pv->len==t && ph_can_fall((unsigned char)ph_rb(pv->addr))) falls=1; }
+            for(int j=0;j<nlabels;j++) if(labels[j].value==t && labels[j].refs-lsites[j]>0) blocked=1;
+            int delta=sumd[t]-th.len;
+            if(falls||blocked||delta>0) continue;
+            unsigned char op=(unsigned char)ph_rb(a->addr);
+            char oldm[48], newm[48], lv[40]="", sv[48];
+            ph_mn(oldm,sizeof(oldm),op);
+            if(is_un&&th.zp) snprintf(newm,sizeof(newm),"%s",is_call?"ZBSR":"ZBRR");
+            else { const BrFam *f=ph_brfam(op); unsigned char nop=f?(unsigned char)(op+(f->rel?4:0)):(unsigned char)(is_call?0x3F:0x1F); ph_mn(newm,sizeof(newm),nop); }
+            if(th.levels>1) snprintf(lv,sizeof(lv),", via %d thunk levels",th.levels);
+            if(delta<0) snprintf(sv,sizeof(sv),"saves %d byte(s)",-delta); else snprintf(sv,sizeof(sv),"same size, faster");
+            ph_emit(PH_THUNK,a->line,rep[t]?0:-delta,
+                "%s %.100s goes via a thunk at line %d (%s%s) -- suggest %s %.100s; if all %d caller(s) are redirected and the thunk dropped: %s",
+                oldm,a->opnd?a->opnd:"?",pins[ix].line,th.desc,lv,newm,th.opnd,ncall[t],sv);
+            rep[t]=1;
+        }
+    }
+}
+
+static int ph_cmp(const void *x, const void *y){
+    const PWarn *a=(const PWarn*)x, *b=(const PWarn*)y;
+    if(a->line!=b->line) return a->line<b->line?-1:1;
+    return a->seq<b->seq?-1:(a->seq>b->seq);
+}
+
+/* peep_report: run all enabled peephole checks, print the hints (sorted by
+ * source line) and a one-line summary, then free the working storage.
+ * Inputs: pins[] from pass 2, rom[], labels[].  Outputs: stderr.
+ * Clobbers: heap, ph_ins_at[]. */
+static void peep_report(void){
+    if(ph_enabled && !errors && npins>0){
+        for(int i=0;i<MAX_ROM;i++) ph_ins_at[i]=-1;
+        for(int i=0;i<npins;i++) ph_ins_at[pins[i].addr]=i;
+        for(int i=0;i<npins;i++){
+            const PInst *a=&pins[i];
+            unsigned char op=(unsigned char)ph_rb(a->addr), b1=(unsigned char)ph_rb(a->addr+1);
+            const PInst *n=(i+1<npins && pins[i+1].addr==a->addr+a->len)?&pins[i+1]:NULL;
+            const BrFam *f=ph_brfam(op);
+            char m1[48], m2[48], m3[48];
+            int t=0, ind=0, isbr=ph_decode_target(a->addr,&t,&ind);
+            const char *ao=a->opnd?a->opnd:"?";
+            /* clear / test (R0 idioms) */
+            if((ph_enabled&PH_CLEAR) && ((op==0x04&&b1==0)||(op==0x44&&b1==0)))
+                ph_emit(PH_CLEAR,a->line,1,"%s,R0 0 can be EORZ,R0 -- 1 byte shorter, same cycles and CC",op==0x04?"LODI":"ANDI");
+            if((ph_enabled&PH_TEST) && ((op==0x64&&b1==0)||(op==0x44&&b1==0xFF)||(op==0x24&&b1==0)))
+                ph_emit(PH_TEST,a->line,1,"%s,R0 %s only tests R0 -- use IORZ,R0 (1 byte shorter, same CC)",
+                    op==0x64?"IORI":(op==0x44?"ANDI":"EORI"),op==0x44?"$FF":"0");
+            /* zpage */
+            if((ph_enabled&PH_ZPAGE) && (op==0x1F||op==0x3F)){
+                int T=((b1&0x7F)<<8)|ph_rb(a->addr+2), off=T-(a->addr+2);
+                int zp=(T<=0x3F)||(T>=0x1FC0&&T<=0x1FFF);
+                if(zp && !(off>=-64&&off<=63))
+                    ph_emit(PH_ZPAGE,a->line,1,"%s %s targets zero page -- use %s %s (1 byte shorter, same cycles)",
+                        op==0x1F?"BCTA,UN":"BSTA,UN",ao,op==0x1F?"ZBRR":"ZBSR",ao);
+            }
+            /* next */
+            if((ph_enabled&PH_NEXT) && f && !f->call && (!f->reg||f->base==0x58||f->base==0x5C) && isbr && !ind && t==a->addr+a->len){
+                ph_mn(m1,sizeof(m1),op);
+                ph_emit(PH_NEXT,a->line,a->len,"%s %s branches to the next instruction -- no-op, delete it (%d byte(s))",m1,ao,a->len);
+            }
+            /* psw merge */
+            if((ph_enabled&PH_PSW) && op>=0x74 && op<=0x77 && n && ph_rb(n->addr)==op && !n->lab_before){
+                static const char *pn[4]={"CPSU","CPSL","PPSU","PPSL"};
+                int b2=ph_rb(n->addr+1);
+                ph_emit(PH_PSW,a->line,2,"%s $%02X followed by %s $%02X (line %d) -- merge into one %s $%02X (saves 2 bytes)",
+                    pn[op-0x74],b1,pn[op-0x74],b2,n->line,pn[op-0x74],b1|b2);
+            }
+            /* retcc: conditional/unconditional branch to a bare RETC,UN */
+            if((ph_enabled&PH_RETCC) && f && !f->call && !f->reg && (f->base==0x18||f->base==0x1C) && isbr && !ind
+               && t>=0 && t<MAX_ROM && ph_ins_at[t]>=0 && ph_rb(t)==0x17){
+                ph_mn(m1,sizeof(m1),op);
+                ph_emit(PH_RETCC,a->line,a->len-1,"%s %s branches to RETC,UN (line %d) -- use RETC,%s (saves %d byte(s))",
+                    m1,ao,pins[ph_ins_at[t]].line,ph_cc[op&3],a->len-1);
+            }
+            /* condtail: conditional call + RETC,UN -> conditional jump */
+            if((ph_enabled&PH_CONDTAIL) && f && f->call && (f->reg||(op&3)!=3) && n && ph_rb(n->addr)==0x17){
+                ph_mn(m1,sizeof(m1),op); ph_mn(m2,sizeof(m2),(unsigned char)(op-0x20));
+                ph_emit(PH_CONDTAIL,a->line,0,"%s %s followed by RETC,UN (line %d) -- tail call: suggest %s %s and keep the RETC,UN (saves a return-stack level and cycles, no size change)",
+                    m1,ao,n->line,m2,ao);
+            }
+            /* loop: SUBI/ADDI,Rn 1 + BCFx,EQ -> BDRx/BIRx */
+            if((ph_enabled&PH_LOOP) && ((op>=0xA4&&op<=0xA7)||(op>=0x84&&op<=0x87)) && b1==1 && n && !n->lab_before
+               && (ph_rb(n->addr)==0x98||ph_rb(n->addr)==0x9C)){
+                int dec=(op>=0xA4), rel=(ph_rb(n->addr)==0x98);
+                snprintf(m3,sizeof(m3),"%s",dec?(rel?"BDRR":"BDRA"):(rel?"BIRR":"BIRA"));
+                ph_mn(m2,sizeof(m2),(unsigned char)ph_rb(n->addr));
+                ph_emit(PH_LOOP,a->line,2,"%s,R%d 1 / %s %s (line %d) -> %s,R%d %s -- saves 2 bytes and is faster; %s leaves CC and carry unchanged, so use only if they are dead afterwards",
+                    dec?"SUBI":"ADDI",op&3,m2,n->opnd?n->opnd:"?",n->line,m3,op&3,n->opnd?n->opnd:"?",m3);
+            }
+            /* brn: test-register + BCFx,EQ -> BRNx,Rn */
+            if((ph_enabled&PH_BRN) && n && !n->lab_before && (ph_rb(n->addr)==0x98||ph_rb(n->addr)==0x9C)){
+                int rg=-1, sv=0, lodz=0; char lhs[40]="";
+                if(op>=0xE4&&op<=0xE7&&b1==0){ rg=op&3; sv=2; snprintf(lhs,sizeof(lhs),"COMI,R%d 0",rg); }
+                else if(op==0x60){ rg=0; sv=1; snprintf(lhs,sizeof(lhs),"IORZ,R0"); }
+                else if(op>=0x01&&op<=0x03){ rg=op&3; sv=1; lodz=1; snprintf(lhs,sizeof(lhs),"LODZ,R%d",rg); }
+                if(rg>=0){
+                    int rel=(ph_rb(n->addr)==0x98); const char *no=n->opnd?n->opnd:"?";
+                    ph_mn(m2,sizeof(m2),(unsigned char)ph_rb(n->addr));
+                    ph_emit(PH_BRN,a->line,sv,"%s / %s %s (line %d) -> %s,R%d %s -- saves %d byte(s); %s leaves CC unchanged%s",
+                        lhs,m2,no,n->line,rel?"BRNR":"BRNA",rg,no,sv,rel?"BRNR":"BRNA",
+                        lodz?" and R0 is no longer loaded":"");
+                }
+            }
+            /* dead: unlabelled instruction right after an unconditional transfer */
+            if((ph_enabled&PH_DEAD) && i>0 && !a->lab_before && ph_can_fall(op)){
+                const PInst *pv=&pins[i-1]; unsigned char po=(unsigned char)ph_rb(pv->addr);
+                if(pv->addr+pv->len==a->addr && !ph_can_fall(po)){
+                    ph_mn(m1,sizeof(m1),po);
+                    ph_emit(PH_DEAD,a->line,0,"unreachable code: follows %s (line %d) with no label before it",m1,pv->line);
+                }
+            }
+        }
+        if(ph_enabled&PH_THUNK) ph_thunks();
+        if(npw){
+            qsort(pw,(size_t)npw,sizeof(PWarn),ph_cmp);
+            for(int i=0;i<npw;i++) fprintf(stderr,"WARN line %d: %s\n",pw[i].line,pw[i].text);
+            fprintf(stderr,"Hints:");
+            for(int i=0;ph_names[i].name;i++) if(ph_count[i]) fprintf(stderr," %s=%d",ph_names[i].name,ph_count[i]);
+            fprintf(stderr," (about %d byte(s) potential saving)\n",ph_saved);
+        }
+    }
+    for(int i=0;i<npw;i++) free(pw[i].text);
+    for(int i=0;i<npins;i++) free(pins[i].opnd);
+    free(pw); free(pins); pw=NULL; pins=NULL; npw=npins=0;
+}
+
+/* ph_set_list: apply a --warn= / --no-warn= comma list.
+ * Inputs: list = comma-separated names (clear,test,zpage,next,psw,retcc,
+ *         condtail,loop,brn,thunk,dead; legacy label,rel,skip,tail; groups
+ *         advisory,peephole,all), on = 1 enable / 0 disable.
+ * Outputs: returns 1 ok, 0 on unknown name (message printed).
+ * Clobbers: ph_enabled, warn_* flags. */
+static int ph_set_list(const char *list, int on){
+    char tmp[256]; snprintf(tmp,sizeof(tmp),"%s",list);
+    for(char *tok=strtok(tmp,",");tok;tok=strtok(NULL,",")){
+        int bits=0, ok=1;
+        if(!strcmp(tok,"all")){ bits=PH_ALL; warn_inline_label=warn_local_abs_branch=warn_branch_skip=warn_tail_call=on; }
+        else if(!strcmp(tok,"peephole")) bits=PH_ALL;
+        else if(!strcmp(tok,"advisory")) bits=PH_ADVISORY;
+        else if(!strcmp(tok,"label")) warn_inline_label=on;
+        else if(!strcmp(tok,"rel")) warn_local_abs_branch=on;
+        else if(!strcmp(tok,"skip")) warn_branch_skip=on;
+        else if(!strcmp(tok,"tail")) warn_tail_call=on;
+        else {
+            ok=0;
+            for(int i=0;ph_names[i].name;i++) if(!strcmp(tok,ph_names[i].name)){ bits=ph_names[i].bit; ok=1; }
+        }
+        if(!ok){ fprintf(stderr,"ERROR: unknown warning name '%s'\n",tok); return 0; }
+        if(on) ph_enabled|=bits; else ph_enabled&=~bits;
+    }
+    return 1;
+}
+
 static void assemble_line(char *line){
+    cur_mn[0]=0; cur_op0[0]=0; cur_op1[0]=0; cur_nops=0; cur_lbl_defined=0;
     line_start_pc = pc;  /* BUG-ASM-13: fix '$' to this line's start address before anything emits */
     char buf[MAX_LINE]; strncpy(buf,line,MAX_LINE-1); buf[MAX_LINE-1]=0;
     upcase(buf);
@@ -794,6 +1313,7 @@ static void assemble_line(char *line){
             fprintf(stderr,"WARN line %d: label and instruction on same line\n",lineno);
         }
     }
+    cur_lbl_defined = (*lbl!=0);
     /* v1.4 FIX: allow "LABEL: OPCODE operands" on one line.
      * After defining the label, continue to assemble any instruction that follows.
      * A colon with nothing after it (label-only line) is handled by the !*p check. */
@@ -808,6 +1328,8 @@ static void assemble_line(char *line){
     char ops[64][128];
     for(int _i=0;_i<64;_i++) ops[_i][0]=0;
     int nops=split_ops(p,ops,64);
+    snprintf(cur_mn,sizeof(cur_mn),"%s",mn); snprintf(cur_op0,sizeof(cur_op0),"%.127s",ops[0]);
+    snprintf(cur_op1,sizeof(cur_op1),"%.127s",ops[1]); cur_nops=nops;
     tailcall_check(mn,ops,nops,*lbl!=0);
 
     if(strcmp(mn,"ORG")==0){
@@ -1316,17 +1838,45 @@ static void free_listing(void){
 static void print_usage(FILE *f){
     fprintf(f,"asm2650 v%s - Signetics 2650 cross-assembler\n", ASM2650_VERSION);
     fprintf(f,"Usage: asm2650 [options] source.asm [output.hex]\n");
-    fprintf(f,"Options:\n");
+    fprintf(f,"  Hex goes to stdout unless output.hex is given; <source>.LST is written beside the source.\n");
+    fprintf(f,"  Exit status: 0 = assembled, 1 = errors (hex/binary output withheld).\n");
+    fprintf(f,"\nOutput options:\n");
     fprintf(f,"  -s                             Dump symbol table to stderr\n");
-    fprintf(f,"  --binary                       Write flat 32768-byte binary image\n");
-    fprintf(f,"  -o <file>                      Write binary image to <file>\n");
-    fprintf(f,"  -r $HHHH-$HHHH                 Limit binary output address range (inclusive)\n");
+    fprintf(f,"  --binary                       Write flat 32768-byte binary image to stdout\n");
+    fprintf(f,"  -o <file>                      Write binary image to <file> (implies --binary)\n");
+    fprintf(f,"  -r $HHHH-$HHHH                 Limit binary output address range (inclusive; needs --binary/-o)\n");
     fprintf(f,"  -NoList                        Suppress default .LST listing sidecar\n");
-    fprintf(f,"  --no-warn-inline-label         Disable warning for LABEL: INSTR on same line\n");
-    fprintf(f,"  --no-warn-local-branch         Disable warning when absolute branch could be relative\n");
-    fprintf(f,"  --no-warn-tail-call            Disable warning for BSTx,UN/ZBSR/BSXA followed by RETC,UN (use jump)\n");
-    fprintf(f,"  --no-warn-branch-skip          Disable warning for BCTR/BCTA-skips-BCTx,UN idiom (see BCFR/BCFA)\n");
     fprintf(f,"  -h, --help                     Show this help and exit\n");
+    fprintf(f,"\nWarning options:\n");
+    fprintf(f,"  --warn=LIST                    Enable named warnings/hints (comma-separated names, see below)\n");
+    fprintf(f,"  --no-warn=LIST                 Disable named warnings/hints\n");
+    fprintf(f,"  --no-warn-inline-label         Same as --no-warn=label\n");
+    fprintf(f,"  --no-warn-local-branch         Same as --no-warn=rel\n");
+    fprintf(f,"  --no-warn-tail-call            Same as --no-warn=tail\n");
+    fprintf(f,"  --no-warn-branch-skip          Same as --no-warn=skip\n");
+    fprintf(f,"\nWarning names (all on by default except the advisory hints):\n");
+    fprintf(f,"  label     LABEL: INSTR on one line\n");
+    fprintf(f,"  rel       absolute branch that could be relative\n");
+    fprintf(f,"  skip      BCTR/BCTA,cc skipping an unconditional branch (use BCF)\n");
+    fprintf(f,"  tail      BSTx,UN / ZBSR / BSXA followed by RETC,UN (use BCTx / ZBRR / BXA)\n");
+    fprintf(f,"Peephole hints (default on):\n");
+    fprintf(f,"  clear     LODI,R0 0 / ANDI,R0 0 -> EORZ,R0\n");
+    fprintf(f,"  test      IORI,R0 0 / ANDI,R0 $FF / EORI,R0 0 -> IORZ,R0\n");
+    fprintf(f,"  zpage     BCTA,UN / BSTA,UN to zero page -> ZBRR / ZBSR\n");
+    fprintf(f,"  next      branch to the next instruction -> delete\n");
+    fprintf(f,"  psw       CPSL a / CPSL b (also CPSU, PPSL, PPSU) -> one instruction\n");
+    fprintf(f,"  retcc     BCTx,cc to a RETC,UN -> RETC,cc\n");
+    fprintf(f,"Advisory hints (default off; may need CC/carry/R0 to be dead):\n");
+    fprintf(f,"  condtail  conditional call + RETC,UN -> conditional jump, RETC,UN kept\n");
+    fprintf(f,"  loop      SUBI/ADDI,Rn 1 + BCFx,EQ -> BDRx/BIRx,Rn\n");
+    fprintf(f,"  brn       COMI,Rn 0 / LODZ,Rn / IORZ,R0 + BCFx,EQ -> BRNx,Rn\n");
+    fprintf(f,"  thunk     branch/call to a jump thunk -> branch/call the final target\n");
+    fprintf(f,"  dead      unlabelled code after an unconditional transfer\n");
+    fprintf(f,"Groups: advisory (the 5 advisory hints), peephole (all 11 hints), all (everything)\n");
+    fprintf(f,"\nExamples:\n");
+    fprintf(f,"  asm2650 prog.asm prog.hex\n");
+    fprintf(f,"  asm2650 --warn=advisory prog.asm\n");
+    fprintf(f,"  asm2650 --warn=all --no-warn=dead prog.asm\n");
 }
 
 static int parse_range(const char *s, int *lo, int *hi){
@@ -1364,6 +1914,8 @@ int main(int argc,char *argv[]){
         else if(!strcmp(argv[i],"--no-warn-local-branch")) warn_local_abs_branch=0;
         else if(!strcmp(argv[i],"--no-warn-branch-skip")) warn_branch_skip=0;
         else if(!strcmp(argv[i],"--no-warn-tail-call")) warn_tail_call=0;
+        else if(!strncmp(argv[i],"--warn=",7)){ if(!ph_set_list(argv[i]+7,1)) return 1; }
+        else if(!strncmp(argv[i],"--no-warn=",10)){ if(!ph_set_list(argv[i]+10,0)) return 1; }
         else if(!strcmp(argv[i],"-h") || !strcmp(argv[i],"--help")){
             print_usage(stdout);
             return 0;
@@ -1419,10 +1971,12 @@ int main(int argc,char *argv[]){
             }
             if(pass==2 && list_enabled) list_begin_line();
             assemble_line(line);
+            if(pass==2) peep_line_done();
             if(pass==2 && list_enabled) list_add_line(lineno,line);
         }
         fclose(f);
     }
+    peep_report();
     fprintf(stderr,"Pass complete: %d error(s), %d label(s)\n",errors,nlabels);
     if(dump_syms){ for(int i=0;i<nlabels;i++) fprintf(stderr,"  %-20s $%04X\n",labels[i].name,labels[i].value); }
     if(rom_hi>=rom_lo) fprintf(stderr,"Code: $%04X-$%04X (%d bytes)\n",rom_lo,rom_hi,rom_hi-rom_lo+1);
