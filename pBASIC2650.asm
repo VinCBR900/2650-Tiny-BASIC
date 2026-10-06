@@ -744,7 +744,7 @@ DR_HDR:
 ; Out: CC=GT if line stored/deleted; CC=EQ if not a numbered line
 ; Clobbers: R0, EXPH, EXPL, LNUMH, LNUML, TMPH, TMPL, CURH, CURL
 TRY_STORE_LINE:
-        ZBSR *VDIGIT_CHECK                ; R0 = char-'0'; ported from uBASIC (was inline here)
+        ZBSR *VDIGIT_CHECK                ; R0 = char-'0'
         BCFR,GT TSL_NUM                  ; unsigned range test: 0-9 ("not greater" - the inverted sense
                                          ; needs no "not equal" condition, and no db $EC skip either)
 TSL_NO:
@@ -1098,11 +1098,7 @@ PF_LOADVAR:
         STRA,R0 EXPH
         LODA,R0 VARS+1,R1               ; lo byte
         STRA,R0 EXPL
-        ZBSR *VINC_IP                  
-        RETC,UN
-
-PRO_NONE:
-        ZBRR *VJSYNERR 
+        ZBRR *VINC_IP                  
 
 PF_NUM:
 ;       drop through
@@ -1131,7 +1127,7 @@ PS16_UN:
 ;PARSE_U16:
         ZBSR *VCLR_EXP
         ZBSR *VDIGIT_CHECK
-        BCTR,GT PRO_NONE; surrogate for JSYNERR
+        BCTA,GT JSYNERR
 PU16_LP:
         ZBSR *VDIGIT_CHECK
         BCTR,GT PU16_RET                  ; unsigned range test: not 0-9 -> done
@@ -1366,8 +1362,7 @@ SUB_LOOP:
         ADDI,R1 1                ; Increment digit
         LODA,R0 EXPL
         SUBA,R0 P10_LO,R2        ; Subtract low byte
-        STRA,R0 SC0              ; Save tentatively (was TMPL - PRINT_S16
-                                 ; must not clobber TMP, see DO_LIST)
+        STRA,R0 SC0              ; Save tentatively 
         PPSL $08                 ; Set WC bit (enables Carry-In/Borrow)
         LODA,R0 EXPH
         SUBA,R0 P10_HI,R2        ; Subtract high byte
@@ -1456,7 +1451,6 @@ ET_RET:
         RETC,UN
 
 ; =============================================================================
-; =============================================================================
 ;  REG16_TO_REG16 -- generic 16-bit copy between any two IPH-relative
 ;  register pairs, addressed by a packed nibble pair (v0.34 code-golf:
 ;  replaces the single-parameter EXP16_TO_ET/TMP_TO_ET family below plus
@@ -1518,7 +1512,8 @@ DO_ERROR:
 DE_NL:
         BSTR,UN PRT_CRLF
         ZBSR *VCLR_RUNFLG                ; Not running
-        BCTA,UN REPL                     ; REPL resets RAS (PSU SP bits) on entry
+;        BCTA,UN REPL                     ; REPL resets RAS (PSU SP bits) on entry
+        ZBRR REPL
 
 ; =============================================================================
 ;  Shared character print routines -- $EC (COMA) byte-skip chain
@@ -1563,10 +1558,7 @@ DO_WR:
 ;  ADV_TMP_PAST_REC -- Advance TMPH:TMPL past the current stored line record
 ; Skips the 2-byte line-number header, scans forward until NUL (end of that
 ; record's text), then skips the NUL too - leaves TMPH:TMPL pointing at the
-; start of the NEXT record (or PE, if this was the last one). Factored out
-; of two identical inlined copies (TRY_STORE_LINE's TSL_MAS/TSL_MADONE,
-; FIND_INS's FI_AS/FI_ADV/FI_DONE) found via the same duplicate-byte-
-; sequence scan technique as CMP_TMP_PE.
+; start of the NEXT record (or PE, if this was the last one). 
 ; In:  TMPH:TMPL -> start of a stored record (its line-number hi byte)
 ; Out: TMPH:TMPL -> start of the next record
 ; Clobbers: R0
@@ -1576,8 +1568,7 @@ APR_LP:
         ZBSR *VINC_TMP
         LODA,R0 *TMPH
         BCFR,EQ APR_LP                  ; free zero-test: NUL ends the body
-        ZBSR *VINC_TMP                    ; skip the NUL itself
-        RETC,UN
+        ZBRR *VINC_TMP                    ; skip the NUL itself
 
 ; =============================================================================
 ;  TABLES 
@@ -1688,6 +1679,7 @@ VARS    RES 52      ; A-Z variables 2 bytes each
 ;  $22=DQ $3B=semicolon  in-string chars that need escaping.
 ; =============================================================================
 PROG:
+        DB 0,10,"PRINT ",$22,"-- Append/Delete Only Line Edits --",$22,$00
         DB 0,20,"PRINT ",$22,"-- pBASIC2650 Showcase --",$22,$00
         DB 0,30,"PRINT ",$22,"--- PRINT / WR ---",$22,$00                      ; 30  PRINT "--- PRINT / WR ---"
         DB 0,40,"WR 65",$00                                                    ; 40  WR 65
