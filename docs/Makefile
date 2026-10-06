@@ -6,6 +6,7 @@
 # `make -C docs serve`.
 #
 # History:
+#   v1.2 - Clumsily added miniBASIC2650 variant
 #   v1.1 - added pBASIC2650/4kBASIC2650 variants; added variants.json
 #          generation (gen-variants.sh) so CHIN/COUT are pulled from each
 #          variant's .LST automatically instead of being hand-edited into
@@ -23,11 +24,12 @@ ASM2650 := ../tools/asm2650
 # are pulled automatically (see gen-variants.sh) instead of being grepped
 # and hand-edited into the page offline.
 # ---------------------------------------------------------------------------
-VARIANTS := uBASIC2650 pBASIC2650 4kBASIC2650
+VARIANTS := uBASIC2650 pBASIC2650 4kBASIC2650 miniBASIC2650
 
 uBASIC2650_SRC  := ../uBASIC2650.asm
 pBASIC2650_SRC  := ../pBASIC2650.asm
 4kBASIC2650_SRC := ../4kBASIC2650.asm
+miniBASIC2650_SRC := ../miniBASIC2650.asm
 
 HEX_OUTS      := $(patsubst %,assets/%.hex,$(VARIANTS))
 LST_OUTS      := $(patsubst %,../%.LST,$(VARIANTS))
