@@ -1532,9 +1532,6 @@ PF_LOADVAR:
         STRA,R0 EXPL
         RETC,UN
 
-PRO_NONE:
-        BCTA,UN JSYNERR 
-
 PF_NUM:
 ;       drop through
 ; =============================================================================
@@ -1565,7 +1562,7 @@ PS16_UN:
 ;PARSE_U16:
         ZBSR *VCLR_EXP
         ZBSR *VDIGIT_CHECK
-        BCTR,GT PRO_NONE; surrogate for JSYNERR
+        BCTA,GT JSYNERR
 PU16_LP:
         ZBSR *VDIGIT_CHECK
         BCTR,GT NEG_EXP                    ; not a digit -> end of number
