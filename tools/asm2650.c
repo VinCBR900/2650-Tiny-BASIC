@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.21
+ * Version: 1.22
  * Build:   gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * USAGE
@@ -35,7 +35,7 @@
  *
  * WARNINGS AND HINTS  (all go to stderr as "WARN line N: ..."; none change the
  * emitted code. Names are used by --warn= / --no-warn=; groups: advisory =
- * condtail,loop,brn,thunk,dead; peephole = the 11 hint names; all = everything.)
+ * condtail,loop,brn,thunk,dead; peephole = the 12 hint names; all = everything.)
  *   Always on (not switchable): register omitted (BXA/BSXA default to R3);
  *     ANDZ,R0 replaced with HALT; STRZ,R0 replaced with NOP; LODZ,R0 replaced
  *     with IORZ,R0.
@@ -53,6 +53,7 @@
  *     next      branch (not call) to the next instruction -> delete
  *     psw       CPSL a / CPSL b (also CPSU, PPSL, PPSU) -> one instruction
  *     retcc     BCTx,cc to a RETC,UN -> RETC,cc
+ *     skipbyte  BCTR/BCTA,UN over 1-2 bytes -> DB $E4 / DB $EC (skip byte)
  *   Advisory hints, default off (need knowledge the assembler does not have,
  *   e.g. that CC/carry/R0 are dead, or that a thunk has no outside users):
  *     condtail  conditional call + RETC,UN -> conditional jump (RETC,UN kept)
@@ -62,6 +63,7 @@
  *     dead      unlabelled code after an unconditional transfer
  *
  * VERSION HISTORY  (summary; the full change notes follow, newest first)
+ *   1.22  New default-on hint "skipbyte": BCTx,UN over 1-2 bytes -> DB $E4 / $EC.
  *   1.21  Peephole hints (clear, test, zpage, next, psw, retcc, condtail, loop,
  *         brn, thunk, dead); --warn= / --no-warn=; label reference counts;
  *         header and help text brought up to date.
@@ -104,6 +106,35 @@
  *            grouping. Division by zero is an error. Trailing text the
  *            grammar can't parse is a hard error (was silently dropped
  *            pre-1.17 — BUG-ASM-15).
+ *
+ * Changes v1.21 -> v1.22:
+ *   Added hint "skipbyte" (default on; --no-warn=skipbyte to disable): an
+ *   unconditional BCTR,UN / BCTA,UN that jumps over exactly 1 or 2 bytes (whole
+ *   instructions, at least one of them labelled, i.e. entered from elsewhere)
+ *   can be replaced by a one-byte skip opcode that swallows those bytes as its
+ *   operand, saving 1 byte (BCTR,UN) or 2 bytes (BCTA,UN):
+ *       BCTR,UN SKIP / LODI,R0 4 / SKIP:   ->   DB $EC / LODI,R0 4 / SKIP:
+ *       BCTR,UN SKIP / EORZ,R0   / SKIP:   ->   DB $E4 / EORZ,R0   / SKIP:
+ *   $EC is COMA,R0 absolute (consumes 2 bytes, reads one memory byte, sets CC);
+ *   $E4 is COMI,R0 immediate (consumes 1 byte, sets CC only). All other
+ *   registers, PSW bits and memory are unchanged; entering the skipped
+ *   instruction directly still executes it normally. Verified in pipbug_wrap.
+ *   Reported only when it is safe by construction:
+ *     - CC is provably overwritten before it can be read (the instructions at
+ *       the skip target are scanned: LOD/ALU/COM/TMI/TPSx set CC, NOP/STR/
+ *       rotate/PSU ops are transparent; any conditional or unknown instruction
+ *       suppresses the hint), because the skip opcode clobbers CC where the
+ *       branch left it alone;
+ *     - for the 2-byte form the first skipped byte must have bits 6:5 clear
+ *       ($00-$1F, $80-$9F). As the high address byte of COMA,R0 those bits mean
+ *       auto-increment/decrement/index with R0 as the index register, which
+ *       changes R0 (seen in the simulator for EORI,R0 $24, ANDI,R0 $44,
+ *       SUBI,R0 $A4 and ZBSR $BB). Bit 7 only makes the read indirect;
+ *     - the skipped bytes are labelled somewhere (otherwise the code is dead
+ *       and should simply be deleted - see the optional "dead" hint).
+ *   The message shows the address COMA would read, so memory-mapped I/O with
+ *   read side effects can be ruled out by eye. Cost: the 2-byte form takes
+ *   4 cycles against 3 for BCTR,UN; the 1-byte $E4 form takes 2 (faster).
  *
  * Changes v1.20 -> v1.21:
  *   Added peephole / optimisation hints. Every instruction is recorded in
@@ -412,7 +443,7 @@
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.21"
+#define ASM2650_VERSION "1.22"
 
 typedef struct { char name[64]; int value; int referenced; int def_line; int refs; } Label;
 static Label labels[MAX_LABELS];
@@ -895,18 +926,19 @@ static void tailcall_check(const char *mn, char ops[][128], int nops, int has_la
  *   brn       COMI,Rn 0 / LODZ,Rn / IORZ,R0 + BCFx,EQ -> BRNx,Rn       (advisory)
  *   thunk     branch/call to a jump thunk with few callers -> go direct (advisory)
  *   dead      unlabelled code after an unconditional transfer           (advisory)
+ *   skipbyte  BCTR/BCTA,UN over 1-2 bytes -> DB $E4 / DB $EC skip byte  (default on)
  * ======================================================================== */
 enum { PH_CLEAR=1, PH_TEST=2, PH_ZPAGE=4, PH_NEXT=8, PH_PSW=16, PH_RETCC=32,
-       PH_CONDTAIL=64, PH_LOOP=128, PH_BRN=256, PH_THUNK=512, PH_DEAD=1024 };
-#define PH_DEFAULT  (PH_CLEAR|PH_TEST|PH_ZPAGE|PH_NEXT|PH_PSW|PH_RETCC)
+       PH_CONDTAIL=64, PH_LOOP=128, PH_BRN=256, PH_THUNK=512, PH_DEAD=1024, PH_SKIPBYTE=2048 };
+#define PH_DEFAULT  (PH_CLEAR|PH_TEST|PH_ZPAGE|PH_NEXT|PH_PSW|PH_RETCC|PH_SKIPBYTE)
 #define PH_ADVISORY (PH_CONDTAIL|PH_LOOP|PH_BRN|PH_THUNK|PH_DEAD)
 #define PH_ALL      (PH_DEFAULT|PH_ADVISORY)
 static int ph_enabled = PH_DEFAULT;
 static const struct { const char *name; int bit; } ph_names[] = {
     {"clear",PH_CLEAR},{"test",PH_TEST},{"zpage",PH_ZPAGE},{"next",PH_NEXT},{"psw",PH_PSW},
     {"retcc",PH_RETCC},{"condtail",PH_CONDTAIL},{"loop",PH_LOOP},{"brn",PH_BRN},
-    {"thunk",PH_THUNK},{"dead",PH_DEAD},{NULL,0}};
-static int ph_count[11];
+    {"thunk",PH_THUNK},{"dead",PH_DEAD},{"skipbyte",PH_SKIPBYTE},{NULL,0}};
+static int ph_count[12];
 static int ph_saved = 0;
 
 typedef struct { int addr, len, line, lab_before; char *opnd; } PInst;
@@ -1041,6 +1073,44 @@ static void peep_line_done(void){
     unsigned char op=(unsigned char)ph_rb(r->addr);
     if(ph_brfam(op)) r->opnd=ph_split_addr(cur_op0,cur_op1,cur_nops);
     else if(op==0x9B||op==0xBB) r->opnd=xstrdup(cur_op0);
+}
+
+/* ph_cc_dead_from: is CC provably overwritten before anything can read it,
+ * scanning forward from instruction index ix? Behaviour below was verified
+ * in pipbug_wrap (baseline CC=GT, R0=$80).
+ *   Setters  : LOD/EOR/AND/IOR/ADD/SUB/COM in all forms, TMI, TPSU, TPSL,
+ *              STRZ,R1-R3, and CPSL/PPSL whose mask has both CC bits ($C0).
+ *   Neutral  : NOP, STRR, STRA, RRL, RRR, CPSU/PPSU, CPSL/PPSL not touching
+ *              the CC bits (keep scanning).
+ *   HALT     : ends the scan as dead.
+ *   Anything else (conditional branch/call/return, unconditional transfer,
+ *   SPSL/SPSU, DAR, port I/O, a gap between instructions, more than 8
+ *   instructions) is treated as "CC may be read".
+ * Inputs: ix = index into pins[].
+ * Outputs: source line of the instruction that overwrites CC (or of HALT);
+ *          0 if CC may be live.  Clobbers: none. */
+static int ph_cc_dead_from(int ix){
+    for(int k=0; k<8 && ix<npins; k++, ix++){
+        const PInst *r=&pins[ix];
+        if(k>0 && r->addr!=pins[ix-1].addr+pins[ix-1].len) return 0;
+        unsigned char op=(unsigned char)ph_rb(r->addr), m=(unsigned char)ph_rb(r->addr+1);
+        unsigned char hi=(unsigned char)(op&0xF0);
+        if(op==0x40) return r->line;                                        /* HALT */
+        if(hi==0x00||hi==0x20||hi==0x40||hi==0x60||hi==0x80||hi==0xA0||hi==0xE0)
+            return r->line;                                                 /* LOD EOR AND IOR ADD SUB COM */
+        if((op>=0xF4&&op<=0xF7)||op==0xB4||op==0xB5) return r->line;       /* TMI, TPSU, TPSL */
+        if(op>=0xC1&&op<=0xC3) return r->line;                              /* STRZ,R1-R3 */
+        if(op==0xC0||(op>=0xC8&&op<=0xCF)) continue;                        /* NOP, STRR, STRA */
+        if((op>=0xD0&&op<=0xD3)||(op>=0x50&&op<=0x53)) continue;            /* RRL, RRR */
+        if(op==0x74||op==0x76) continue;                                    /* CPSU, PPSU */
+        if(op==0x75||op==0x77){                                             /* CPSL, PPSL */
+            if((m&0xC0)==0xC0) return r->line;
+            if((m&0xC0)==0) continue;
+            return 0;
+        }
+        return 0;
+    }
+    return 0;
 }
 
 typedef struct { int zp, len, levels; const char *opnd; char desc[220]; } Thunk;
@@ -1226,6 +1296,36 @@ static void peep_report(void){
                     ph_emit(PH_BRN,a->line,sv,"%s / %s %s (line %d) -> %s,R%d %s -- saves %d byte(s); %s leaves CC unchanged%s",
                         lhs,m2,no,n->line,rel?"BRNR":"BRNA",rg,no,sv,rel?"BRNR":"BRNA",
                         lodz?" and R0 is no longer loaded":"");
+                }
+            }
+            /* skipbyte: BCTR/BCTA,UN over 1-2 bytes -> DB $E4 / DB $EC (v1.22) */
+            if((ph_enabled&PH_SKIPBYTE) && (op==0x1B||op==0x1F) && isbr && !ind){
+                int nb=t-(a->addr+a->len);
+                if(nb==1||nb==2){
+                    int pos=a->addr+a->len, j=i+1, lab=0, tiled=1;
+                    while(pos<t){
+                        if(j>=npins||pins[j].addr!=pos){ tiled=0; break; }
+                        if(pins[j].lab_before) lab=1;
+                        pos+=pins[j].len; j++;
+                    }
+                    int s1=ph_rb(a->addr+a->len), s2=ph_rb(a->addr+a->len+1);
+                    /* a 2-byte skip is clean only if the first skipped byte, seen as the
+                     * high address byte of COMA,R0, has no index-control bits (bits 6:5) */
+                    int clean=(nb==1)||(((s1>>5)&3)==0);
+                    if(tiled && pos==t && j<npins && pins[j].addr==t && lab && clean){
+                        int ccl=ph_cc_dead_from(j);
+                        if(ccl){
+                            ph_mn(m1,sizeof(m1),op);
+                            if(nb==1)
+                                ph_emit(PH_SKIPBYTE,a->line,a->len-1,"%s %s skips 1 byte ($%02X, line %d) -- use DB $E4 (COMI,R0: sets CC only) instead of the branch, saves %d byte(s); CC is overwritten at line %d",
+                                    m1,ao,s1,pins[i+1].line,a->len-1,ccl);
+                            else {
+                                int ea=(a->addr&0x6000)|((s1&0x1F)<<8)|s2;
+                                ph_emit(PH_SKIPBYTE,a->line,a->len-1,"%s %s skips 2 bytes ($%02X $%02X, line %d) -- use DB $EC (COMA,R0: sets CC, reads %s$%04X) instead of the branch, saves %d byte(s); CC is overwritten at line %d",
+                                    m1,ao,s1,s2,pins[i+1].line,(s1&0x80)?"pointer at ":"",ea,a->len-1,ccl);
+                            }
+                        }
+                    }
                 }
             }
             /* dead: unlabelled instruction right after an unconditional transfer */
@@ -1866,13 +1966,14 @@ static void print_usage(FILE *f){
     fprintf(f,"  next      branch to the next instruction -> delete\n");
     fprintf(f,"  psw       CPSL a / CPSL b (also CPSU, PPSL, PPSU) -> one instruction\n");
     fprintf(f,"  retcc     BCTx,cc to a RETC,UN -> RETC,cc\n");
+    fprintf(f,"  skipbyte  BCTR/BCTA,UN over 1-2 bytes -> DB $E4 / DB $EC skip byte (CC must be dead)\n");
     fprintf(f,"Advisory hints (default off; may need CC/carry/R0 to be dead):\n");
     fprintf(f,"  condtail  conditional call + RETC,UN -> conditional jump, RETC,UN kept\n");
     fprintf(f,"  loop      SUBI/ADDI,Rn 1 + BCFx,EQ -> BDRx/BIRx,Rn\n");
     fprintf(f,"  brn       COMI,Rn 0 / LODZ,Rn / IORZ,R0 + BCFx,EQ -> BRNx,Rn\n");
     fprintf(f,"  thunk     branch/call to a jump thunk -> branch/call the final target\n");
     fprintf(f,"  dead      unlabelled code after an unconditional transfer\n");
-    fprintf(f,"Groups: advisory (the 5 advisory hints), peephole (all 11 hints), all (everything)\n");
+    fprintf(f,"Groups: advisory (the 5 advisory hints), peephole (all 12 hints), all (everything)\n");
     fprintf(f,"\nExamples:\n");
     fprintf(f,"  asm2650 prog.asm prog.hex\n");
     fprintf(f,"  asm2650 --warn=advisory prog.asm\n");
