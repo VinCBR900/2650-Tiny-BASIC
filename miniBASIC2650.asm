@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC2650 v3.4  --  Tiny BASIC with 32-bit MBF4 floating point and SIN/COS for the Signetics 2650
+; miniBASIC2650 v3.6  --  Tiny BASIC with 32-bit MBF4 floating point, SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP and the ^ operator for the Signetics 2650
 ; (derived from uBASIC2650 v2.11; archive/uBASIC2650_v2.11_orig.asm is the integer original; RND/PRE_CHIN ported from uBASIC2650 v2.12)
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -7,7 +7,7 @@
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : 4 KB target, $0000 upward (ROMEND $0D72 = 3442 bytes - see ROMEND; the FP library is the block marked MBF4 near the end)
+;   ROM    : 4 KB target, $0000 upward: ROMEND $1000 = 4096 bytes exactly (v3.6; code ends at CODEND $0F4B, 25 bytes free below the pinned stream tables)
 ;   RAM    : ~400 bytes of variables and stacks from $1000 (FA/FB and the FP work area included), program store PROG..$1FFF above
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
@@ -24,15 +24,23 @@
 ;
 ; PRINT items: "literal", CHR$(n), TAB(n), or an expression; separate with ';'.
 ;
-; Arithmetic: + - * /  (unary -).  True division: 7/2 is 3.5; X/0 is error ?Z; overflow (> about 1.7E38) is ?O; no wraparound.
-; Precedence: BODMAS-lite * / binds before + -, which binds before relops (= < >).
+; Arithmetic: + - * / ^  (unary -).  True division: 7/2 is 3.5; X/0 is error ?Z; overflow (> about 1.7E38) is ?O; no wraparound.
+; Precedence: BODMAS-lite ^ binds before * /, which bind before + -, which bind before relops (= < >).
+; Power   : x^y (v3.6).  RIGHT associative and tighter than * / and unary minus: 2^3^2 is 2^(3^2) = 512, -2^2 is -(2^2) = -4, 2*3^2 is 18.
+;      y an integer 0..255 (any x, also zero or negative): exact repeated multiplication, x^0 = 1.  Any other y: EXP(y*LN(x)), x > 0 only.
+;      The right operand is ONE atom (number, variable, function, parenthesis, or a - sign): write 2^(N+1) and 2^-1; 2^N+1 is (2^N)+1.
 ; Relops: `=`  `<`  `>`  prefix with ! to invert: `!=`, `!<`, `!>` (<= is !>, >= is !<).
 ; RND: niladic: the 16-bit signed pseudorandom integer (as in uBASIC2650 v2.12) converted to a float, no parenthesis/arg.  A value in
 ;      0 < x <= 1 is ABS(RND)/32768 (see the showcase, lines 77-79).
 ; ABS(expr): absolute value function - expressions allowed
 ; SIN(expr) COS(expr): sine and cosine, the argument in RADIANS (any expression, as for ABS).  Accurate to about 5E-7 for |x| <= 2*PI;
 ;      the error grows with |x| (see KNOWN LIMITATIONS) and |x| above about 51471 gives ?R.  There is no PI constant: write 3.14159265, or
-;      K=0.0174532925 for degrees as the showcase does.  Only these two functions so far (Stage 5 tier 1).
+;      K=0.0174532925 for degrees as the showcase does.
+; ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS.  ATAN, ASN, ACS, ASINE... are the same words (only the
+;      first two letters count).  |x| > 1 in ASIN/ACOS saturates to +-PI/2 (PI/2 - that for ACOS) as in the 65C02 build: no error.
+; SQR(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives 0 (as the 65C02 build): no error.  SQRT is the same word.
+; LN(expr) : natural logarithm; zero or a negative argument gives ?R.   EXP(expr): e^x; a result above about 1.7E38 gives ?O (x above 88.7),
+;      a result below 1E-38 gives 0, and |x| above about 22700 gives ?R.
 ;
 ; Numbers : MBF4 floating point: 24-bit mantissa (exact integers to 16777216), exponent range about 1E-38 .. 1.7E38.
 ;           Literals [digits][.digits] (no E notation).  PRINT shows 6 significant digits in plain notation
@@ -54,10 +62,38 @@
 ;     reduction, not the polynomial, which is good to 4E-8).  Measured maximum error against double precision (tools/fn_diff.py):
 ;     1.5E-7 in [0,PI/2], 4.4E-7 in [-2PI,2PI], 7E-6 up to |x|=100, 4E-4 up to 5000, 3.5E-3 up to 51000.  |x|*2/PI >= 32768 (|x| above about
 ;     51471) gives ?R.  COS(PI/2) prints a tiny non-zero number: the single-precision argument is not exactly PI/2.
-;   - Name matching: in an expression S+letter is SIN and C+letter is COS (R RND, A ABS); any further letters are eaten.  A variable directly
-;     followed by a letter (SA) reads as SIN.  In PRINT, CHR$ and TAB( are told from COS and TAN( by their THIRD letter (R / B).
+;   - Name matching (v3.5): FN_DSP keys on the FIRST TWO letters (AB ABS, SI SIN, CO COS, AT ATN, AS ASIN, AC ACOS, SQ SQR, LN, EX EXP; RND on R); the
+;     rest of the word is eaten.  Any other word (TAN, TA..., SA...) is read as a variable, as before; nothing else aliases a function any more.
+;     In PRINT, CHR$ and TAB( are told from COS and TAN( by their THIRD letter (R / B).
 ;   - The library rounds half away from zero.  Against mbf4.py with rounding RN_AWAY, * and / were bit-exact and + - differed by 1 ULP in 1 of
 ;     300 random pairs (tools/lib_bitexact.py); the library was not changed.
+;
+;
+; Power (v3.6):
+;   - x^y with y an integer 0..255 is y repeated multiplications (exact while the products are; slow only for large y); x may be negative or zero
+;     there (0^0 is 1, (-2)^3 is -8).  Any other exponent (fraction, negative, 256 or more) is EXP(y*LN(x)): x must be > 0, so a zero or negative
+;     base gives ?R (LN's error) and 2^-1 works while (-2)^-1 does not.  That path inherits LN and EXP's error, about 1E-6 relative for small
+;     results (10^0.3 prints 1.99526; 2^0.5 prints 1.41421), growing about 6E-8 * |y*LN(x)|.  10^2.5 prints 316.228; 10^-2 prints 0.01.
+;   - Overflow is ?O: 2^126 prints, 2^127 is ?O (the largest MBF4 is just under 2^127 = 1.7E38); 2^-200 gives 0 as EXP does for results below 1E-38.
+;   - The right operand is ONE atom: 2^N+1 is (2^N)+1, 2^-N is 2^(-N), 2^-N^2 is 2^(-(N^2)).  There is no ^ chain limit apart from the SW stack.
+;   - Cost in NESTING: every atom (a number, variable, function name, or open parenthesis) now pushes a 2-byte '^' continuation on the SW stack, so
+;     the expression nesting limit fell.  Measured with PRINT: ((...1...)) 14 -> 10 levels, 1+(1+(...)) 8 -> 6, ABS(ABS(...)) 11 -> 7 (a function
+;     name and its parenthesis are two atoms: 4 bytes a level).  Giving SWBASE 128 bytes and SWCAP_LIMIT 124 (two EQU/RES edits, 0 ROM bytes, 32
+;     bytes less program store) gives 14 / 9 / 9.  Not done by default: the program store is the scarcer RAM.
+;     The hardware call stack is unaffected: the ^ continuations are jumps, peak 7 (tests/depth.py over RUN, FOR, GOSUB, IF, nested functions, errors).
+;   - INT() is still not provided; FIX/INT/SGN were left out for lack of ROM (25 bytes free: FIX about 14 bytes, SGN about 29, a floor-INT about 38).
+;
+; Transcendental functions (v3.5), measured with tools/fn_diff.py (host model = the 2650 code bit for bit, against libm; the argument is the MBF4
+;   value actually used):
+;   - Maximum error: ATN 1.6E-7 (absolute), ASIN 2.2E-7, ACOS 3.7E-7, LN 1.4E-7 on [0.1,10] and 1.4E-6 over 1E-6..1E7 (values up to 16), SQR 6.7E-7
+;     relative, EXP 1.2E-6 relative for |x| <= 20 and 4.1E-6 for |x| <= 80 (about 6E-8*|x|: k*ln2 is formed in single precision).  LN(1) is exactly 0.
+;   - ASIN / ACOS use (1-x)(1+x), exact near |x| = 1.  SQR(x) = EXP(0.5*LN(x)) is not exact for perfect squares in the last digit only (SQR(0.0001)
+;     prints 0.00999999).
+;   - Function calls nest, but each pending call costs software-stack bytes: about 8 nested functions (SQR(SQR(SQR(...)))) end in ?8.
+;   - Hardware call depth: each function stage starts at the caller's depth (2 at the prompt, 3 in RUN) and adds 4; chains (SQR, ASIN, ACOS) are
+;     separate stages joined through the software stack, so the 8-deep return stack never nests: peak 7 (tools/depth_trig.py, 83 stage entries).
+;   - The library's FLT_ADD / FLT_SUB keep only one guard byte: with a large alignment shift the result can differ from correct rounding by 1 ULP
+;     (the host model then differs by 1 ULP in about 1 value of 1000: attributed step by step to one addition in an ATN Horner chain).
 ;
 ; UPPERCASE only apart from PRINT "String literals"
 ;
@@ -71,13 +107,13 @@
 ;   relop's right operand free of other relops (use a variable or separate IFs).
 ;
 ; OPERATOR PRECEDENCE
-;   BODMAS-lite, tightest first: * /   then   + -   then relops.
-;   So "1+2*3" is 7 and "1+2>2*2" is (1+2)>(2*2).  * / and + - are left-to-right
-;   among themselves; relops are right-to-left (see above).  Parentheses override.
+;   BODMAS-lite, tightest first: ^   then   * /   then   + -   then relops.
+;   So "1+2*3" is 7, "2*3^2" is 18 and "1+2>2*2" is (1+2)>(2*2).  * / and + - are left-to-right
+;   among themselves; ^ and relops are right-to-left (see above).  Parentheses override.
 ;
 ; PARENTHESIS NESTING
-;   Bounded by the SW stack (SWBASE, 64 bytes). Limit depends on expression
-;   complexity - operators within a level consume additional stack so a
+;   Bounded by the SW stack (SWBASE, 96 bytes). Limit depends on expression
+;   complexity - operators within a level consume additional stack (v3.6: and 2 bytes per atom for ^) so a
 ;   deeply-nested expression with many operators uses more stack per level.
 ;   ERR_EXPR ('?8') fires gracefully when the stack is full. Practical
 ;   ceiling for typical BASIC expressions is 5-6 levels of mixed
@@ -158,6 +194,66 @@
 ; =============================================================================
 ; VERSION HISTORY 
 ; =============================================================================
+;
+;                                                                                                        
+; v3.6 (Oct 2026) - FLT_* code golf to get the ROM back inside the 4 KB EPROM, then the ^ operator.  v3.5 was 4098 bytes ($1002, two over); ROMEND is now
+;   $1000 exactly (the RAM `ORG 4096` is back: the assembler fails the build if the ROM passes $1000), CODEND $0F4B, 25 bytes free below the tables.
+;   Banner 3.6.  No change to the language or the numerics apart from ^ (every library routine gives the same results: see Tested).
+;   - Golf, 147 bytes in all (ROMEND $1002 -> $0FAD = -85 in the first four steps; then the table pin and the vectors; CODEND $0F10 -> $0ED3 = -61):
+;       NORM_PACK  -25  an all-zero mantissa is detected by OR-ing FA+2, FA+3 and FDB (FA+1 = 0 test dropped): one branch, no shift-until-FER-runs-out
+;       FLT_PRINT  -44  one position loop (FPNRD / FPOL / FPDG / FPPC with R3 = P+64) for the integer and fraction digits, replacing two output stages
+;       DIGV        -7  the digit-value table is gone: FPDIG stores the digit, MUL_BY_TEN runs, DIGI is reloaded for the COMI,R1 7
+;       FLT_ADD     -9  FA = 0 / FB = 0 shortcuts as BCTR/RETC,EQ; swap test by COMA + BCFR,GT; one sign loop FASG/FASL indexes FSA by 0 / 5 (FSB = FSA+5)
+;       table pin   --  `ORG $0F64` before SCT..EXPT + CILN2 + SETP (140 bytes of tables, one page): the pad is CODEND..$0F64 and ROMEND stays $1000
+;       vectors    -39  page-zero vectors VLD_B_PTR (12 callers), VSETP (7), VFN_END (7) -- the table is now FULL at 31 entries; ST_Z / ST_T / LD_Z / LD_T
+;                       entry points (LODI,R2 slot / DB $EC / LODI,R2 slot) replace 15 `LODI,R2 xSLOT / BSTA ST_FA|LD_FB` pairs
+;       FLT_CMP, FLT_TO_INT tail (FTIG/FTIP), EXPCHK (CC from EORI, RETC,GT/LT), INC_FER (shared by FLT_ADD's FASM and NORM_PACK's NPRND)   -22 together
+;     Not changed: FLT_PARSE (a rewrite was tried and reverted at the owner's request; it keeps its measured accuracy, 954 of 1040 literals exact and 86 within
+;     1 ULP, tests/lit.py), the stream tables, the function stages.
+;   - ^ (+120 bytes, CODEND $0ED3 -> $0F4B): EXPR_ATOM pushes the continuation POW_LOOP after every atom (one site: the unary signs recurse into
+;     EXPR_ATOM); POW_LOOP looks for '^' and, if found, enters OPS_HIT_HI with TOK_CHARS row 21 (STMT_EXEC's scan length 21 -> 24, one new row), which
+;     pushes FA and parses ONE atom (that atom pushes POW_LOOP again: x^y^z = x^(y^z), and -2^2 = -4, 2^-2 = 0.25).  DO_POW (JMP_VEC target) takes the
+;     integer path for 0 <= y <= 255 (HCNT repeated FLT_MUL, exact) and otherwise chains LN_RET -> POW_2 (y * ln x) -> EXP_RET as function stages do
+;     (x <= 0 gives LN's ?R).  Cheaper than the stub-per-operator route: the operator rides the existing OPS_HIT frame and row dispatch.
+;   - Tested: build outputs against the v3.5 build: 61 programs, PRINT edge cases, the compare matrix, FLT_TO_INT range edges, an edge-arithmetic set and
+;     the direct-mode checks are bit-identical after each step; the ^ battery (89 cases: integers, zero, negatives, fractions, nesting, associativity,
+;     unary signs, errors, overflow/underflow) correct; hardware RAS peak 7, never 8, with ^ in RUN, FOR limits, GOSUB, IF, nested parentheses and
+;     functions, and the error exits (tests/depth.py, which understands CPSU $07 resetting the stack pointer); showcase output identical to v3.5 apart
+;     from the banner and the two new lines 578 / 580.
+;   - Found: ^ costs SW-stack bytes (2 per atom), which lowers the expression nesting limit (see KNOWN LIMITATIONS: 14 -> 10 parentheses, ABS( 11 -> 7).
+;     The 32-byte SWBASE option restores most of it for no ROM.  Free ROM left (25 bytes): FIX ~14, SGN ~29, a floor INT ~38 (estimates, not built).
+;   - Possible further gain, not made: the page-zero vector table is full, so an under-used vector (fewer than 3 callers) could be swapped for a
+;     better one; worth about 3-5 bytes.
+;
+; v3.5 (Oct 2026) - ATN ASIN ACOS SQR LN EXP (Stage 5 tier 2), on the golfed v3.4.  EXPERIMENT BUILD: the RAM `ORG 4096` is removed, so the ROM may grow
+;   past the 4 KB EPROM and RAM simply follows ROMEND.  ROMEND $1002 = 4098 bytes: TWO BYTES OVER $1000 BEFORE ANY GOLF (v3.4: $0D72 = 3442, +656).
+;   Boot FREE 1039 (RAM now starts at $1002; the showcase grew by 196 bytes), FREE after NEW 3694.  Banner 3.5.
+;   - Algorithms of the 65C02 build (ATAN with the |x| > 1 reduction and an odd polynomial, ASIN = ATAN(x/SQRT(1-x*x)), ACOS = PI/2 - ASIN,
+;     SQRT = EXP(0.5*LN), LN with E*ln2 + z*Q(z*z), EXP with k*ln2 and a Horner polynomial) with these 2650 differences: (1) 8-coefficient ATN, 4-coefficient LN
+;     and 8-coefficient EXP tables fitted for single precision (the 65C02 ones are good to about 2E-4); (2) LN reduces m into [1/sqrt2, sqrt2), so LN(1) is
+;     exactly 0 and four coefficients do; (3) ASIN uses (1-x)(1+x); (4) EXP checks k and scales the exponent with overflow (?O) / underflow (0) tests, where
+;     the 65C02 build wraps silently; (5) no PUSH_FLT_A: three 4-byte slots (TS = DIG + PSAVE) and the coefficient streams replace the hardware-stack parking.
+;   - CHAINS, not calls: the return stack is 8 deep, and SQR -> LN -> HORNER_ODD -> HORNER_EVAL -> FLT_MUL -> inner would nest 9.  Every function is a
+;     continuation stage that ends in PARSER_RET; SQR = LN stage, SQR_2 (halve), EXP stage; ASIN = ASN_RET, the SQR chain, ASN_2, ATN_BODY; ACOS = ASIN, ACS_2.
+;     A stage pushes the next one with PUSH_RET and jumps to the first.  Stages call the library directly and never through a helper that itself calls
+;     HORNER_ODD, so the peak stays at the caller's depth + 4 = 7.
+;   - DISPATCH: FN_DSP, a scanner over a table of two-letter keys with a parallel table of continuation addresses, replaces the compare chain and the DO_ABS /
+;     DO_SIN / DO_COS stubs (52 bytes of code + 37 of tables for nine names, 4 bytes per further name).  Measured on assembled prototypes against the extended
+;     chain: the table loses 29 bytes at 3 names, breaks even at 5, saves 27 at 7, 50 at 8, 70 at 10.  STMT_EXEC's TOK_CHARS / MD_SCAN was NOT reused: the
+;     scan compares R2 (live in an expression), its no-match exit is SE_NOTKW, EATWORD returns in the other register bank, and its rows are jump targets
+;     (a stub per function) not continuation addresses.  The key is the first two letters (all nine distinct), not the third: the second is the one
+;     PK_C2_NO_R2 already tested, and it accepts the spellings ASIN/ASN, ATN/ATAN, SQR/SQRT without extra rows.
+;   - Streams: SCT (sin), ONES + ATT + PIO2 (atn), LNT, EXPT: 140 bytes of 4-byte MBF4 entries that must share ONE page (SETP stores the page of SCT;
+;     LD_B_PTR adds 4 to the low byte).  tools/check_tables.py checks it; SETP and CILN2 sit after the tables to put the stream area in $0F65..$0FF0.
+;     tools/gen_coeffs.py v2.0 makes every entry.
+;   - RAM: QF, HPTR, HCNT and the new EK are four plain bytes (5 bytes with HPTR's two); TS grows from DIG (8) to DIG + PSAVE (12): XSLOT = PSAVE holds
+;     ASIN's x for the whole chain (LN, EXP and HORNER use ZSLOT / TSLOT only).
+;   - Branch forms: the block sits 300-800 bytes from its callers, so about 40 BSTR/BCTR became BSTA/BCTA; tools/fixbr.py settles them from the assembler's
+;     own hints.  Placing the helpers (ST_FA, LD_FB, LD_B_PTR, HORNER_*) between the stages would recover most of that: golf.
+;   - Showcase: lines 570-576 (4*ATN(1), ASIN(.5), SQR(2), LN(10), EXP(1), SIN(ASIN(.3))).  Mandelbrot plot unchanged.
+;   - Tested: 1040 values bit-exact against tools/fn_model.py (1039 exact, 1 within 1 ULP: the library FLT_ADD, see KNOWN LIMITATIONS); probes p1..p9 identical
+;     to v3.4; p11_fn (every function, domains, nesting, name collisions); p10_trigdepth (83 stage entries: base 3, +4, peak 7).
+;   - Found and fixed on the way: EXP's underflow test used a signed compare (exponent bytes >= $80 looked negative: SQR(0.25) gave 0).
 ;
 ; v3.4 (Oct 2026) - Merge of the two v3.3 branches: the code-golf pass (golf, ROMEND $0C7B = 3195) and SIN/COS with the extended showcase
 ;   (trig, ROMEND $0E99 = 3737; both derive from v3.2).  ROMEND $0D72 = 3442 bytes: SIN/COS costs +247 bytes on the golfed base (+268 on v3.2);
@@ -481,6 +577,12 @@ VFROM_INT_B:
         DW FLT_FROM_INT_B
 VFLT_MUL:
         DW FLT_MUL
+VLD_B_PTR:
+        DW LD_B_PTR
+VSETP:
+        DW SETP
+VFN_END:
+        DW FN_END
 
 ; =============================================================================
 ; MAIN - Program init
@@ -627,8 +729,8 @@ STMT_EXEC:
         LODI,R1 2                 ; peek 3rd char - disambiguates GOTO/GOSUB
         LODA,R0 *IPH,R1           ; and RUN/RETURN inside DO_GO/DO_RU
         STRA,R0 RXSAVE
-        LODI,R1 21                ; start scan at the first STATEMENT row -
-                                   ; skips the 7 operator rows (21 = 7*3) so
+        LODI,R1 24                ; start scan at the first STATEMENT row -
+                                   ; skips the 8 operator rows (24 = 8*3) so
                                    ; an operator-led line (e.g. "-A", 2nd
                                    ; char is a letter) can never match one
                                    ; and mis-dispatch into a DO_xxx handler;
@@ -1541,8 +1643,12 @@ EXPR_ATOM:
         BCTR,EQ EA_NEG
         COMI,R0 A'+'
         BCTR,EQ EA_POS
+        LODI,R0 >POW_LOOP               ; v3.6: every atom is followed by a '^' check (the unary signs recurse into EXPR_ATOM instead)
+        LODI,R1 <POW_LOOP
+        ZBSR *VPUSH_RET
+        ZBSR *VWSKIP                    ; R0 = char[0] again
         COMI,R0 A'('
-        BCTR,EQ EA_PAREN
+        BCTA,EQ EA_PAREN
 
         ; --- FUNCTION CHECK ---
         BSTA,UN PK_C2_NO_R2
@@ -1551,14 +1657,9 @@ EXPR_ATOM:
         ; 2nd char is a letter. Check char[0] for known functions
         ZBSR *VWSKIP            ; re-peek with R0 = char[0]
         COMI,R0 A'R'
-        BCTR,EQ DO_RND          ; Starts with 'R'? Try RND (absolute: DO_RND is out of BCTR range)
-        COMI,R0 A'A'
-        BCTR,EQ DO_ABS          ; Starts with 'A'? Try ABS
-        COMI,R0 A'S'
-        BCTA,EQ DO_SIN          ; v3.3: 'S'+letter = SIN
-        COMI,R0 A'C'
-        BCTA,EQ DO_COS          ; v3.3: 'C'+letter = COS  (CHR$ is a PRINT item and never reaches here)
-        ; drop through not a known function
+        BCTA,EQ DO_RND          ; Starts with 'R'? Try RND (absolute: DO_RND is out of BCTR range)
+        BCTR,UN FN_DSP          ; v3.5: every other function name is found by the table scanner below
+        ; not a known function: FN_DSP comes back here
 END_FUNCS:
         ZBSR *VWSKIP            ; re-peek with R0 = char[0]
         BSTA,UN PARSE_FACTOR    ; Parse as bare variable / factor
@@ -1572,11 +1673,60 @@ EX_PRA:
         ZBSR *VPUSH_RET
         ZBRR *VEXPR_ATOM                   ; parse the operand
 
-DO_ABS:
-        ZBSR *VEATWORD          ; consume "ABS"
-        LODI,R0 >ABS_RET
-        LODI,R1 <ABS_RET
-        BCTR,UN EX_PRA          ; push RET and jump to EXPR_ATOM
+; -----------------------------------------------------------------------------
+; FN_DSP -- table-driven dispatch of the unary functions (v3.5: replaces the compare chain and the DO_ABS / DO_SIN / DO_COS stubs)
+;   In     : R0 = first letter, IP -> the word, the second character is known to be a letter
+;   Out    : name found: the word is eaten, the function's continuation address is pushed (EX_PRA) and the operand is parsed;
+;            not found: jumps back to END_FUNCS (the word is a variable)
+;   Key    : the FIRST TWO letters (AB ABS, SI SIN, CO COS, AT ATN/ATAN, AS ASIN, AC ACOS, SQ SQR/SQRT, LN, EX EXP); the rest of the word is eaten
+;   Clobber: R0, R1, DIG, DIG+1 (parse time: free);  R2 / R3 untouched
+;   RAS    : 1 (EATWORD)
+FN_DSP:
+        STRA,R0 DIG             ; first letter
+        LODI,R1 1
+        LODA,R0 *IPH,R1
+        STRA,R0 DIG+1           ; second letter
+        LODI,R1 0
+FN_L:
+        LODA,R0 FNK,R1
+        BCTR,EQ END_FUNCS       ; end of table: not a function
+        COMA,R0 DIG
+        BCFR,EQ FN_N
+        LODA,R0 FNK+1,R1
+        COMA,R0 DIG+1
+        BCTR,EQ FN_HIT
+FN_N:
+        ADDI,R1 2
+        BCTR,UN FN_L
+FN_HIT:
+        ZBSR *VEATWORD          ; (R1 survives: EATWORD works in the other bank)
+        LODA,R0 FNA+1,R1
+        STRA,R0 DIG             ; continuation, low byte
+        LODA,R0 FNA,R1
+        STRZ,R1                 ; R1 = high byte
+        LODA,R0 DIG             ; R0 = low byte
+        BCTR,UN EX_PRA          ; push the continuation, parse the operand
+FNK:
+        DB A'A',A'B'
+        DB A'S',A'I'
+        DB A'C',A'O'
+        DB A'A',A'T'
+        DB A'A',A'S'
+        DB A'A',A'C'
+        DB A'S',A'Q'
+        DB A'L',A'N'
+        DB A'E',A'X'
+        DB 0
+FNA:
+        DB <ABS_RET,>ABS_RET
+        DB <SIN_RET,>SIN_RET
+        DB <COS_RET,>COS_RET
+        DB <ATN_RET,>ATN_RET
+        DB <ASN_RET,>ASN_RET
+        DB <ACS_RET,>ACS_RET
+        DB <SQR_RET,>SQR_RET
+        DB <LN_RET,>LN_RET
+        DB <EXP_RET,>EXP_RET
 
 ; =============================================================================
 ;  PUSH_LOLOOP / PUSH_HILOOP -- shared "push a continuation of LO_LOOP/
@@ -1768,7 +1918,8 @@ FIX_EXP:
 PRT_INT:
         PPSL PSW_RS
         BSTA,UN FLT_FROM_INT              ; FA = float(EXP)
-        BCTR,UN PRT_F2
+        ; BCTR,UN PRT_F2
+        DB $EC
 PRT_FA:
         PPSL PSW_RS
 PRT_F2:
@@ -1938,7 +2089,7 @@ DF_BODY:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "miniBASIC2650 3.4", CR, LF, NUL        
+        DB CR, LF, "miniBASIC2650 3.6", CR, LF, NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -1957,6 +2108,7 @@ TOK_CHARS:
         DB "=", <DO_EQOP,   >DO_EQOP      ; = (LO tier, offset 12; relop)
         DB "<", <DO_LTOP,   >DO_LTOP      ; < (LO tier, offset 15; relop)
         DB ">", <DO_GTOP,   >DO_GTOP      ; > (LO tier, offset 18; relop)
+        DB "^", <DO_POW,    >DO_POW       ; ^ (POW tier, offset 21; never scanned: POW_LOOP dispatches it directly)
 ;        DB "A", <DO_ASK,    >DO_ASK       ; ASK
         DB "E", <CLR_RUNFLG,>CLR_RUNFLG   ; END
         DB "G", <DO_GO,     >DO_GO        ; GOTO / GOSUB
@@ -2217,33 +2369,26 @@ FSW_L:
 ;   RAS    : 1  (FSWAP, SUB_A_B, ADD_A_B, SHR4/SHR_A; NORM_PACK is entered by jump and calls SHL_MANTISSA)
 FLT_ADD:
         LODA,R0 FA
-        BCFR,EQ FACKB
-        BCTR,UN FSWAP                    ; FA = 0: result = FB (swap; FB is not preserved by FLT_ADD anyway)
-; (FA = 0 above: result is FB.)
-FACKB:
+        BCTR,EQ FSWAP                    ; FA = 0: result = FB (swap; FB is not preserved by FLT_ADD anyway)
         LODA,R0 FB
         RETC,EQ
-; make ea >= eb: swap the operands when FA's exponent is the smaller
-        LODA,R0 FA
-        COMA,R0 FB
-        BCFR,LT FASG
+; make ea >= eb: swap the operands when FB's exponent (R0) is the larger
+        COMA,R0 FA
+        BCFR,GT FASG
         BSTR,UN FSWAP
 ; signs -> FSA / FSB, hidden bits explicit;  R3 = ea - eb;  FER = ea;  FDB = FBG = 0
 FASG:
-        LODA,R0 FA+1
+        LODI,R1 5                       ; R1 = 5: FB, then 0: FA
+FASL:
+        LODA,R0 FA+1,R1
         STRZ,R2
         ANDI,R0 $80
-        STRA,R0 FSA
+        STRA,R0 FSA,R1                  ; FSB = FSA+5 (RAM order)
         LODZ,R2
         IORI,R0 $80
-        STRA,R0 FA+1
-        LODA,R0 FB+1
-        STRZ,R2
-        ANDI,R0 $80
-        STRA,R0 FSB
-        LODZ,R2
-        IORI,R0 $80
-        STRA,R0 FB+1
+        STRA,R0 FA+1,R1
+        SUBI,R1 5
+        BCTR,EQ FASL
         LODA,R0 FA
         STRA,R0 FER
         SUBA,R0 FB
@@ -2299,10 +2444,7 @@ FASM:
         TPSL    $01
         BCTR,LT FANM2
         BSTA,UN SHR_A
-        LODA,R0 FER
-        ADDI,R0 1
-        STRA,R0 FER
-        BCTA,EQ FP_OVF
+        BSTA,UN INC_FER
 ; common exit: normalise, round, pack
 FANM2:
         BCTA,UN NORM_PACK
@@ -2379,24 +2521,18 @@ S_ERR:
 ;   Out    : in range : R0 = R0 xor $80 = result exponent 1..255, CC = GT/LT (non-zero)
 ;            underflow: R0 = 0, CC = EQ (the caller flushes the result to zero)
 ;            overflow : does not return, jumps to FP_OVF
-;   Clobber: R0, R2
+;   Clobber: R0, CC
 ;   RAS    : 0
 ;   Note   : C=1: R0 >= 128 overflows, otherwise e = R0+128.   C=0: R0 < 129 underflows, otherwise e = R0-128.
 EXPCHK:
-        STRZ,R2
         TPSL    $01
         BCFR,EQ EC_NC
-        LODZ,R2
-        BCTR,LT FP_OVF
-        BCTR,UN EC_OK
+        EORI,R0 $80                     ; C=1: ok when bit 7 of the result is set (CC = LT), else R0 was >= 128: overflow
+        RETC,LT
+        BCTR,UN FP_OVF
 EC_NC:
-        LODZ,R2
-        COMI,R0 129
-        BCTR,LT EC_UF
-EC_OK:
-        EORI,R0 $80
-        RETC,UN
-EC_UF:
+        EORI,R0 $80                     ; C=0: ok when 1..127 (CC = GT); 0 or bit 7 set: underflow
+        RETC,GT
         EORZ,R0
         RETC,UN
 ; -----------------------------------------------------------------------------
@@ -2516,20 +2652,10 @@ NPL:
         LODA,R0 FA+1
         BCTR,LT NPRND
         BCFR,EQ NPBT
-        LODA,R0 FER
-        COMI,R0 9
-        BCTR,LT NPZE
-        SUBI,R0 8
-        STRA,R0 FER
-        LODA,R0 FA+2
-        STRA,R0 FA+1
-        LODA,R0 FA+3
-        STRA,R0 FA+2
-        LODA,R0 FDB
-        STRA,R0 FA+3
-        EORZ,R0
-        STRA,R0 FDB
-        BCTR,UN NPL
+        LODA,R0 FA+2                    ; FA+1 = 0: an all-zero mantissa is zero at once (else it would shift until FER ran out)
+        IORA,R0 FA+3
+        IORA,R0 FDB
+        BCTR,EQ NPZE
 NPBT:
         ZBSR *VSHL_MANT
         LODA,R0 FER
@@ -2550,10 +2676,7 @@ NPRL:
         BDRR,R1 NPRL
         LODI,R0 $80
         STRA,R0 FA+1
-        LODA,R0 FER
-        ADDI,R0 1
-        STRA,R0 FER
-        BCTA,EQ FP_OVF
+        BSTR,UN INC_FER
 NPPK:
         LODA,R0 FER
         STRA,R0 FA
@@ -2561,6 +2684,18 @@ NPPK:
         ANDI,R0 $7F
         IORA,R0 FSA
         STRA,R0 FA+1
+        RETC,UN
+; -----------------------------------------------------------------------------
+; INC_FER -- FER = FER + 1; a wrap to 0 is an exponent overflow
+;   In     : FER
+;   Out    : FER + 1;  overflow does not return (FP_OVF)
+;   Clobber: R0, CC
+;   RAS    : 0
+INC_FER:
+        LODA,R0 FER
+        ADDI,R0 1
+        STRA,R0 FER
+        BCTA,EQ FP_OVF
         RETC,UN
 E_NP:
 
@@ -2695,8 +2830,7 @@ FLT_CMP:
         BCFR,LT FC_SAME
         LODA,R0 FA+1
         RETC,LT
-        LODI,R0 1
-        COMI,R0 0
+        LODI,R0 1                       ; LODI sets CC = GT
         RETC,UN
 FC_SAME:
         LODA,R0 FA+1
@@ -2726,7 +2860,8 @@ S_CONV:
 ;   RAS    : 0
 ;   Note   : FLT_ZERO loads R1 = 0, DB $EC skips the next LODI,R1 (skip-2 idiom), and the code runs on into F_ZERO.
 FLT_ZERO:
-        LODI,R1 0
+        ;LODI,R1 0
+        EORZ,R0
         DB      $EC
 ; -----------------------------------------------------------------------------
 ; FLT_ZERO_B -- FB = canonical zero 00 00 00 00 (the guard byte FBG is not written)
@@ -2856,14 +2991,12 @@ FTIS2:
         BDRR,R1 FTIS2
 FTIG:
         LODA,R0 FA+1
-        BCTR,LT FTIN
-        LODA,R0 T0
-        BCTA,LT FP_RANGE                ; positive magnitude >= 32768
-        RETC,UN
-FTIN:
-        BSTA,UN NEG16
-        LODA,R0 T0
-        BCFA,LT FP_RANGE                ; negative result must have bit 15 set (-32768 is legal)
+        BCFR,LT FTIP
+        BSTA,UN NEG16                   ; FA < 0: negate the magnitude
+        LODA,R0 FA+1
+FTIP:
+        EORA,R0 T0                      ; the result's bit 15 must equal FA's sign (-32768 is legal, +32768 is not)
+        BCTA,LT FP_RANGE
         RETC,UN
 E_CONV:
 
@@ -2981,7 +3114,7 @@ PUTC:
 ;   In     : FA (canonical);  RS=1
 ;   Out    : characters through PUTC / COUT:  "0" for zero;  "-" first for a negative value;  |x| < 1 prints as "0." + leading zeros + digits.
 ;            FA is DESTROYED (v3.3; before it was restored to |FA| - no caller in the interpreter reads it afterwards).
-;   Clobber: R0-R3;  FA (see Out), FB, FBG, FDB, FSA, FSB, FER, FMA, FDV, RD, T0, FDE, FPLIM, FPY, DIGI, DIGV, DIG..DIG+6
+;   Clobber: R0-R3;  FA (see Out), FB, FBG, FDB, FSA, FSB, FER, FMA, FDV, RD, T0, FDE, FPLIM, FPY, DIGI, DIG..DIG+6
 ;   Errors : none expected for a canonical FA: it is scaled into [1,10) before the MUL / DIV / FIX steps, so they cannot overflow or leave range
 ;   RAS    : 3  (FLT_SUB -> FLT_ADD -> FSWAP, or PUTC -> COUT -> its inner level)
 FLT_PRINT:
@@ -2996,7 +3129,7 @@ FPNZ:
         BSTR,UN PUTC
         BSTA,UN FLT_ABS
 FPPS:
-        EORZ,R0
+        LODI,R0 64                      ; FDE = decimal exponent + 64 (unsigned compares below)
         STRA,R0 FDE
 FPDN:
         ZBSR *VFLT_TEN_B
@@ -3023,24 +3156,21 @@ FPSC:
         EORZ,R0
         STRA,R0 DIGI
 FPDIG:
-        BSTA,UN FLT_TO_INT
+        BSTA,UN FLT_TO_INT              ; T0 = 0, T0+1 = the digit (FA < 10)
         LODA,R0 T0+1
-        STRA,R0 DIGV
-        EORZ,R0
-        STRA,R0 T0
-        ZBSR *VFROM_INT_B
+        IORI,R0 '0'
+        LODA,R1 DIGI
+        STRA,R0 DIG,R1
+        ADDI,R1 1
+        STRA,R1 DIGI
+        ZBSR *VFROM_INT_B               ; FB = float(digit)
         BSTA,UN FLT_SUB
         LODA,R0 FA+1
         BCFR,LT FPCL
         ZBSR *VFLT_ZERO
 FPCL:
         ZBSR *VMUL_BY_TEN
-        LODA,R0 DIGV
-        IORI,R0 '0'
         LODA,R1 DIGI
-        STRA,R0 DIG,R1
-        ADDI,R1 1
-        STRA,R1 DIGI
         COMI,R1 7
         BCFR,EQ FPDIG
 FPRD:
@@ -3069,104 +3199,76 @@ FPST:
         BCFR,EQ FPSTD
         BDRR,R1 FPST
 FPSTD:
-        STRA,R1 FPLIM
+        STRA,R1 FPLIM                   ; FPLIM = significant digits (1..6)
+; Output as one loop over the decimal position P (R3, held +64 like FDE): from P0 = max(FDE,0) down to Pmin = min(FDE-FPLIM+1,0).
+; The digit at P is DIG[FDE-P] (a '0' when that index is outside 0..5); '.' goes in front of P = -1.
         LODA,R0 FDE
-        BCTA,LT FPLT1
+        SUBA,R0 FPLIM
         ADDI,R0 1
-        STRZ,R3
-        EORZ,R0
-        STRA,R0 FPY
-FPIT:
-        LODI,R0 '0'
-        LODA,R1 FPY
-        COMI,R1 6
-        BCFR,LT FPIT2
-        LODA,R0 DIG,R1
-        ADDI,R1 1
-        STRA,R1 FPY
-FPIT2:
-        ZBSR *VPUTC
-        BDRR,R3 FPIT
-FPFR:
-        LODA,R1 FPY
-        COMI,R1 6
-        BCFR,LT FPEND
-        COMA,R1 FPLIM
-        BCFR,LT FPEND
-        LODI,R0 '.'
-        ZBSR *VPUTC
-FPFRL:
-        LODA,R1 FPY
-        LODA,R0 DIG,R1
-        ZBSR *VPUTC
-        LODA,R1 FPY
-        ADDI,R1 1
-        STRA,R1 FPY
-        COMA,R1 FPLIM
-        BCFR,LT FPEND
-        COMI,R1 6
-        BCTR,LT FPFRL
-FPEND:
-        RETC,UN
-FPLT1:
-        LODI,R0 '0'
-        ZBSR *VPUTC
-        LODI,R0 '.'
-        ZBSR *VPUTC
+        COMI,R0 64
+        BCTR,LT FPMN
+        LODI,R0 64
+FPMN:
+        STRA,R0 FPY                     ; FPY = Pmin + 64
         LODA,R0 FDE
-        EORI,R0 $FF
-        BCTR,EQ FPLZD
-        STRZ,R3
-FPLZ:
-        LODI,R0 '0'
+        COMI,R0 64
+        BCFR,LT FPP0
+        LODI,R0 64
+FPP0:
+        STRZ,R3                         ; R3 = P0 + 64
+FPOL:
+        COMI,R3 63
+        BCFR,EQ FPDG
+        LODI,R0 '.'
         ZBSR *VPUTC
-        BDRR,R3 FPLZ
-FPLZD:
-        EORZ,R0
-        STRA,R0 FPY
-        BCTR,UN FPFRL
+FPDG:
+        LODA,R0 FDE
+        SUBZ,R3
+        STRZ,R1                         ; R1 = FDE - P (unsigned: a negative index is >= 6)
+        LODI,R0 '0'
+        COMI,R1 6
+        BCFR,LT FPPC
+        LODA,R0 DIG,R1
+FPPC:
+        ZBSR *VPUTC
+        COMA,R3 FPY
+        RETC,EQ
+        SUBI,R3 1
+        BCTR,UN FPOL
 E_PRINT:
 ; =============================================================================
-; SECTION TRIG -- SIN and COS (radians), Stage 5 tier 1.  Outside the Stage 3 library (S_GLUE..E_PRINT).
+; SECTION TRIG -- SIN COS ATN ASIN ACOS SQR LN EXP (radians), Stage 5.  Outside the Stage 3 library (S_GLUE..E_PRINT).
 ;
-; Method: a = |x|;  y = a * 2/PI;  q = TRUNC(y) (16 bit, so |x| < 51471 or ?R);  f = y - q in [0,1).
-;   n = (q + offset) AND 3 where offset = 0 (SIN, x >= 0), 2 (SIN, x < 0), 1 (COS).
-;   n odd: t = 1 - f, else t = f;  r = sin(PI*t/2) = t * P(t*t), P a 5-coefficient minimax polynomial in HORNER_ODD;  n AND 2: r = -r.
-;   (SIN: -x adds 2 to n.  COS(x) = SIN(x + PI/2): adds 1.)  Measured max error vs double precision: see tools/gen_coeffs.py and STAGE5_REPORT.
-; Both functions take their operand exactly like ABS: EXPR_ATOM -> DO_SIN / DO_COS -> EX_PRA pushes SIN_RET / COS_RET and parses the
-; operand; the continuation runs with FA = operand and ends in PARSER_RET.
-; One table, SCT, feeds both the constants and the coefficients through LD_B_PTR (HPTR walks it in 4-byte steps):
-;   2/PI, 1.0, c4, c3, c2, c1, c0   (c4 first: Horner order).  The table must not cross a 256-byte page (LD_B_PTR adds to the low byte only):
-;   the low byte of SCT must be <= $E8 - check the .LST after every build.
-; v3.4: the block was adapted to the code-golfed library of v3.3 (golf branch).  FLT_A_TO_B, FLT_B_TO_A, SAVE_A and REST_A no longer exist; SC_CORE
-;   and HORNER_ODD get by without them (FLT_TO_INT leaves FA alone, FLT_FROM_INT_B makes q in FB, FSWAP, and the two 4-byte slot copiers
-;   ST_FA / LD_FB below).  The numerics are unchanged: FLT_MUL is commutative, so the operand order of the last multiply does not matter.
+; Every function is a CONTINUATION entered from PARSER_RET with FA = operand (like ABS) and ends in PARSER_RET (through FN_END).  The name
+; is found by FN_DSP (next to EXPR_ATOM).  Composite functions are CHAINS of such stages: a stage pushes the next stage on the software
+; stack (PUSH_RET) and jumps to the first one, so the hardware return stack (8 deep!) never nests: SQR = LN stage, then SQR_2 (halve), then
+; EXP stage;  ASIN = ASN_RET, SQR chain, ASN_2, ATN body;  ACOS = ASIN, then ACS_2.  Peak hardware depth = the caller's base (2 prompt / 3 RUN)
+; + 4 (stage -> HORNER_ODD -> HORNER_EVAL -> FLT_MUL / FLT_ADD -> inner call): 7, never 8.  Every stage therefore calls the library directly
+; (flat): a helper that itself called HORNER_ODD would make 8.
+;
+; Algorithms (the 65C02 miniBASIC ones, with the 2650 differences noted):
+;   SIN/COS  y = |x|*2/PI, q = TRUNC(y), f = y-q, n = (q+offset) AND 3 (SIN 0, SIN of x<0: 2, COS 1), t = f or 1-f (n odd), r = t*P(t*t) =
+;            sin(PI*t/2), negate when n AND 2.  |x| above about 51471 gives ?R.
+;   ATN      t = |x| (or 1/|x| when |x| > 1), r = t*P(t*t), result PI/2 - r when reduced, sign of x restored.
+;   ASIN     asin(x) = atan(x/sqrt(1-x*x)) with 1-x*x taken as (1-x)(1+x) (exact near |x| = 1);  |x| >= 1 saturates to +-PI/2 as in the 65C02.
+;   ACOS     PI/2 - ASIN(x).
+;   SQR      EXP(0.5*LN(x)); x = 0 gives 0, x < 0 is clamped to 0 as in the 65C02 (no complex numbers, no error).
+;   LN       x = m*2^E, m moved into [1/sqrt2, sqrt2) so that LN(1) is exactly 0;  z = (m-1)/(m+1);  ln m = z*Q(z*z);  result E*ln2 + ln m.  x <= 0 gives ?R.
+;   EXP      k = TRUNC(x*log2e) (must fit a signed byte), r = x - k*ln2, exp(r) = P(r) (Horner), exponent += k.  Result overflow gives ?O, underflow 0.
+;
+; Scratch (no RAM beyond QF/HPTR/HCNT/EK): TS = DIG..DIG+11 = DIG (PRINT's digit buffer, free while a function runs) + PSAVE (FLT_PARSE's, likewise),
+;   three 4-byte slots ZSLOT / TSLOT / XSLOT copied by ST_FA / LD_FB (R2 = slot offset).
+; Constants and coefficients are 4-byte MBF4 entries [E][S|M1][M2][M3] in ONE page ($0Dxx): LD_B_PTR walks a stream with HPTR (low byte += 4),
+;   SETP points HPTR at a stream (the high byte is the page of SCT).  tools/check_tables.py verifies that the whole table sits in one page.
 ; =============================================================================
 S_TRIG:
 ; -----------------------------------------------------------------------------
-; DO_SIN / DO_COS -- SIN( / COS( atoms (entered by BCTA from EXPR_ATOM)
-;   In     : IP -> the keyword (any letters are eaten, as for ABS)
-;   Out    : IP past the keyword; SIN_RET / COS_RET pushed on the SW stack; the operand is parsed by EXPR_ATOM
-;   Clobber: R0, R1;  R2 and R3 are live across EXPR and untouched
-;   RAS    : 1  (EATWORD)
-DO_SIN:
-        ZBSR *VEATWORD
-        LODI,R0 >SIN_RET
-        LODI,R1 <SIN_RET
-        BCTA,UN EX_PRA
-DO_COS:
-        ZBSR *VEATWORD
-        LODI,R0 >COS_RET
-        LODI,R1 <COS_RET
-        BCTA,UN EX_PRA
-; -----------------------------------------------------------------------------
-; SIN_RET / COS_RET -- continuations: FA = operand.  Set the quadrant offset, point HPTR at SCT, run SC_CORE in the alternate bank.
+; SIN_RET / COS_RET -- continuations: FA = x.  Flat stage: quadrant offset, stream SCT, then the whole SIN / COS body in the alternate bank.
 ;   In     : FA = x
-;   Out    : FA = SIN(x) or COS(x); RS = 0; ends in PARSER_RET
-;   Clobber: R0-R3 (both banks), FA, FB, FBG, FDB, T0, TS (DIG..DIG+7), QF, HPTR, HCNT (PSAVE..PSAVE+3) and the library scratch;
-;            R2/R3 of bank 0 are untouched
-;   Errors : |x| >= 51471 -> ?R (FLT_TO_INT);  overflow cannot occur
-;   RAS    : 4 below the caller of PARSER_RET (SC_CORE, HORNER_ODD, FLT_MUL / FLT_ADD, their inner level)
+;   Out    : FA = SIN(x) / COS(x); RS = 0; ends in PARSER_RET (FN_END)
+;   Clobber: R0-R3 (both banks), FA, FB, FBG, FDB, T0, TS, QF, HPTR, HCNT and the library scratch;  R2/R3 of bank 0 are untouched
+;   Errors : |x| >= about 51471 -> ?R (FLT_TO_INT)
+;   RAS    : base + 4
 SIN_RET:
         LODA,R0 FA+1
         BCTR,LT SC_NEG          ; sign bit set: x < 0
@@ -3174,32 +3276,20 @@ SIN_RET:
         BCTR,UN SC_GO
 SC_NEG:
         LODI,R0 2               ; offset 2: SIN(-x) = -SIN(x) is n + 2
-        BCTR,UN SC_GO
+;        BCTR,UN SC_GO
+        DB $EC
 COS_RET:
         LODI,R0 1               ; offset 1: COS(x) = SIN(x + PI/2); the sign of x does not matter
 SC_GO:
         STRA,R0 QF
-        LODI,R0 <(SCT-1)
-        STRA,R0 HPTR
         LODI,R0 >(SCT-1)
-        STRA,R0 HPTR+1
-        LODI,R0 5               ; number of coefficients in the table
+        ZBSR *VSETP
+        LODI,R0 5               ; number of coefficients in SCT
         STRA,R0 HCNT
         PPSL PSW_RS
-        BSTR,UN SC_CORE
-        CPSL PSW_RS
-        ZBRR *VPARSER_RET
-; -----------------------------------------------------------------------------
-; SC_CORE -- the SIN / COS body (runs in the alternate bank)
-;   In     : FA = x, QF = offset, HPTR -> SCT-1, HCNT = 5, RS = 1
-;   Out    : FA = result
-;   Clobber: R0-R3, FA, FB, T0, TS, QF, HPTR, HCNT, and what FLT_MUL / FLT_ADD / FLT_SUB / FLT_TO_INT / FLT_FROM_INT_B clobber
-;   Errors : ?R from FLT_TO_INT when |x|*2/PI >= 32768
-;   RAS    : 3  (HORNER_ODD, then FLT_MUL or FLT_ADD and its inner level counted in the caller's 4)
-SC_CORE:
         BSTA,UN FLT_ABS         ; FA = |x|
-        BSTA,UN LD_B_PTR        ; FB = 2/PI
-        ZBSR *VFLT_MUL         ; FA = y = |x| * 2/PI
+        ZBSR *VLD_B_PTR        ; FB = 2/PI
+        ZBSR *VFLT_MUL          ; FA = y = |x| * 2/PI
         BSTA,UN FLT_TO_INT      ; T0:T0+1 = q = TRUNC(y); FA = y is left alone
         LODA,R0 QF
         ADDA,R0 T0+1            ; offset + low byte of q
@@ -3207,24 +3297,273 @@ SC_CORE:
         STRA,R0 QF              ; QF = n
         ZBSR *VFROM_INT_B       ; FB = q (FA = y is left alone)
         BSTA,UN FLT_SUB         ; FA = f = y - q, 0 <= f < 1
-        BSTA,UN LD_B_PTR        ; FB = 1.0 (always loaded: it keeps HPTR in step)
+        ZBSR *VLD_B_PTR        ; FB = 1.0 (always loaded: it keeps HPTR in step)
         LODA,R0 QF
         ANDI,R0 1
         BCTR,EQ SC_P            ; n even: t = f
         ZBSR *VFLT_NEGATE
         ZBSR *VFLT_ADD          ; n odd: t = 1 - f  (FA = -f + FB)
 SC_P:
-        BSTR,UN HORNER_ODD      ; FA = sin(PI*t/2)
+        BSTA,UN HORNER_ODD      ; FA = sin(PI*t/2)
         LODA,R0 QF
         ANDI,R0 2
-        RETC,EQ
-        ZBRR *VFLT_NEGATE       ; n AND 2: FA = -FA (tail call)
+        BCTR,EQ FN_END
+        ZBSR *VFLT_NEGATE       ; n AND 2: FA = -FA
 ; -----------------------------------------------------------------------------
-; ST_FA / LD_FB -- 4-byte copies between FA / FB and a slot of the trig scratch TS (the guard bytes FDB / FBG are not touched)
-;   In     : R2 = slot offset (ZSLOT or TSLOT), RS = 1;  ST_FA: FA;  LD_FB: TS[R2..R2+3]
+; FN_END -- common end of every stage: back to bank 0 and on to the next continuation
+;   RAS    : 0 (a jump)
+FN_END:
+        CPSL PSW_RS
+        ZBRR *VPARSER_RET
+; -----------------------------------------------------------------------------
+; ATN_RET / ATN_BODY -- ATN(x)  (ATN_BODY is also entered from ASN_2, in bank 1, with FA = the ratio)
+;   In     : FA = x
+;   Out    : FA = atan(x), -PI/2 < result < PI/2
+;   Clobber: as SIN_RET, QF = sign (bit 7) / reduced (bit 0)
+;   RAS    : base + 4
+ATN_RET:
+        PPSL PSW_RS
+ATN_BODY:
+        LODI,R0 >(ATT-1)
+        ZBSR *VSETP
+        LODA,R0 FA+1
+        ANDI,R0 $80
+        STRA,R0 QF              ; sign of x in bit 7, reduction flag (bit 0) cleared
+        BSTA,UN FLT_ABS         ; FA = a = |x|
+        ZBSR *VLD_B_PTR        ; FB = 1.0
+        ZBSR *VFLT_CMP          ; a against 1.0
+        BCFR,GT AT_NR           ; a <= 1: no reduction
+        LODA,R0 QF
+        IORI,R0 1
+        STRA,R0 QF
+        ZBSR *VFSWAP            ; FA = 1.0, FB = a
+        BSTA,UN FLT_DIV         ; FA = 1/a, 0 < 1/a < 1
+AT_NR:
+        LODI,R0 8               ; number of coefficients in ATT
+        STRA,R0 HCNT
+        BSTA,UN HORNER_ODD      ; FA = atan(t)
+        ZBSR *VLD_B_PTR        ; FB = PI/2 (always loaded: it keeps HPTR in step)
+        LODA,R0 QF
+        ANDI,R0 1
+        BCTR,EQ AT_S
+        ZBSR *VFLT_NEGATE
+        ZBSR *VFLT_ADD          ; reduced: FA = PI/2 - atan(1/a)
+AT_S:
+        LODA,R0 QF
+        ANDI,R0 $80
+        BCTA,EQ FN_END
+        ZBSR *VFLT_NEGATE       ; x < 0: FA = -FA
+        ZBRR *VFN_END
+; -----------------------------------------------------------------------------
+; ASN_RET -- ASIN(x), stage 1: FA = (1-x)(1+x), then SQR (a chain) and on to ASN_2
+;   In     : FA = x
+;   Out    : continues in SQR_RET with FA = 1 - x*x (negative for |x| > 1: SQR clamps it to 0), ASN_2 pushed
+;   Clobber: as SIN_RET;  XSLOT = x, TSLOT = x-1
+;   RAS    : base + 3
+ASN_RET:
+        PPSL PSW_RS
+        LODI,R0 >(ONES-1)
+        ZBSR *VSETP
+        LODI,R2 XSLOT
+        BSTA,UN ST_FA           ; X = x
+        ZBSR *VLD_B_PTR        ; FB = 1.0
+        BSTA,UN FLT_SUB         ; FA = x - 1
+        BSTA,UN ST_T            ; T = x - 1
+        LODI,R2 XSLOT
+        BSTA,UN LD_FB           ; FB = x
+        ZBSR *VFSWAP            ; FA = x
+        ZBSR *VLD_B_PTR        ; FB = 1.0 (second entry)
+        ZBSR *VFLT_ADD          ; FA = x + 1
+        BSTA,UN LD_T            ; FB = x - 1
+        ZBSR *VFLT_MUL          ; FA = x*x - 1
+        ZBSR *VFLT_NEGATE       ; FA = 1 - x*x
+        CPSL PSW_RS
+        LODI,R0 >ASN_2
+        LODI,R1 <ASN_2
+        ZBSR *VPUSH_RET
+        BCTA,UN SQR_RET
+; -----------------------------------------------------------------------------
+; ASN_2 -- ASIN(x), stage 2: FA = d = sqrt(1-x*x).  d = 0 gives +-PI/2, otherwise ATN of x/d.
+;   In     : FA = d, XSLOT = x
+;   Out    : FA = asin(x) (through ATN_BODY or FN_END)
+;   RAS    : base + 4
+ASN_2:
+        PPSL PSW_RS
+        LODI,R2 XSLOT
+        BSTA,UN LD_FB           ; FB = x
+        ZBSR *VFSWAP            ; FA = x, FB = d
+        LODA,R0 FB
+        BCFR,EQ AS_DIV          ; d <> 0
+        LODI,R0 >(PIO2-1)
+        ZBSR *VSETP
+        ZBSR *VLD_B_PTR        ; FB = PI/2
+        LODA,R0 FA+1
+        ANDI,R0 $80
+        IORA,R0 FB+1
+        STRA,R0 FB+1            ; FB = PI/2 with the sign of x
+        ZBSR *VFSWAP            ; FA = +-PI/2
+        ZBRR *VFN_END
+AS_DIV:
+        BSTA,UN FLT_DIV         ; FA = x/d
+        BCTA,UN ATN_BODY        ; (HPTR is set there)
+; -----------------------------------------------------------------------------
+; ACS_RET / ACS_2 -- ACOS(x) = PI/2 - ASIN(x)
+ACS_RET:
+        LODI,R0 >ACS_2
+        LODI,R1 <ACS_2
+        ZBSR *VPUSH_RET
+        BCTA,UN ASN_RET
+ACS_2:
+        PPSL PSW_RS
+        ZBSR *VFLT_NEGATE       ; FA = -asin(x)
+        LODI,R0 >(PIO2-1)
+        ZBSR *VSETP
+        ZBSR *VLD_B_PTR        ; FB = PI/2
+        ZBSR *VFLT_ADD          ; FA = PI/2 - asin(x)
+        ZBRR *VFN_END
+; -----------------------------------------------------------------------------
+; SQR_RET / SQR_2 -- SQR(x) = EXP(0.5 * LN(x)).  x = 0 gives 0; x < 0 is clamped to 0 (as the 65C02).
+;   In     : FA = x
+;   Out    : FA = sqrt(x)
+SQR_RET:
+        LODA,R0 FA
+        BCFR,EQ SQ_NZ           ; x <> 0
+        ZBRR *VPARSER_RET       ; x = 0: FA = 0 already
+SQ_NZ:
+        LODA,R0 FA+1
+        BCFR,LT SQ_POS
+        PPSL PSW_RS
+        ZBSR *VFLT_ZERO         ; x < 0: FA = 0
+        ZBRR *VFN_END
+SQ_POS:
+        LODI,R0 >SQR_2
+        LODI,R1 <SQR_2
+        ZBSR *VPUSH_RET
+        BCTR,UN LN_RET
+SQR_2:
+        LODA,R0 FA              ; FA = ln x
+        BCTA,EQ EXP_RET         ; ln x = 0 (x = 1): exp(0) = 1
+        SUBI,R0 1
+        STRA,R0 FA              ; * 0.5
+        BCTA,UN EXP_RET
+; -----------------------------------------------------------------------------
+; LN_RET -- LN(x)
+;   In     : FA = x
+;   Out    : FA = ln(x);  x <= 0 gives ?R
+;   Clobber: as SIN_RET;  EK = E, ZSLOT = m then ln m, TSLOT = m-1
+;   RAS    : base + 4
+LN_RET:
+        LODA,R0 FA
+        BCTA,EQ FP_RANGE        ; x = 0
+        LODA,R0 FA+1
+        BCTA,LT FP_RANGE        ; x < 0
+        LODA,R0 FA
+        SUBI,R0 $80
+        STRA,R0 EK              ; E = exponent - 128: x = m * 2^E with m in [0.5,1)
+        LODA,R0 FA+1
+        COMI,R0 $35             ; m < 1/sqrt2 ?  (mantissa byte below $35)
+        BCFR,LT LN_M
+        LODA,R0 EK
+        SUBI,R0 1
+        STRA,R0 EK              ; E - 1
+        LODI,R0 $81             ; m * 2, in [1, 1.41)
+;        BCTR,UN LN_S
+        DB $EC
+LN_M:
+        LODI,R0 $80
+LN_S:
+        STRA,R0 FA              ; FA = m in [0.707, 1.414)
+        LODI,R0 >(LNT-1)
+        ZBSR *VSETP
+        PPSL PSW_RS
+        BSTA,UN ST_Z            ; X = m
+        ZBSR *VLD_B_PTR        ; FB = 1.0
+        BSTA,UN FLT_SUB         ; FA = m - 1
+        BSTA,UN ST_T            ; T = m - 1
+        BSTA,UN LD_Z            ; FB = m
+        ZBSR *VFSWAP            ; FA = m
+        ZBSR *VLD_B_PTR        ; FB = 1.0 (second entry)
+        ZBSR *VFLT_ADD          ; FA = m + 1
+        BSTA,UN LD_T            ; FB = m - 1
+        ZBSR *VFSWAP            ; FA = m - 1, FB = m + 1
+        BSTA,UN FLT_DIV         ; FA = z = (m-1)/(m+1)
+        LODI,R0 4               ; number of coefficients in LNT
+        STRA,R0 HCNT
+        BSTA,UN HORNER_ODD      ; FA = ln m
+        BSTA,UN ST_Z            ; X = ln m
+        LODA,R0 EK
+        STRA,R0 T0+1
+        ANDI,R0 $80
+        BCTR,EQ LN_EP
+        LODI,R0 $FF
+LN_EP:
+        STRA,R0 T0              ; T0:T0+1 = E, sign extended
+        BSTA,UN CILN2           ; FA = E * ln2 (ln2 is the entry after the coefficients)
+        BSTA,UN LD_Z            ; FB = ln m
+        ZBSR *VFLT_ADD          ; FA = E*ln2 + ln m
+        ZBRR *VFN_END
+; -----------------------------------------------------------------------------
+; EXP_RET -- EXP(x)
+;   In     : FA = x
+;   Out    : FA = exp(x);  k = TRUNC(x*log2e) outside -128..127: above gives ?O, below gives 0;  |x*log2e| >= 32768 gives ?R (FLT_TO_INT)
+;   Clobber: as SIN_RET;  EK = k, ZSLOT = x
+;   RAS    : base + 3
+EXP_RET:
+        LODI,R0 >(EXPT-1)
+        ZBSR *VSETP
+        PPSL PSW_RS
+        BSTA,UN ST_Z            ; X = x
+        ZBSR *VLD_B_PTR        ; FB = log2e
+        ZBSR *VFLT_MUL          ; FA = x * log2e
+        BSTA,UN FLT_TO_INT      ; T0:T0+1 = k
+        LODA,R0 T0+1
+        STRA,R0 EK
+        RRL,R0                  ; bit 7 -> bit 0
+        ANDI,R0 1
+        ADDA,R0 T0              ; T0 + bit 7 of the low byte: 0 when k fits a signed byte
+        BCFA,EQ EX_BIG
+        BSTA,UN CILN2           ; FA = k * ln2
+        BSTA,UN LD_Z            ; FB = x
+        ZBSR *VFSWAP            ; FA = x, FB = k*ln2
+        BSTA,UN FLT_SUB         ; FA = r = x - k*ln2
+        LODI,R0 8               ; number of coefficients in EXPT
+        STRA,R0 HCNT
+        BSTA,UN HORNER_EVAL     ; FA = exp(r), 0.5 < exp(r) < 2
+        LODA,R0 EK
+        BCTR,LT EX_NEG
+        LODA,R0 FA
+        ADDA,R0 EK              ; exponent + k
+        STRA,R0 FA
+        TPSL $01
+        BCTA,EQ FP_OVF          ; carry out: exponent > 255
+        ZBRR *VFN_END
+EX_NEG:
+        LODA,R0 FA
+        ADDA,R0 EK
+        STRA,R0 FA
+        TPSL $01
+        BCFR,EQ EX_ZERO         ; no carry: exponent < 0
+        LODA,R0 FA
+        BCFA,EQ FN_END          ; exponent byte <> 0 (a signed test would reject exponents >= $80)
+EX_ZERO:
+        ZBSR *VFLT_ZERO         ; underflow: 0
+        ZBRR *VFN_END
+EX_BIG:
+        LODA,R0 T0
+        BCTR,LT EX_ZERO         ; k < -128: 0
+        BCTA,UN FP_OVF          ; k > 127: ?O
+; -----------------------------------------------------------------------------
+; ST_FA / LD_FB -- 4-byte copies between FA / FB and a slot of the scratch TS (the guard bytes FDB / FBG are not touched)
+;   Entries: ST_Z / ST_T / LD_Z / LD_T (v3.6) load R2 = ZSLOT / TSLOT themselves (skip-2 idiom) and fall into ST_FA / LD_FB: one call instead of two.
+;   In     : R2 = slot offset (ZSLOT / TSLOT / XSLOT), RS = 1;  ST_FA: FA;  LD_FB: TS[R2..R2+3]
 ;   Out    : ST_FA: TS[R2..R2+3] = FA;   LD_FB: FB = TS[R2..R2+3]
 ;   Clobber: R0, R1, R2 (left at offset+3)
 ;   RAS    : 0
+ST_Z:
+        LODI,R2 ZSLOT
+        DB      $EC                     ; skip-2: swallows the LODI,R2 below
+ST_T:
+        LODI,R2 TSLOT
 ST_FA:
         LODI,R1 $FC             ; R1 = -4: BIRR counts it up to 0 (FA-$FC,R1 = FA+0..3)
 STF_L:
@@ -3232,6 +3571,11 @@ STF_L:
         STRA,R0 TS-1,R2+        ; pre-increment: TS+off+0..3
         BIRR,R1 STF_L
         RETC,UN
+LD_Z:
+        LODI,R2 ZSLOT
+        DB      $EC                     ; skip-2: swallows the LODI,R2 below
+LD_T:
+        LODI,R2 TSLOT
 LD_FB:
         LODI,R1 $FC
 LFB_L:
@@ -3243,34 +3587,35 @@ LFB_L:
 ; HORNER_ODD -- FA = t * P(t*t) with P from the coefficient stream (highest power first)
 ;   In     : FA = t, HPTR -> stream-1, HCNT = number of coefficients (>= 1), RS = 1
 ;   Out    : FA = t * P(t*t); HPTR advanced past the coefficients;  HCNT = 0
-;   Clobber: R0-R3, FA, FB, TS (t in slot TSLOT, z = t*t in slot ZSLOT), HPTR, HCNT, and the FLT_MUL / FLT_ADD scratch
-;   Errors : as FLT_MUL / FLT_ADD (cannot occur for the SIN / COS tables)
-;   RAS    : 1 here + 1 for FLT_MUL / FLT_ADD (+ their inner level)
+;   Clobber: R0-R3, FA, FB, TS (t in TSLOT, z in ZSLOT), HPTR, HCNT, and the FLT_MUL / FLT_ADD scratch
+;   RAS    : 2 here (HORNER_EVAL) + FLT_MUL / FLT_ADD and their inner call
 HORNER_ODD:
-        LODI,R2 TSLOT
-        BSTR,UN ST_FA           ; TS[t] = t
-        LODI,R2 TSLOT
-        BSTR,UN LD_FB           ; FB = t
-        ZBSR *VFLT_MUL         ; FA = z = t*t
-        LODI,R2 ZSLOT
-        BSTR,UN ST_FA           ; TS[z] = z
-        BSTR,UN LD_B_PTR        ; FB = first (highest) coefficient c4
-        ZBSR *VFSWAP            ; FA = S = c4, FB = z
-HO_L:
+        BSTR,UN ST_T            ; TS[t] = t
+        BSTR,UN LD_T            ; FB = t
+        ZBSR *VFLT_MUL          ; FA = z = t*t
+        BSTR,UN HORNER_EVAL     ; FA = P(z)
+        BSTR,UN LD_T            ; FB = t
+        ZBRR *VFLT_MUL          ; FA = P(z) * t (tail call)
+; -----------------------------------------------------------------------------
+; HORNER_EVAL -- FA = P(z), P from the coefficient stream (highest power first), by Horner's rule
+;   In     : FA = z, HPTR -> stream-1, HCNT = number of coefficients (>= 1), RS = 1
+;   Out    : FA = P(z); HPTR advanced past the coefficients;  HCNT = 0
+;   Clobber: R0-R3, FA, FB, TS (z in ZSLOT), HPTR, HCNT, and the FLT_MUL / FLT_ADD scratch
+;   RAS    : 1 here + FLT_MUL / FLT_ADD and their inner call
+HORNER_EVAL:
+        BSTR,UN ST_Z            ; TS[z] = z
+        BSTR,UN LD_B_PTR        ; FB = first (highest) coefficient
+        ZBSR *VFSWAP            ; FA = S = c(n-1), FB = z
+HE_L:
         LODA,R0 HCNT
         SUBI,R0 1
         STRA,R0 HCNT
-        BCTR,EQ HO_D
-        LODI,R2 ZSLOT
-        BSTR,UN LD_FB           ; FB = z
-        ZBSR *VFLT_MUL         ; FA = S * z
+        RETC,EQ                 ; all coefficients applied
+        BSTR,UN LD_Z            ; FB = z
+        ZBSR *VFLT_MUL          ; FA = S * z
         BSTR,UN LD_B_PTR        ; FB = next coefficient
         ZBSR *VFLT_ADD          ; FA = S * z + c
-        BCTR,UN HO_L
-HO_D:
-        LODI,R2 TSLOT
-        BSTR,UN LD_FB           ; FB = t
-        ZBRR *VFLT_MUL         ; FA = P(z) * t (tail call)
+        BCTR,UN HE_L
 ; -----------------------------------------------------------------------------
 ; LD_B_PTR -- FB = the 4-byte entry after HPTR (first byte at HPTR+1), then HPTR += 4 (low byte only: no page crossing, see the header)
 ;   In     : HPTR
@@ -3288,22 +3633,147 @@ LBP_L:
         STRA,R0 HPTR+1
         RETC,UN
 ; -----------------------------------------------------------------------------
-; SCT -- constant / coefficient stream for SIN and COS, 4 bytes per entry [E][S|M1][M2][M3] (MBF4):  2/PI, 1.0, then c4..c0 of
-;   sin(PI*t/2) = t * (c0 + c1 t^2 + c2 t^4 + c3 t^6 + c4 t^8), minimax on t in [0,1] (tools/gen_coeffs.py --asm 5)
+; -----------------------------------------------------------------------------
+; POW_LOOP -- continuation pushed by EXPR_ATOM after every atom: is the next token '^'?
+;   In     : IP -> after the atom;  FA = the atom's value;  R3 = SW-stack index
+;   Out    : no '^': on to the next continuation (PARSER_RET).  '^': OPS_HIT_HI pushes row 21 and FA, eats the '^' and parses ONE more atom,
+;            which pushes POW_LOOP itself, so x^y^z is x^(y^z) (right associative) and binds tighter than * / and unary minus.
+;   Clobber: R0, R1 (+ what OPS_HIT_HI does)
+;   RAS    : 0 (jumps only)
+POW_LOOP:
+        ZBSR *VWSKIP
+        COMI,R0 A'^'
+        BCFA,EQ PARSER_RET
+        LODI,R1 21                      ; TOK_CHARS row offset of '^'
+        BCTA,UN OPS_HIT_HI
+; -----------------------------------------------------------------------------
+; DO_POW -- operator '^':  x^y   (entered through JMP_VEC from OPS_HIT_RET: FB = x, FA = y)
+;   Method : y an integer 0..255: FA = 1, then FA = FA * x, y times (exact whenever the products are; x may be zero or negative; x^0 = 1).
+;            Any other y: x^y = EXP(y * LN(x)) as a chain of stages (LN stage, POW_2 = multiply by y, EXP stage); needs x > 0.
+;   Out    : FA = x^y; control resumes through FN_END / the next continuation (PARSER_RET)
+;   Errors : ?O overflow (multiply or EXP);  ?R from LN when x <= 0 and y is not an integer 0..255
+;   Clobber: R0-R3, FA, FB, T0, HCNT, TS (TSLOT = x, XSLOT = y) and the FP library scratch
+;   RAS    : base + 2 on the integer path; base + 4 on the chain (as every function stage)
+DO_POW:
+        PPSL PSW_RS
+        ZBSR *VFSWAP                    ; FA = x, FB = y
+        BSTA,UN ST_T                    ; TSLOT = x
+        ZBSR *VFSWAP                    ; FA = y, FB = x
+        LODA,R0 FA
+        COMI,R0 $89
+        BCFR,LT POW_EL                  ; |y| >= 256
+        BSTA,UN FLT_TO_INT              ; T0:T0+1 = TRUNC(y); FA = y is left alone
+        LODA,R0 T0
+        BCFR,EQ POW_EL                  ; y < 0
+        LODA,R0 T0+1
+        STRA,R0 HCNT                    ; HCNT = n = TRUNC(y)
+        ZBSR *VFROM_INT_B               ; FB = float(n)
+        ZBSR *VFLT_CMP
+        BCFR,EQ POW_EL                  ; y has a fraction
+        ZBSR *VFLT_ZERO
+        LODI,R0 $81
+        STRA,R0 FA                      ; FA = 1.0
+POW_LP:
+        LODA,R0 HCNT
+        BCTA,EQ FN_END                  ; n = 0 left: done
+        SUBI,R0 1
+        STRA,R0 HCNT
+        BSTA,UN LD_T                    ; FB = x
+        ZBSR *VFLT_MUL                  ; FA = FA * x
+        BCTR,UN POW_LP
+POW_EL:                                 ; FA = y still
+        LODI,R2 XSLOT
+        BSTA,UN ST_FA                   ; XSLOT = y
+        BSTA,UN LD_T                    ; FB = x
+        ZBSR *VFSWAP                    ; FA = x
+        CPSL PSW_RS
+        LODI,R0 >POW_2
+        LODI,R1 <POW_2
+        ZBSR *VPUSH_RET
+        BCTA,UN LN_RET                  ; FA = ln x, then POW_2
+POW_2:
+        PPSL PSW_RS
+        LODI,R2 XSLOT
+        BSTA,UN LD_FB                   ; FB = y
+        ZBSR *VFLT_MUL                  ; FA = y * ln x
+        CPSL PSW_RS
+        BCTA,UN EXP_RET
+CODEND:                                 ; end of the code proper: ROM free for new code = $0F64 - CODEND
+;        ORG     $0F64                   ; pin the stream tables (140 bytes, ONE page: LD_B_PTR adds 4 to the low byte), CILN2 and SETP to end at $1000
+; Streams (4 bytes per entry, MBF4 [E][S|M1][M2][M3]); all in one page.  tools/gen_coeffs.py makes every entry.
+; SCT : SIN / COS:  2/PI, 1.0, c4..c0 of sin(PI*t/2) = t * (c0 + c1 t^2 + ... + c4 t^8)
 SCT:
-        DB $80,$22,$F9,$83          ; 2/PI = 0.636619772
-        DB $81,$00,$00,$00          ; 1.0
+        DB $80,$22,$F9,$83          ; 2/PI = 0.6366197467
+        DB $81,$00,$00,$00          ; 1.0 = 1
         DB $74,$1F,$CE,$19          ; c4 = 0.00015240199
         DB $79,$99,$37,$F9          ; c3 = -0.00467586191
         DB $7D,$23,$35,$25          ; c2 = 0.0796912089
         DB $80,$A5,$5D,$E7          ; c1 = -0.645964086
         DB $81,$49,$0F,$DB          ; c0 = 1.57079637
+; ONES + ATT : ASIN reads ONES and the first entry of ATT (1.0, 1.0); ATN reads ATT, then PIO2:  1.0, c7..c0 of atan(t) = t * P(t^2), then PI/2
+;ONES:
+;        DB $81,$00,$00,$00          ; 1.0 = 1
+ATT:
+        DB $81,$00,$00,$00          ; 1.0 = 1
+        DB $79,$87,$4E,$26          ; c7 = -0.00412918907
+        DB $7B,$35,$86,$4C          ; c6 = 0.0221587643
+        DB $7C,$E6,$E9,$FA          ; c5 = -0.0563754812
+        DB $7D,$46,$38,$30          ; c4 = 0.0967868567
+        DB $7E,$8E,$94,$B7          ; c3 = -0.139239177
+        DB $7E,$4C,$49,$71          ; c2 = 0.199498907
+        DB $7F,$AA,$A6,$90          ; c1 = -0.333302021
+        DB $80,$7F,$FF,$F7          ; c0 = 0.999999464
+PIO2:
+        DB $81,$49,$0F,$DB          ; PI/2 = 1.570796371
+; EXPT : EXP:  log2e, ln2, c7..c0 of exp(r) = c0 + c1 r + ... + c7 r^7
+EXPT:
+        DB $81,$38,$AA,$3B          ; LOG2E = 1.442695022
+        DB $80,$31,$72,$18          ; LN2 = 0.6931471825
+        DB $74,$5B,$35,$23          ; c7 = 0.000209052625
+        DB $77,$38,$8C,$00          ; c6 = 0.00140798092
+        DB $7A,$08,$6A,$DC          ; c5 = 0.00832625851
+        DB $7C,$2A,$A7,$07          ; c4 = 0.0416631959
+        DB $7E,$2A,$AA,$FD          ; c3 = 0.166667894
+        DB $80,$00,$00,$00          ; c2 = 0.5
+;        DB $81,$00,$00,$00          ; c1 = 1
+;        DB $81,$00,$00,$00          ; c0 = 1
+
+; LNT : LN:  1.0, 1.0, q3..q0 of ln(m) = z * (q0 + q1 z^2 + q2 z^4 + q3 z^6), then ln2
+LNT:
+ONES:
+        DB $81,$00,$00,$00          ; 1.0 = 1
+        DB $81,$00,$00,$00          ; 1.0 = 1
+        DB $7F,$18,$17,$3D          ; c3 = 0.297052294
+        DB $7F,$4C,$BA,$40          ; c2 = 0.399858475
+        DB $80,$2A,$AA,$AD          ; c1 = 0.666666806
+        DB $82,$00,$00,$00          ; c0 = 2
+        DB $80,$31,$72,$18          ; LN2 = 0.6931471825
+
+E_TBL:
+; -----------------------------------------------------------------------------
+; CILN2 -- FA = float(T0:T0+1) * ln2 (ln2 = the next stream entry).  Shared by LN (E) and EXP (k).
+;   RAS    : 1 (+ FROM_INT's NEG16 / FLT_MUL's inner call)
+CILN2:
+        BSTA,UN FLT_FROM_INT
+        ZBSR *VLD_B_PTR
+        ZBRR *VFLT_MUL
+; -----------------------------------------------------------------------------
+; SETP -- HPTR = (page of SCT):(R0)   i.e. point the stream pointer at the stream whose first entry is at (R0)+1
+;   In     : R0 = low byte of (stream - 1)
+;   Out    : HPTR
+;   Clobber: R0
+;   RAS    : 0
+SETP:
+        STRA,R0 HPTR+1
+        LODI,R0 <SCT
+        STRA,R0 HPTR
+        RETC,UN
 E_TRIG:
 ROMEND: 
 
 ;  RAM variables -- sequential RES block 
  
-        ORG     4096    ; half a 2650 8kbyte page
+        ORG 4096                ; RAM at $1000, directly above the 4 KB EPROM: the assembler's ORG overwrite check fails the build if the ROM passes $1000
 
 ; --- Ordered group: offsets from IPH used by INC_ET/DEC_ET/NEG_SHARED and
 ; by REG16_TO_REG16's packed-nibble index scheme (see IDX_* EQUs, v2.11).
@@ -3383,32 +3853,34 @@ FDB     RES     1               ; FA+4: guard byte below FA's mantissa (bit 7 = 
 FB      RES     4               ; FLT_B [E][S|M1][M2][M3]: right operand (FB = FA+5)
 FBG     RES     1               ; FB+4: guard byte below FB's mantissa
 FSA     RES     1               ; result sign (bit 7); FA's sign inside FLT_ADD
-FSB     RES     1               ; FB's sign (bit 7), FLT_ADD only
 FER     RES     1               ; working result exponent
-FDE     RES     1               ; PRINT decimal exponent (live across MUL_BY_TEN, DIV_BY_TEN, FLT_TO_INT)
 FMA     RES     3               ; MUL multiplicand copy (hi,mid,lo)
+FSB     RES     1               ; FB's sign (bit 7), FLT_ADD only.  MUST be FSA+5 (FLT_ADD's sign loop indexes FSA by 0 / 5)
+FDE     RES     1               ; PRINT decimal exponent (live across MUL_BY_TEN, DIV_BY_TEN, FLT_TO_INT)
 FDV     RES     3               ; DIV divisor (hi,mid,lo)
 RD      RES     3               ; DIV remainder (hi,mid,lo)
 FPLIM   RES     1               ; PRINT: number of significant digits after trimming trailing zeros
 FPY     RES     1               ; PRINT: index of the next digit in DIG
 DIGI    RES     1               ; PRINT: digits extracted so far (0..7)
-DIGV    RES     1               ; PRINT: current digit value
 DIG     RES     8               ; PRINT digit buffer, DIG..DIG+6 used (the 65C02 used IBUF; here a private buffer)
 PSAVE   RES     4               ; FLT_PARSE: parked copy of FA (the integer part while the fraction is built)
-; v3.4: the trig routines borrow RAM that is free while a function is evaluated, so no new RAM is used.  FLT_PRINT fills DIG only after
-; the expression has been evaluated, and FLT_PARSE uses PSAVE only inside itself (no literal is half parsed while SIN / COS runs).
-TS      EQU     DIG             ; two 4-byte FP slots (packed like FA), copied by ST_FA / LD_FB with R2 = slot offset
-ZSLOT   EQU     0               ; Horner: z = t*t
-TSLOT   EQU     4               ; Horner: t
-QF      EQU     PSAVE           ; SIN/COS: quadrant offset on entry, then n = (q+offset) AND 3
-HPTR    EQU     PSAVE+1         ; coefficient-stream pointer, 2 bytes high byte first, points ONE BYTE BEFORE the next 4-byte entry
-HCNT    EQU     PSAVE+3         ; Horner: coefficients still to apply
+; v3.4/v3.5: the function routines borrow RAM that is free while a function is evaluated.  FLT_PRINT fills DIG only after the expression has
+; been evaluated, and FLT_PARSE uses PSAVE only inside itself (no literal is half parsed while a function runs).  DIG and PSAVE are adjacent,
+; so together they form three 4-byte FP slots.
+TS      EQU     DIG             ; DIG..DIG+11 (= DIG + PSAVE): three 4-byte FP slots (packed like FA), copied by ST_FA / LD_FB with R2 = slot offset
+ZSLOT   EQU     0               ; Horner: z (the evaluation point)
+TSLOT   EQU     4               ; Horner: t;  LN / ASIN: m-1, x-1
+XSLOT   EQU     8               ; ASIN: x (= PSAVE).  Nothing else touches it: ASIN's x must survive the whole SQR chain (LN, EXP, HORNER use ZSLOT / TSLOT only)
+QF      RES     1               ; SIN/COS: quadrant offset on entry, then n;  ATN: sign (bit 7) and reduced (bit 0)
+HPTR    RES     2               ; coefficient-stream pointer, high byte first, points ONE BYTE BEFORE the next 4-byte entry
+HCNT    RES     1               ; Horner: coefficients still to apply
+EK      RES     1               ; LN: E (exponent - 128);  EXP: k
 FPN     RES     1               ; PARSE: count of fraction digits ahead of IP
 T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL (high byte first)
 
 
 ; =============================================================================
-;  Pre-loaded SHOWCASE program (v3.4: floating point, 8-step RND, SIN/COS)
+;  Pre-loaded SHOWCASE program (v3.6: floating point, 8-step RND, SIN/COS, ATN..EXP, ^)
 ;
 ;  Line format: <lineno_hi> <lineno_lo> <body_ASCII> <NUL>
 ;  Format: DB hi,lo,"text",$00  -- hi-then-lo matches DR_EXEC record format.  DQ=$22 (double quote); a ';' outside a quoted DB string is $3B.
@@ -3419,6 +3891,8 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;                 comparisons incl. decimals (80-139), a GOTO loop (140-190)
 ;  Lines 195-241: GOSUB/RETURN, 4 levels deep
 ;  Lines 250-297: FOR/NEXT: STEP -4, nested 3x3 table, and (271-274) a fractional STEP 0.25; 297 jumps to the trig section
+;  Lines 570-580: ATN, ASIN, ACOS, SQR, LN, EXP (v3.5) and the ^ operator (v3.6: 578 integer and fractional powers, 580 right associativity,
+;                 ^ over unary minus), a second block inside the trig section
 ;  Lines 520-590: SIN and COS (v3.3): values, a degrees table, S^2+C^2, an odd/small argument, a one-period sine wave plot (TAB( with a float
 ;                 expression); 590 jumps back to 300
 ;  Lines 300-650: Mandelbrot set, floating point: 44 columns x 21 rows, escape count in a GOSUB'd FOR loop (levels: 2 loops + 1 inside the sub)
@@ -3428,6 +3902,9 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;     PRINT 100000*100000*100000*100000*100000*100000*100000*100000   ?O   overflow (result beyond about 1.7E38)
 ;     PRINT TAB(40000)    ?R   integer use out of range (|x| >= 32768: TAB(, CHR$(, GOTO/GOSUB target, line number)
 ;     PRINT SIN(60000)    ?R   SIN/COS argument beyond about +-51471 (|x|*2/PI >= 32768)
+;     PRINT LN(0)         ?R   LN of zero or of a negative number
+;     PRINT EXP(89)       ?O   EXP result beyond about 1.7E38 (so is EXP(1000); EXP of a large negative number gives 0)
+;     PRINT 2^128         ?O   power beyond about 1.7E38;   PRINT (-2)^0.5   ?R   non-integer power of a negative base (LN)
 ;  No LIST in the showcase.  Not shown either: E notation (unsupported), INT() (none).
 ; =============================================================================
 PROG:
@@ -3536,6 +4013,12 @@ PROG:
         DB 2,43,"FOR X=0 TO 6.5 STEP 0.5",$00               ; 555 one period of a sine wave, TAB( takes the float
         DB 2,48,"PRINT TAB(20+SIN(X)*18);",DQ,"*",DQ,$00    ; 560 column 2..38
         DB 2,53,"NEXT X",$00                                ; 565 
+        DB 2,58,"PRINT ",DQ,"--- ATN ASIN ACOS SQR LN EXP ---",DQ,$00 ; 570 v3.5: the other functions
+        DB 2,60,"PRINT ",DQ,"4*ATN(1)=",DQ,";4*ATN(1);",DQ," ASIN(.5)=",DQ,";ASIN(0.5)",$00 ; 572 3.14159  0.523599
+        DB 2,62,"PRINT ",DQ,"SQR(2)=",DQ,";SQR(2);",DQ," LN(10)=",DQ,";LN(10);",DQ," EXP(1)=",DQ,";EXP(1)",$00 ; 574 1.41421  2.30259  2.71828
+        DB 2,64,"PRINT ",DQ,"SIN(ASIN(.3))=",DQ,";SIN(ASIN(0.3))",$00 ; 576 0.3, functions nest
+        DB 2,66,"PRINT ",DQ,"2^10=",DQ,";2^10;",DQ," 2^0.5=",DQ,";2^0.5;",DQ," 2^-2=",DQ,";2^-2",$00 ; 578 v3.6: 1024  1.41421  0.25
+        DB 2,68,"PRINT ",DQ,"2^3^2=",DQ,";2^3^2;",DQ," -2^2=",DQ,";-2^2;",DQ," 10^0.3=",DQ,";10^0.3",$00 ; 580 512 (right assoc.)  -4  1.99526
         DB 2,78,"GOTO 300",$00                              ; 590 on to the Mandelbrot plot
         DB 2,88,"FOR N=1 TO M",$00                                         ; 600 escape-count subroutine, a FOR loop
         DB 2,98,"IF E>0 GOTO 640",$00                                      ; 610   (FOR level 3, inside a GOSUB, inside
