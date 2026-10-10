@@ -1,21 +1,25 @@
 ; =============================================================================
-; miniBASIC2650 v3.6  --  Tiny BASIC with 32-bit MBF4 floating point, SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP and the ^ operator for the Signetics 2650
-; (derived from uBASIC2650 v2.11; archive/uBASIC2650_v2.11_orig.asm is the integer original; RND/PRE_CHIN ported from uBASIC2650 v2.12)
+; miniBASIC2650 v1.0  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
+;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP and ^ operator 
+;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: standalone build - I/O is bit-banged in software, no PIPBUG ROM or
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : 4 KB target, $0000 upward: ROMEND $1000 = 4096 bytes exactly (v3.6; code ends at CODEND $0F4B, 25 bytes free below the pinned stream tables)
-;   RAM    : ~400 bytes of variables and stacks from $1000 (FA/FB and the FP work area included), program store PROG..$1FFF above
+;   ROM    : 4 KB target from $0000
+;   RAM    : ~400 bytes of variables and stacks from $1000
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
 ;   NMI/IRQ: Not used
 ;
 ; Usage:
-;   Power-up prints the banner and the '>' prompt, with the showcase preloaded: type RUN (CR terminates a line) to run it, LIST to read it,
-;   FREE for the free program bytes, NEW to clear the store before typing your own program.  Lines: <number 0-32767> <statement>.
+;   Power-up prints the banner and the '>' prompt, with the showcase preloaded: 
+;   type RUN (CR terminates a line) to run it, LIST to read it,
+;   FREE for the free program bytes, 
+; 
+;   Lines: <number 0-32767> <statement>.
 ;
 ; Statements:
 ;   INPUT  END  FREE  GOTO <expr>  GOSUB <expr>  IF <cond> [THEN] <stmt>
@@ -24,76 +28,44 @@
 ;
 ; PRINT items: "literal", CHR$(n), TAB(n), or an expression; separate with ';'.
 ;
-; Arithmetic: + - * / ^  (unary -).  True division: 7/2 is 3.5; X/0 is error ?Z; overflow (> about 1.7E38) is ?O; no wraparound.
-; Precedence: BODMAS-lite ^ binds before * /, which bind before + -, which bind before relops (= < >).
-; Power   : x^y (v3.6).  RIGHT associative and tighter than * / and unary minus: 2^3^2 is 2^(3^2) = 512, -2^2 is -(2^2) = -4, 2*3^2 is 18.
-;      y an integer 0..255 (any x, also zero or negative): exact repeated multiplication, x^0 = 1.  Any other y: EXP(y*LN(x)), x > 0 only.
-;      The right operand is ONE atom (number, variable, function, parenthesis, or a - sign): write 2^(N+1) and 2^-1; 2^N+1 is (2^N)+1.
+; Arithmetic: + - * / ^  (unary -).
+; Power   : x^y - y an integer 0..255 (any x, also zero or negative):  repeated multiplication, x^0 = 1.  
+;           Any other y: EXP(y*LN(x)), x > 0 only.
 ; Relops: `=`  `<`  `>`  prefix with ! to invert: `!=`, `!<`, `!>` (<= is !>, >= is !<).
-; RND: niladic: the 16-bit signed pseudorandom integer (as in uBASIC2650 v2.12) converted to a float, no parenthesis/arg.  A value in
-;      0 < x <= 1 is ABS(RND)/32768 (see the showcase, lines 77-79).
-; ABS(expr): absolute value function - expressions allowed
-; SIN(expr) COS(expr): sine and cosine, the argument in RADIANS (any expression, as for ABS).  Accurate to about 5E-7 for |x| <= 2*PI;
-;      the error grows with |x| (see KNOWN LIMITATIONS) and |x| above about 51471 gives ?R.  There is no PI constant: write 3.14159265, or
-;      K=0.0174532925 for degrees as the showcase does.
-; ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS.  ATAN, ASN, ACS, ASINE... are the same words (only the
-;      first two letters count).  |x| > 1 in ASIN/ACOS saturates to +-PI/2 (PI/2 - that for ACOS) as in the 65C02 build: no error.
-; SQR(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives 0 (as the 65C02 build): no error.  SQRT is the same word.
-; LN(expr) : natural logarithm; zero or a negative argument gives ?R.   EXP(expr): e^x; a result above about 1.7E38 gives ?O (x above 88.7),
-;      a result below 1E-38 gives 0, and |x| above about 22700 gives ?R.
+;
+; Functions:
+;   ABS(expr): absolute value function - expressions allowed
+;   SIN(expr) COS(expr): sine and cosine in RADIANS.  Accurate to about 5E-7 for |x| <= 2*PI;
+;   ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS
+;   SQRT(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives 0
+;   LN(expr) : natural logarithm; zero or a negative argument gives ?R.   
 ;
 ; Numbers : MBF4 floating point: 24-bit mantissa (exact integers to 16777216), exponent range about 1E-38 .. 1.7E38.
-;           Literals [digits][.digits] (no E notation).  PRINT shows 6 significant digits in plain notation
+;           Literals [digits][.digits].  PRINT shows 6 significant digits in plain notation
 ;           (1234567 prints 1234570, 1/3 prints 0.333333, trailing zeros trimmed).  Integer uses (GOTO/GOSUB target, line
-;           numbers, TAB(, CHR$() truncate toward zero; |x| >= 32768 gives ?R.  INT() is not provided.
+;
 ; Variables: A-Z (26), MBF4 values (4 bytes each); no arrays or string variables
 ; Print   : "literals", CHR$(n), TAB(n), `;` separator - no string vars
 ;
 ; KNOWN LIMITATIONS
 ;
-; Floating point (v3.0-v3.2):
-;   - No E notation: 1E3 reads as 1 (the E3 is silently ignored); write 1000.  No INT(); truncate with CHR$/TAB(/GOTO targets.
-;   - FOR/NEXT with a fractional STEP accumulates rounding error: STEP 0.25 is exact, STEP 0.1 is not (FOR X=0 TO 1 STEP 0.1 stops after 0.9
-;     because ten additions of 0.1 give 1.0000001).  '=' is exact equality.
-;   - RND is the new 16-bit LFSR seed as a float (signed, -32768..32767; never 0, so ABS(RND)/32768 is 0 < x <= 1).
+; Floating point
+;   - No E notation: 1E3 reads as 1 (the E3 is silently ignored); write 1000.  
+;   - No INT() rounding.
+;   - FOR/NEXT with a fractional STEP accumulates rounding error: STEP 0.25 is exact, STEP 0.1 is not
+;   - RND is 16-bit LFSR seed as a float (signed, -32768..32767; never 0, so ABS(RND)/32768 is 0 < x <= 1).
 ;
-; Trigonometry (v3.3):
-;   - SIN/COS reduce the argument as y = |x|*2/PI in single precision, so the result carries an angular error of about 6E-8*|x| radians (the
-;     reduction, not the polynomial, which is good to 4E-8).  Measured maximum error against double precision (tools/fn_diff.py):
-;     1.5E-7 in [0,PI/2], 4.4E-7 in [-2PI,2PI], 7E-6 up to |x|=100, 4E-4 up to 5000, 3.5E-3 up to 51000.  |x|*2/PI >= 32768 (|x| above about
-;     51471) gives ?R.  COS(PI/2) prints a tiny non-zero number: the single-precision argument is not exactly PI/2.
-;   - Name matching (v3.5): FN_DSP keys on the FIRST TWO letters (AB ABS, SI SIN, CO COS, AT ATN, AS ASIN, AC ACOS, SQ SQR, LN, EX EXP; RND on R); the
-;     rest of the word is eaten.  Any other word (TAN, TA..., SA...) is read as a variable, as before; nothing else aliases a function any more.
-;     In PRINT, CHR$ and TAB( are told from COS and TAN( by their THIRD letter (R / B).
+; Trigonometry 
+;   - SIN/COS reduces  argument y = |x|*2/PI in single precision, angular error of about 6E-8*|x| radians
 ;   - The library rounds half away from zero.  Against mbf4.py with rounding RN_AWAY, * and / were bit-exact and + - differed by 1 ULP in 1 of
 ;     300 random pairs (tools/lib_bitexact.py); the library was not changed.
 ;
-;
-; Power (v3.6):
-;   - x^y with y an integer 0..255 is y repeated multiplications (exact while the products are; slow only for large y); x may be negative or zero
-;     there (0^0 is 1, (-2)^3 is -8).  Any other exponent (fraction, negative, 256 or more) is EXP(y*LN(x)): x must be > 0, so a zero or negative
-;     base gives ?R (LN's error) and 2^-1 works while (-2)^-1 does not.  That path inherits LN and EXP's error, about 1E-6 relative for small
-;     results (10^0.3 prints 1.99526; 2^0.5 prints 1.41421), growing about 6E-8 * |y*LN(x)|.  10^2.5 prints 316.228; 10^-2 prints 0.01.
-;   - Overflow is ?O: 2^126 prints, 2^127 is ?O (the largest MBF4 is just under 2^127 = 1.7E38); 2^-200 gives 0 as EXP does for results below 1E-38.
-;   - The right operand is ONE atom: 2^N+1 is (2^N)+1, 2^-N is 2^(-N), 2^-N^2 is 2^(-(N^2)).  There is no ^ chain limit apart from the SW stack.
-;   - Cost in NESTING: every atom (a number, variable, function name, or open parenthesis) now pushes a 2-byte '^' continuation on the SW stack, so
-;     the expression nesting limit fell.  Measured with PRINT: ((...1...)) 14 -> 10 levels, 1+(1+(...)) 8 -> 6, ABS(ABS(...)) 11 -> 7 (a function
-;     name and its parenthesis are two atoms: 4 bytes a level).  Giving SWBASE 128 bytes and SWCAP_LIMIT 124 (two EQU/RES edits, 0 ROM bytes, 32
-;     bytes less program store) gives 14 / 9 / 9.  Not done by default: the program store is the scarcer RAM.
-;     The hardware call stack is unaffected: the ^ continuations are jumps, peak 7 (tests/depth.py over RUN, FOR, GOSUB, IF, nested functions, errors).
-;   - INT() is still not provided; FIX/INT/SGN were left out for lack of ROM (25 bytes free: FIX about 14 bytes, SGN about 29, a floor-INT about 38).
-;
-; Transcendental functions (v3.5), measured with tools/fn_diff.py (host model = the 2650 code bit for bit, against libm; the argument is the MBF4
-;   value actually used):
+; Transcendental functions
 ;   - Maximum error: ATN 1.6E-7 (absolute), ASIN 2.2E-7, ACOS 3.7E-7, LN 1.4E-7 on [0.1,10] and 1.4E-6 over 1E-6..1E7 (values up to 16), SQR 6.7E-7
 ;     relative, EXP 1.2E-6 relative for |x| <= 20 and 4.1E-6 for |x| <= 80 (about 6E-8*|x|: k*ln2 is formed in single precision).  LN(1) is exactly 0.
 ;   - ASIN / ACOS use (1-x)(1+x), exact near |x| = 1.  SQR(x) = EXP(0.5*LN(x)) is not exact for perfect squares in the last digit only (SQR(0.0001)
 ;     prints 0.00999999).
 ;   - Function calls nest, but each pending call costs software-stack bytes: about 8 nested functions (SQR(SQR(SQR(...)))) end in ?8.
-;   - Hardware call depth: each function stage starts at the caller's depth (2 at the prompt, 3 in RUN) and adds 4; chains (SQR, ASIN, ACOS) are
-;     separate stages joined through the software stack, so the 8-deep return stack never nests: peak 7 (tools/depth_trig.py, 83 stage entries).
-;   - The library's FLT_ADD / FLT_SUB keep only one guard byte: with a large alignment shift the result can differ from correct rounding by 1 ULP
-;     (the host model then differs by 1 ULP in about 1 value of 1000: attributed step by step to one addition in an ATN Horner chain).
 ;
 ; UPPERCASE only apart from PRINT "String literals"
 ;
@@ -108,14 +80,11 @@
 ;
 ; OPERATOR PRECEDENCE
 ;   BODMAS-lite, tightest first: ^   then   * /   then   + -   then relops.
-;   So "1+2*3" is 7, "2*3^2" is 18 and "1+2>2*2" is (1+2)>(2*2).  * / and + - are left-to-right
-;   among themselves; ^ and relops are right-to-left (see above).  Parentheses override.
 ;
 ; PARENTHESIS NESTING
 ;   Bounded by the SW stack (SWBASE, 96 bytes). Limit depends on expression
-;   complexity - operators within a level consume additional stack (v3.6: and 2 bytes per atom for ^) so a
-;   deeply-nested expression with many operators uses more stack per level.
-;   ERR_EXPR ('?8') fires gracefully when the stack is full. Practical
+;   complexity - operators within a level consume additional stack and 2 bytes 
+;   per atom for ^. ERR_EXPR ('?8') fires  when the stack is full. Practical
 ;   ceiling for typical BASIC expressions is 5-6 levels of mixed
 ;   paren/operator nesting.
 ;
@@ -155,7 +124,7 @@
 ;
 ;   ./asm2650 --no-warn-inline-label miniBASIC2650.asm miniBASIC2650.hex
 ;   grep -n "^CHIN \|^COUT \|^ROMEND " miniBASIC2650.LST
-;   ./pipbug_wrap --entry 0 --chin 0x<addr> --cout 0x<addr> miniBASIC2650.hex   (--cout at an UNUSED address runs the real bit-banged COUT)
+;   ./pipbug_wrap --entry 0 --chin 0x<addr> --cout 0x<addr> miniBASIC2650.hex
 ;
 ; ROMEND is used as ROM tide mark
 ;
@@ -196,269 +165,37 @@
 ; =============================================================================
 ;
 ;                                                                                                        
-; v3.6 (Oct 2026) - FLT_* code golf to get the ROM back inside the 4 KB EPROM, then the ^ operator.  v3.5 was 4098 bytes ($1002, two over); ROMEND is now
-;   $1000 exactly (the RAM `ORG 4096` is back: the assembler fails the build if the ROM passes $1000), CODEND $0F4B, 25 bytes free below the tables.
-;   Banner 3.6.  No change to the language or the numerics apart from ^ (every library routine gives the same results: see Tested).
-;   - Golf, 147 bytes in all (ROMEND $1002 -> $0FAD = -85 in the first four steps; then the table pin and the vectors; CODEND $0F10 -> $0ED3 = -61):
-;       NORM_PACK  -25  an all-zero mantissa is detected by OR-ing FA+2, FA+3 and FDB (FA+1 = 0 test dropped): one branch, no shift-until-FER-runs-out
-;       FLT_PRINT  -44  one position loop (FPNRD / FPOL / FPDG / FPPC with R3 = P+64) for the integer and fraction digits, replacing two output stages
-;       DIGV        -7  the digit-value table is gone: FPDIG stores the digit, MUL_BY_TEN runs, DIGI is reloaded for the COMI,R1 7
-;       FLT_ADD     -9  FA = 0 / FB = 0 shortcuts as BCTR/RETC,EQ; swap test by COMA + BCFR,GT; one sign loop FASG/FASL indexes FSA by 0 / 5 (FSB = FSA+5)
-;       table pin   --  `ORG $0F64` before SCT..EXPT + CILN2 + SETP (140 bytes of tables, one page): the pad is CODEND..$0F64 and ROMEND stays $1000
-;       vectors    -39  page-zero vectors VLD_B_PTR (12 callers), VSETP (7), VFN_END (7) -- the table is now FULL at 31 entries; ST_Z / ST_T / LD_Z / LD_T
-;                       entry points (LODI,R2 slot / DB $EC / LODI,R2 slot) replace 15 `LODI,R2 xSLOT / BSTA ST_FA|LD_FB` pairs
-;       FLT_CMP, FLT_TO_INT tail (FTIG/FTIP), EXPCHK (CC from EORI, RETC,GT/LT), INC_FER (shared by FLT_ADD's FASM and NORM_PACK's NPRND)   -22 together
-;     Not changed: FLT_PARSE (a rewrite was tried and reverted at the owner's request; it keeps its measured accuracy, 954 of 1040 literals exact and 86 within
-;     1 ULP, tests/lit.py), the stream tables, the function stages.
-;   - ^ (+120 bytes, CODEND $0ED3 -> $0F4B): EXPR_ATOM pushes the continuation POW_LOOP after every atom (one site: the unary signs recurse into
-;     EXPR_ATOM); POW_LOOP looks for '^' and, if found, enters OPS_HIT_HI with TOK_CHARS row 21 (STMT_EXEC's scan length 21 -> 24, one new row), which
-;     pushes FA and parses ONE atom (that atom pushes POW_LOOP again: x^y^z = x^(y^z), and -2^2 = -4, 2^-2 = 0.25).  DO_POW (JMP_VEC target) takes the
-;     integer path for 0 <= y <= 255 (HCNT repeated FLT_MUL, exact) and otherwise chains LN_RET -> POW_2 (y * ln x) -> EXP_RET as function stages do
-;     (x <= 0 gives LN's ?R).  Cheaper than the stub-per-operator route: the operator rides the existing OPS_HIT frame and row dispatch.
-;   - Tested: build outputs against the v3.5 build: 61 programs, PRINT edge cases, the compare matrix, FLT_TO_INT range edges, an edge-arithmetic set and
-;     the direct-mode checks are bit-identical after each step; the ^ battery (89 cases: integers, zero, negatives, fractions, nesting, associativity,
-;     unary signs, errors, overflow/underflow) correct; hardware RAS peak 7, never 8, with ^ in RUN, FOR limits, GOSUB, IF, nested parentheses and
-;     functions, and the error exits (tests/depth.py, which understands CPSU $07 resetting the stack pointer); showcase output identical to v3.5 apart
-;     from the banner and the two new lines 578 / 580.
-;   - Found: ^ costs SW-stack bytes (2 per atom), which lowers the expression nesting limit (see KNOWN LIMITATIONS: 14 -> 10 parentheses, ABS( 11 -> 7).
-;     The 32-byte SWBASE option restores most of it for no ROM.  Free ROM left (25 bytes): FIX ~14, SGN ~29, a floor INT ~38 (estimates, not built).
-;   - Possible further gain, not made: the page-zero vector table is full, so an under-used vector (fewer than 3 callers) could be swapped for a
-;     better one; worth about 3-5 bytes.
+; v1.0 (Oct 2026) - Code Golf and Power Operator ROMEND $0FAF (4015 bytes)
+;   - ^ (+120 bytes): EXPR_ATOM pushes the continuation POW_LOOP after every
+;     atom (one site: the unary signs recurse into
 ;
-; v3.5 (Oct 2026) - ATN ASIN ACOS SQR LN EXP (Stage 5 tier 2), on the golfed v3.4.  EXPERIMENT BUILD: the RAM `ORG 4096` is removed, so the ROM may grow
-;   past the 4 KB EPROM and RAM simply follows ROMEND.  ROMEND $1002 = 4098 bytes: TWO BYTES OVER $1000 BEFORE ANY GOLF (v3.4: $0D72 = 3442, +656).
-;   Boot FREE 1039 (RAM now starts at $1002; the showcase grew by 196 bytes), FREE after NEW 3694.  Banner 3.5.
-;   - Algorithms of the 65C02 build (ATAN with the |x| > 1 reduction and an odd polynomial, ASIN = ATAN(x/SQRT(1-x*x)), ACOS = PI/2 - ASIN,
-;     SQRT = EXP(0.5*LN), LN with E*ln2 + z*Q(z*z), EXP with k*ln2 and a Horner polynomial) with these 2650 differences: (1) 8-coefficient ATN, 4-coefficient LN
-;     and 8-coefficient EXP tables fitted for single precision (the 65C02 ones are good to about 2E-4); (2) LN reduces m into [1/sqrt2, sqrt2), so LN(1) is
-;     exactly 0 and four coefficients do; (3) ASIN uses (1-x)(1+x); (4) EXP checks k and scales the exponent with overflow (?O) / underflow (0) tests, where
-;     the 65C02 build wraps silently; (5) no PUSH_FLT_A: three 4-byte slots (TS = DIG + PSAVE) and the coefficient streams replace the hardware-stack parking.
-;   - CHAINS, not calls: the return stack is 8 deep, and SQR -> LN -> HORNER_ODD -> HORNER_EVAL -> FLT_MUL -> inner would nest 9.  Every function is a
-;     continuation stage that ends in PARSER_RET; SQR = LN stage, SQR_2 (halve), EXP stage; ASIN = ASN_RET, the SQR chain, ASN_2, ATN_BODY; ACOS = ASIN, ACS_2.
-;     A stage pushes the next one with PUSH_RET and jumps to the first.  Stages call the library directly and never through a helper that itself calls
-;     HORNER_ODD, so the peak stays at the caller's depth + 4 = 7.
-;   - DISPATCH: FN_DSP, a scanner over a table of two-letter keys with a parallel table of continuation addresses, replaces the compare chain and the DO_ABS /
-;     DO_SIN / DO_COS stubs (52 bytes of code + 37 of tables for nine names, 4 bytes per further name).  Measured on assembled prototypes against the extended
-;     chain: the table loses 29 bytes at 3 names, breaks even at 5, saves 27 at 7, 50 at 8, 70 at 10.  STMT_EXEC's TOK_CHARS / MD_SCAN was NOT reused: the
-;     scan compares R2 (live in an expression), its no-match exit is SE_NOTKW, EATWORD returns in the other register bank, and its rows are jump targets
-;     (a stub per function) not continuation addresses.  The key is the first two letters (all nine distinct), not the third: the second is the one
-;     PK_C2_NO_R2 already tested, and it accepts the spellings ASIN/ASN, ATN/ATAN, SQR/SQRT without extra rows.
-;   - Streams: SCT (sin), ONES + ATT + PIO2 (atn), LNT, EXPT: 140 bytes of 4-byte MBF4 entries that must share ONE page (SETP stores the page of SCT;
-;     LD_B_PTR adds 4 to the low byte).  tools/check_tables.py checks it; SETP and CILN2 sit after the tables to put the stream area in $0F65..$0FF0.
-;     tools/gen_coeffs.py v2.0 makes every entry.
-;   - RAM: QF, HPTR, HCNT and the new EK are four plain bytes (5 bytes with HPTR's two); TS grows from DIG (8) to DIG + PSAVE (12): XSLOT = PSAVE holds
-;     ASIN's x for the whole chain (LN, EXP and HORNER use ZSLOT / TSLOT only).
-;   - Branch forms: the block sits 300-800 bytes from its callers, so about 40 BSTR/BCTR became BSTA/BCTA; tools/fixbr.py settles them from the assembler's
-;     own hints.  Placing the helpers (ST_FA, LD_FB, LD_B_PTR, HORNER_*) between the stages would recover most of that: golf.
-;   - Showcase: lines 570-576 (4*ATN(1), ASIN(.5), SQR(2), LN(10), EXP(1), SIN(ASIN(.3))).  Mandelbrot plot unchanged.
-;   - Tested: 1040 values bit-exact against tools/fn_model.py (1039 exact, 1 within 1 ULP: the library FLT_ADD, see KNOWN LIMITATIONS); probes p1..p9 identical
-;     to v3.4; p11_fn (every function, domains, nesting, name collisions); p10_trigdepth (83 stage entries: base 3, +4, peak 7).
-;   - Found and fixed on the way: EXP's underflow test used a signed compare (exponent bytes >= $80 looked negative: SQR(0.25) gave 0).
+; v0.8 (Oct 2026) Inverse Trig & EXP/LN - ROMEND $1002 (4098 bytes)
+;   - ASIN = ATAN(x/SQRT(1-x*x)), ACOS = PI/2 - ASIN, SQRT = EXP(0.5*LN), LN with E*ln2 + z*Q(z*z),
+;     EXP with k*ln2 and a Horner polynomial) 
+;   - DISPATCH:Aded FN_DSP to dispatch functions based on 2 character matching.
 ;
-; v3.4 (Oct 2026) - Merge of the two v3.3 branches: the code-golf pass (golf, ROMEND $0C7B = 3195) and SIN/COS with the extended showcase
-;   (trig, ROMEND $0E99 = 3737; both derive from v3.2).  ROMEND $0D72 = 3442 bytes: SIN/COS costs +247 bytes on the golfed base (+268 on v3.2);
-;   654 bytes remain below the $1000 end of the 2732 EPROM.  Boot FREE 1242.  Banner 3.4.  No change to the BASIC language or to the numerics.
-;   - Merge: three-way against v3.2 (git merge-file, v3.2 as base): clean apart from the header.  The one semantic clash: the trig block called
-;     FLT_A_TO_B, FLT_B_TO_A, SAVE_A and REST_A, which the golf pass deleted.  They are NOT restored (+44 bytes); the trig block was adapted:
-;     SC_CORE: FLT_TO_INT leaves FA = y alone and FLT_FROM_INT_B builds q straight into FB, so SAVE_A / FLT_FROM_INT / FLT_A_TO_B / REST_A become
-;       one ZBSR.  HORNER_ODD: ST_FA / LD_FB (generic 4-byte slot copies, R2 = slot offset, the FA2VAR loop idiom) replace SAVE_A / REST_A /
-;       A_TO_B / B_TO_A / SAVE_Z / LD_B_Z; one FSWAP gives S = c4 and FB = z; the last multiply is P(z)*t, not t*P(z) - FLT_MUL forms the exact
-;       48-bit product and rounds once, so it is commutative (and A*B = B*A held for 3000 full-mantissa products in a BASIC probe).
-;   - RAM: still none new.  TS = DIG (slots ZSLOT = 0: z = t*t, TSLOT = 4: t); QF / HPTR / HCNT moved from DIG to PSAVE, which only FLT_PARSE uses (inside
-;     itself: no literal is half parsed while SIN / COS runs).  PSAVE's header comment fixed (FLT_PRINT no longer touches it).
-;   - Golf follow-up: new page-zero vector VFLT_MUL (5 callers, -3); ABS_RET uses BSTR (-1); the five leftover assembler hints from the golf branch
-;     applied (four LODI,R0 0 -> EORZ,R0, one BCTR,LT -> RETC,LT in FLT_CMP; -5).  --warn=all is now silent.  Vectors: 27 of the 31 slots used.
-;     Not done: VFLT_TO_INT (3 callers, would save 1 byte for a slot).  Free vector slots: 4.
-;   - Constraint kept: SCT must not cross a 256-byte page (low byte of SCT <= $E8; it is $56 in this build).
-;   - Tested (pipbug_wrap, CHIN/COUT re-read from the .LST, --crlf $7FFF): showcase output identical to the trig branch (apart from boot FREE) and,
-;     with the trig section removed, to the golf branch; non-trig batteries (expressions, relops, FOR/GOSUB/IF/INPUT, 6-digit printing, 60 random
-;     + - * / lines, errors ?Z ?8) identical to the golf branch; SIN and COS of 5 sweeps (~1500 arguments: +-7, +-2000, 0..0.93, to 51000, multiples of PI/2)
-;     bit-identical to the trig branch, compared as raw bytes written to the result variables; peak hardware RAS depth 7, no wrap, in nested
-;     parentheses (to the ?8 limit), under GOSUB / FOR / IF, at the prompt and from RUN.  Not testable in the simulator: the bit-banged CHIN body.
+; v0.6 trig branch (Oct 2026) - Stage 5 tier 1: SIN and COS (radians).  ROMEND $0E99 (3737 bytes)
+;   - DO_SIN/DO_COS (atoms), SIN_RET/COS_RET, SC_CORE, HORNER_ODD, table-driven, reusable for ATN/LN/EXP
+;     LD_B_PTR / LD_B_Z / SAVE_Z, and SCT (2/PI, 1.0, five minimax coefficients.
+;   - Method: y = |x|*2/PI, q = TRUNC(y), f = y - q;  n = (q + offset) AND 3 
+;     (SIN: offset 0, 2 for x < 0;  COS: 1);  t = f, or 1 - f for odd n; r = t * P(t*t) = sin(PI*t/2);
+;     r = -r when n AND 2.
+;   - The library rounds half away from zero
 ;
-; v3.3 golf branch (Oct 2026) - code-golf pass to free ROM for the trig functions.  ROMEND $0D8D -> $0C7B (3469 -> 3195 bytes, -274; ~901 bytes
-;   free below $1000).  (v3.2's header said $0D8F; the v3.2 image actually assembled to $0D8D.)  No behaviour change: the output of the
-;   showcase and of six extra regression scripts (expressions, FOR/GOSUB/IF/INPUT programs, 6-digit printing, 100s of random
-;   +-*/ residual checks, ?8 nesting limit) is byte-identical to v3.2, and the peak RAS depth is unchanged (7, CHIN/COUT included).
-;   Changes, roughly by size:
-;   - FA2VAR / VAR2FA / VAR2FB: three small alt-bank loops replace the unrolled DL_STORE, PF_LV, FA_TO_BLK and BLK_TO_FB copies (-58).
-;     FWRK (the FOR limit/step block) now sits right after VARS and is reached as VARS+LIMOFF / VARS+STPOFF, so it needs no routines of its own.
-;   - FLT_FROM_INT/FLT_TO_INT: exponent, sign and bit count live in alt R2/R3 instead of FER/FSA/FDE; this also removed PRINT's T2 park of FDE
-;     and FTIS (-36 together).  FLT_TO_INT now clobbers R2 (and no longer FDE).
-;   - FLT_PARSE has no sign handling any more: PF_INP (INPUT, the only caller that can see a sign) eats '+' / negates after '-' (-35).
-;   - 11 more page-zero vectors (VFLT_ADD, VPUTC, VFLT_ZERO, VFA2VAR, VFLT_CMP, VFLT_NEGATE, VFSWAP, VFLT_TEN_B, VSHL_MANT, VMUL_BY_TEN,
-;     VFROM_INT_B): every BSTA/BCTA,UN to a target with 3+ callers is now a 2-byte ZBSR/ZBRR (-19).  Table: 26 of the 31 possible slots used.
-;   - OPS_HIT_COM / OPS_HIT_RET push and pop the operator frame with 4-iteration loops; the frame order is now [row offset][FA0..FA3] (-26).
-;   - FLT_DIV: one shared FDSUB (R -= D) replaces the FDS/FDT/FDF loops; the trial subtract is done in place and put back with an add on a
-;     borrow, so the RT scratch is gone (-25 ROM, -3 RAM).
-;   - PUSH_RET compares R3 directly (no SC0 stash), SWRETURN pops with one SUBI, PARSER_RET uses COMI,R3 (-13).  DO_NEW reuses
-;     SET_TMP_PROG + REG16 (-4).  DO_FOR's default STEP 1.0 reuses FLT_ZERO (-4).
-;   - FLT_ADD's FA=0 shortcut and FPSKD use FSWAP, so FLT_A_TO_B and FLT_B_TO_A are gone (-22); FLT_NEGATE / FLT_NEGATE_B share one body (-7).
-;   - SAVE_A / REST_A inlined into FLT_PARSE (their only user now); FDEADD helper for FLT_PRINT's FDE steps; DOP_TRUE loses a
-;     STRZ/LODZ pair; five branches converted to relative form after the assembler's warnings.
-;   Library contract changes (the MBF4 library is no longer 'verbatim'): FLT_PRINT leaves FA destroyed (was |FA|); FLT_ADD's FA=0 shortcut
-;     leaves FB = 0 (was FB intact); FLT_NEGATE now clobbers R1; FLT_TO_INT/FLT_FROM_INT use alt R2/R3 (see their headers).
-;   Tools: asmdup.py (instruction-level duplicate finder) and the assembler's 'can use relative form' warnings found most of the leftovers.
+; v0.5 (Oct 2026) - RND improvements - ROMEND $0D8F (3471 bytes).
+;   - Ported from uBASIC2650 v2.12 - RND_SHUFFLE now runs in reg bank 1 (PPSL/CPSL PSW_RS+PSW_WC)
+;   - New PRE_CHIN (RND_SHUFFLE once, then falls into CHIN); GETLINE calls 
+;     PRE_CHIN; the LFSR now steps once perkeystroke in the simulator too
 ;
-; v3.3 trig branch (Oct 2026) - Stage 5 tier 1: SIN and COS (radians).  ROMEND $0D8D -> $0E99 (3469 -> 3737 bytes, +268); 359 bytes remain below the $1000 end
-;   of the 2732 EPROM.  (v3.2's header said $0D8F / 3471; the assembler gives $0D8D / 3469 for the v3.2 source as received.)
-;   - New block S_TRIG..E_TRIG after the Stage 3 library, which is unchanged (240 bytes): DO_SIN/DO_COS (atoms), SIN_RET/COS_RET, SC_CORE, HORNER_ODD
-;     (table-driven, reusable for ATN/LN/EXP), LD_B_PTR / LD_B_Z / SAVE_Z, and SCT (2/PI, 1.0, five minimax coefficients, 28 bytes).
-;   - Method: y = |x|*2/PI, q = TRUNC(y), f = y - q;  n = (q + offset) AND 3  (SIN: offset 0, 2 for x < 0;  COS: 1);  t = f, or 1 - f for odd n;
-;     r = t * P(t*t) = sin(PI*t/2);  r = -r when n AND 2.  Horner evaluation, coefficients from tools/gen_coeffs.py.
-;   - Hooks, 28 bytes: EXPR_ATOM dispatches 'S' and 'C' (+10); DO_PRINT tells CHR$/TAB( from COS/TAN( by the third letter (+16: it moved DP_SEP out of BCTR
-;     range, so three branches became BCTA); EXPR's two PUSH_LOLOOP/PUSH_HILOOP calls became BSTA (+2, BSTR was out of range).
-;   - No new RAM: ZV, QF, HPTR, HCNT alias the 8 bytes of PRINT's private digit buffer DIG, which is free while a function is evaluated.
-;   - Call depth (tools/depth_trig.py): the continuation starts at depth 2 (prompt) or 3 (RUN, also under nested IF/GOSUB/FOR) and adds 4
-;     (SC_CORE -> HORNER_ODD -> FLT_MUL/FLT_ADD -> inner call).  Peak 7, the same as the existing maximum; 8 is never reached.
-;   - Showcase: trig section lines 520-590 (297 jumps to 520, 590 jumps back to 300): values, a degrees table, S^2+C^2, a one-period sine wave.
-;     Boot FREE 1608 -> 1238.  Mandelbrot plot unchanged (924 cells, 0 differences from the golden model).
-;   - Tested: SIN/COS bit-exact against the host model tools/fn_model.py (520 values, 0 mismatches, with the model rounding half away like the
-;     library); p1..p8 identical to v3.2 apart from banner and boot FREE; probes p9_trig (values, nesting, FOR/IF/GOSUB, name collisions,
-;     errors) and p10_trigdepth (depth).
-;   - Found, not changed: the library rounds half away from zero (the golden model's default is half to even); see KNOWN LIMITATIONS.
+; v0.4 (Oct 2026) - Showcase converted to floating point (Stage 4 of the miniBASIC2650 plan).  
 ;
-; v3.2 (Oct 2026) - RND improvements ported from uBASIC2650 v2.12 (RND_SHUFFLE, PRE_CHIN, DO_RND).  ROMEND $0D8A -> $0D8F (3466 -> 3471 bytes, +5).
-;   - RND_SHUFFLE now runs in register bank 1 (PPSL/CPSL PSW_RS+PSW_WC): the caller's bank-0 R1-R3 survive (R0 is not banked, so it does not).
-;     v3.1's version ran in bank 0 and clobbered R1.  That was harmless from DO_RND but not from CHIN, which called it before its own bank
-;     switch and so destroyed GETLINE's buffer index on real hardware; the simulator intercepts CHIN, so it never showed there.
-;   - New PRE_CHIN (RND_SHUFFLE once, then falls into CHIN); GETLINE calls PRE_CHIN; CHIN no longer shuffles.  The LFSR now steps once per
-;     keystroke in the simulator too (CR included), so the first RND depends on the typing before RUN there as well (v3.1: always -7764).
-;     Hardware trade-off: v3.1's CHIN stepped the LFSR once per idle-line poll (keypress-timing entropy); that source is gone.
-;   - GET_RND removed.  DO_RND does the mix itself: 8 LFSR steps per RND, result = the NEW seed as a float (v3.1: 1 step, the OLD seed).
-;     DO_RND grew 4 bytes; EXPR_ATOM's BCTR,EQ DO_RND became BCTA,EQ (DO_RND is now beyond relative range), +1 byte.
-;   - Comments: DO_RND given its own header (the EXPR header had been sitting above it, now back above EXPR); EXPR_ATOM no longer cites
-;     TRY_RND/GET_RND; header RND text and KNOWN LIMITATIONS RND bullet rewritten.
-;   - Showcase lines 78 (five raw RNDs) and 79 (three 0..1 values) added after line 77.  Boot FREE 1724 -> 1608.  Banner 3.1 -> 3.2.
-;   - Tested (simulator): showcase output identical to v3.1 apart from banner/FREE and the RND lines; RND_SHUFFLE keeps R1-R3 and
-;     matches v3.1's LFSR step; RND values match a host LFSR model (1 step per typed char, 8 per RND); prompt-level RND in
-;     expressions, assignment, IF, GOSUB OK.  Not testable in the simulator: the bit-banged CHIN body itself (intercepted).
-;
-; v3.1 (Oct 2026) - Showcase converted to floating point (Stage 4 of the miniBASIC2650 plan).  NO code change except the banner text
-;   ('miniBASIC2650 3.0' -> '3.1', same length): ROMEND $0D8A = 3466 bytes, library and interpreter bytes identical to v3.0.
-;   - Mandelbrot: lines 620/625/630 lose the /64 fixed-point scaling (T=A*A-B*B+C, B=2*A*B+D, test 4<A*A+B*B); 320/350 give real coordinates
-;     D=(R-10)/8 (-1.25..1.25, step 0.125 = twice the column step: square pixels on 2:1 character cells) and C=Q/16-2.25 (-2.25..0.4375).
-;     Line 305 (M=16, the iteration limit) is unitless and unchanged.  Same 44 x 21 plot; the set is now symmetric about row 10 (D=0 is sampled).
-;   - New showcase lines: 71-77 true division, decimals, 6-digit printing, no 16-bit wrap, RND and ABS(RND)/32768; 133-134 decimal compares;
-;     271-274 FOR with STEP 0.25.  Title line 20 now says miniBASIC2650.  CHR$/TAB( lines 40/44/430/440 work unchanged through FIX (truncation).
-;   - KNOWN LIMITATIONS rewritten (E notation, fractional STEP error, RND, ?Z ?O ?R, program store).  Boot FREE 2169 -> 1724.
-;   - Open items settled by the owner: RND stays the integer seed as float (no 0<=RND<1 code), E notation stays a documented limitation, no
-;     page-zero vectors for PRT_INT / FIX_EXP.
-;   - Layout only (no revision change): every 'LABEL: INSTRUCTION' pair now has the label on a line of its own (the Signetics assembler
-;     requires it); 90 lines split, instruction and comment columns kept.  Hex byte-identical.  Name/EQU/RES/DB definitions unchanged.
-;
-; v3.0 (Oct 2026) - 32-bit MBF4 floating point (Stage 3 of the miniBASIC2650 plan).  ROMEND ROMEND $0D8A = 3466 bytes.
+; v0.3 (Oct 2026) - 32-bit MBF4 floating point (Stage 3 of the miniBASIC2650 plan).  ROMEND $0D8A = 3466 bytes.
 ;   - Every numeric value is MBF4.  Expression result and right operand: FA; the left operand pops into FB (OPS_HIT_RET); EXP (EXPH:EXPL)
 ;     stays the 16-bit INTEGER register (FLT_TO_INT out / FLT_FROM_INT in) so the IPH-relative pair table and REG16_TO_REG16 are untouched.
-;   - Library mbf4_lib.asm v1.0 (1583 bytes) spliced in verbatim, FP code runs in the alternate register bank (PPSL $10 ... CPSL $10 at every
-;     call site; the library itself is entered/left in that bracket).  R2 (variable) and R3 (SW-stack index) survive every expression.
-;   - Operator frame on SWBASE 5 bytes (FA + row offset) + continuation; SWBASE 96 bytes, SWCAP_LIMIT 92.  VARS stride 4 (104 bytes).
-;     FOR frame 11 bytes [var][limit 4][step 4][body 2], FSTKLIM 44 (4 nested loops), real limit and STEP.  Booleans are -1.0 / 0.0.
-;   - New glue: PF_INP/PF_NUM/PF_INT (literals; PF_NUM TAIL-JUMPS into FLT_PARSE: a BSTA would reach hardware depth 8 on a FOR literal),
-;     FIX_EXP, PRT_INT, PRT_FA, FA_TO_BLK/BLK_TO_FB.  DO_ERROR starts with CPSU $07 (error print independent of the depth the error came from).
 ;   - Deleted (now FP): ADD_CORE, CMP_OPS, NEG_EXP/ABS_TMP/NEG_SHARED, ABS_EXP, MULT_LOOP, DIV16/MUL16, PARSE_S16/PARSE_U16, PRINT_S16, CLR_EXP,
 ;     the power-of-10 tables, NEGFLG, vectors VCLR_EXP and VNEG_EXP_BODY.  Banner 'miniBASIC2650 3.0'.  Depth: peak 7 (tools/depthtrace.py).
 ;
-; v2.11 (Sep 2026) - Code golf: REG16_TO_REG16 generic 16-bit copy.
-;   - Replaced EXP16_TO_ET/TMP_TO_ET and DE_LOOP, DR_SWSTK,DN_LIM, GR_LP, OG_SAV
-;     copy loops with REG16_TO_REG16 using R0 = packed (SRC_IDX<<4)|DST_IDX pair. 
-;   - RAM reorg: PEH/PEL and SC0/SC1 moved contiguous for use with REG16.
-;   - ROMEND $07EF (2031) -> $07D0 (2000 bytes), -31.
-;
-; v2.10 (Sep 2026) - BUG FIX: mid-list line insert corrupted following line.
-;   - OPEN_GAP's move loop decrements PE via an inlined former DEC_PE.
-;     However still used "RETC,EQ" for fast path so bailed early. Fixed by 
-;     jumping to where subroutine end would be.
-;     ROMEND $07EF (2031 bytes)
-;
-; v2.9 (Sep 2026) - Added ABS(x) function to EXPR, and FREE memory statement.
-;   -  ROMEND $07C5 (1989) -> $07EE (2030 bytes).
-;
-; v2.8 (Sep 2026) - Code golf, ported from pBASIC2650.asm v0.33.
-;   - New ADD_CORE: shared 16-bit indexed add (EXPH:EXPL += *(IPH+off)) used by
-;     DO_ADD and MULT_LOOP, deleting CARRY_INTO_EXPH. 
-;   - Minor Refactor ABS_EXP for size.
-;   - DV_LP: removed leading CPSL $08 (matches pBASIC's) global invariant.
-;   - ROMEND $07E1 (2017) -> $07C7 (1991 bytes).
-;
-; v2.7 (Sep 2026) - BASIC line editing, LET/THEN/INPUT and FOR/NEXT restored.
-;   - TRY_STORE_LINE: FIND_LINE; if the line exists DEL_REC removes it and
-;     FIND_LINE is repeated.  New DEL_REC (fwd copy), OPEN_GAP (backward copy)
-;     and DEC_PE. Line numbers > 32767 rejected with syntax error. 
-;   - PROGLIM (EQU $1FFF, must be $xxFF): OPEN_GAP builds the new PE in EXP,
-;     checks its hi byte, and only then moves anything; store full gives ?3
-;     (ERR_OOM) with the store untouched (+10). A REPLACE that does not fit has
-;     already deleted the old line. 
-;   - Relop refactor, added '>': 3-way compare, each handler picks its CC (EQ/LT/GT).
-;   - FOR/NEXT: body runs at least once.
-;   - FOR/NEXT frame is pushed/popped by loops 
-;   - STEP added, frame widened to 7 bytes, holding [var][limit lo/hi]
-;     [step lo/hi][body lo/hi]; 
-;   - SHOWCASE updated for new keywords amd relops.
-;   - Golf pass - duplicate digit test (LODA,R0 *IPH; SUBI,R0 A'0';
-;     COMI,R0 9) inlined in TRY_STORE_LINE and PARSE_U16, now DIGIT_CHECK.
-;     ROMEND $07FA (2042) -> $07F5 (2037 bytes);
-;
-; v2.6 (Sep 2026) - Code-golf and Bigfix.
-;   - STMT_EXEC/MD_SCAN: dispatch scan now starts at 1st STATEMENT row, skipping
-;     operator rows to fix crash bug when a line started with an operator.
-;   - BUG FIX: TSL_CPYDONE's "tail call" into TMP_TO_ET used BSTA instead
-;     of BCTA.
-;   - BUG FIX DR_LP only cleared RUNFLG when TMP>PE (overrun), not equal. 
-;   - PARSE_VAR_SAVE/PARSE_FACTOR/TRY_STORE_LINE/PU16/EATWORD: two-comparison 
-;     signed replaced with SUBI+COMI+single unsigned branch throughout. 
-;   - PARSE_VAR_SAVE now threads the VARS byte-offset (index*2) through R2
-;     instead of the raw letter;
-;   - FIND_LINE/FIND_INS: INC16_TMP_TO_EXP deleted.
-;   - DO_EQOP/DO_LTOP: intermediate compare byte now parked in R1 not SC0.
-;   - DIV16: remainder was unused, no MOD operator. DV_LP/DV_SUB/DV_SNB's 
-;     refactored into destructive subtract-and-test-borrow pass
-;   - PRINT_S16: removed the R2 save/restore 
-;   - DR_HDR: refactored to use shared TMP_TO_ET call 
-;   - NEGFLG polarity flipped to 0=negate across PARSE_S16,ABS_TMP, ABS_EXP,
-;     NEG_EXP, DO_MUL, MU_DONE. 
-;   - IBUF moved to $1010 so GETLINE now sets IPH:IPL with one LODI.
-;   - MUL16's multiply loop and PU16's x10 shareMULT_LOOP leaf sub. PU16_DIG
-;     doesnt need EXP16_TO_TMP so deleted.
-;   - ROMEND: $079C -> $06f6 (1948 -> 1782 bytes)
-; v2.5 (Sep 2026) - Added niladic RND to the expression parser.
-;   - EXPR_ATOM: added 'R'-then-alpha check - cant use PEEK_C2_ALPHA due to R2
-;   - Golf pass, all over.
-;   - ROMEND: $0800 after RND detection -> $07AF (1976 bytes)
-;   - Stored-program end of line terminatorchanged to NUL from CR, matches what
-;     STMT_EXEC/EXPR/EATWORD/etc need so DO_RUN executes straight out of PROG. 
-;     Updated Showcase's terminator lines to match.
-;   - ROMEND: $07AF -> $0797 (1943 bytes)
-; v2.4 (Sep 2026) - Added GOSUB/RETURN; golf pass; showcase exercises both.
-;   - GOSUB/RETURN: TOK_CHARS only matches 1st ketter, so GOTO/GOSUB share a
-;     row (as do RUN/RETURN) 
-;   - Showcase: added "--- GOSUB/RETURN ---" section and updated Mandelbrot.
-;   - Added RND_Shuffle pseduo random sequnce ready for RND keyword.
-;   - ROMEND: $0774 -> $07DA 
-; v2.3 (Sep 2026) - Fixed broken Mandelbrot output; golf pass.
-;   - Golf pass
-;   - ROMEND: $0784 -> $0774 (1925 -> 1908 bytes)
-; v2.2 (Sep 2026) - CHR$(n) and TAB(n) added to PRINT; WR statement removed
-;   - Showcase updated
-;   - ROMEND: $0785 (1925 bytes)
-; v2.1 (Sep 2026) - Recursive parens SW stack BODMAS-lite restored on top.
-;   - SWBASE grown to 64 bytes; MU_DONE now pushes HI_LOOP continuation so
-;     */  chaining (e.g. "2*3*4", "100/5/2") evaluates left-to-right correctly.
-;   - ROMEND: $0767 (1895 bytes)
-; V2.0 (sep 2026) - 
-;   - BODMAS layered on afterward: every "give me a fully-resolved value"
-;     site now pushes {LO_LOOP, HI_LOOP} (HI checked first); LO operators'
-;     own right-operand ALSO pushes {HI_LOOP} (so "3+4*5" groups as
-;     "3+(4*5)"); HI operators' own right-operand does not - chaining
-;     ("2*3*4") happens via DO_MUL/DO_DIV looping back to HI_LOOP directly,
-;     preserving left-to-right associativity (required for correct "/"
-;     chaining, e.g. "100/5/2"). TOK_CHARS reordered (*/  first) so each
-;     tier's scan is a contiguous sub-range; DO_MUL's RXSAVE-based MUL-vs-
-;     DIV check re-derived from the new table position (offset 2, not 8)
-;     by simulator trace, not assumed.
-;   - ROMEND: $075D (1885 bytes)
-;
-; Branched from pBASIC V0.22
+; Branched form uBASIC2650 V2.11, which branched from pBASIC V0.22
 ; =============================================================================
 
 ;  ASCII Defines
@@ -489,7 +226,7 @@ PSW_WC          EQU     $08             ; WC (With Carry) bit in PSL (bit 3)
 PSW_FLAG        EQU     $40
 
 ; REG16_TO_REG16 register indices (idx*2 = byte offset from IPH; see the
-; "Ordered group" RAM comment). v2.11.
+; "Ordered group" RAM comment). 
 IDX_IP    EQU 0
 IDX_TMP   EQU 1
 IDX_GOTO  EQU 2
@@ -540,7 +277,7 @@ VSET_TMP_PROG:
 VCMP_TMP_PE:
         DW CMP_TMP_PE
 VREG16_TO_REG16:
-        DW REG16_TO_REG16    ; v2.11: generic nibble-packed 16-bit copy
+        DW REG16_TO_REG16    ; generic nibble-packed 16-bit copy
 VPUSH_RET:
         DW PUSH_RET
 VPARSER_RET:
@@ -756,12 +493,12 @@ JMP_VEC:
 ; from EXPR operators
 ; =============================================================================
 ;  OPS_HIT_RET -- continuation after the right operand: pop the row offset and the LEFT operand (4 bytes) and dispatch the operator.
-; In:  SWBASE: [row offset][FA0][FA1][FA2][FA3] <- top (pushed by OPS_HIT_COM; v3.3 order); FA = right operand
+; In:  SWBASE: [row offset][FA0][FA1][FA2][FA3] <- top; FA = right operand;  R3 = SW-stack byte count
 ; Out: FB = left operand, R1 = TOK_CHARS row offset, jump through JMP_VEC to DO_ADD/SUB/MUL/DIV/EQOP/LTOP/GTOP
 ; Clobbers: R0, R1, R3 (popped by 5), FB
 OPS_HIT_RET:
-;  POP the left operand (4 bytes, pushed FA0..FA3, top = FA3) into FB, then the row offset beneath it
-        ADDI,R3 1                ; one above the top: the pre-decrement loads below start at FA3
+;  POP the left operand (4 bytes, pushed FA0..FA3, top = FA3) into FB, then the row offset beneath it.  R3 is a byte COUNT, so the
+;  pre-decrement load at SWBASE,R3- reads the top byte (SWBASE + count - 1) first and the count ends below the frame: no ADDI / SUBI.
         LODI,R1 4
 OHR_L:
         LODA,R0 SWBASE,R3-       ; pre-decrement: FA3, FA2, FA1, FA0
@@ -769,7 +506,6 @@ OHR_L:
         BDRR,R1 OHR_L
         LODA,R0 SWBASE,R3-       ; the row offset
         STRZ,R1                  ; R1 = row offset for JMP_VEC
-        SUBI,R3 1                ; step past the frame
         ; jump to vector
         BCTR,UN JMP_VEC
 
@@ -783,10 +519,9 @@ SE_NOTKW:
         ZBSR *VINC_IP
         ; drop through
 ; =============================================================================
-;  DL_EX / DL_STORE -- Variable assignment (v0.3 removed DO_LET's own
-;  prologue; v2.7 brings the optional LET keyword back at no handler cost:
-;  the 'L' row lands in DO_LIST, which sends LET straight to SE_NOTKW.  Reached
-;  from SE_NOTKW's "V=expr" path (bare or after LET) and from DO_ASK.)
+;  DL_EX / DL_STORE -- Variable assignment: the 'L' row lands in DO_LIST, 
+;  which sends LET straight to SE_NOTKW.  Reached from SE_NOTKW's "V=expr" path 
+;  (bare or after LET) and from DO_ASK.)
 ; In:  IP -> expression (DL_EX) or R2 = VARS byte-offset, FA = value
 ;      (DL_STORE - PARSE_VAR_SAVE already converts the letter to R2=index*4)
 ; Out: VARS[V..V+3] = FA
@@ -795,8 +530,7 @@ DL_EX:
         ZBSR *VPARSE_EXPR                 ; [+1]
 DL_STORE:
         LODZ,R2                          ; R0 = R2 = letter*4: VARS[R0..R0+3] = FA via FA2VAR (R2 itself is untouched)
-;  FA2VAR / VAR2FA / VAR2FB -- 4-byte copies between FA/FB and the VARS area.  (v3.3: these three small loops replace
-;  the unrolled DL_STORE, PF_LV, FA_TO_BLK and BLK_TO_FB copies, 100 bytes -> 40.)
+;  FA2VAR / VAR2FA / VAR2FB -- 4-byte copies between FA/FB and the VARS area.  
 ;  The FOR limit/step block FWRK+1..8 sits right after VARS, so it is just two more 'variables': LIMOFF / STPOFF.
 ; In:  R0 = byte offset into VARS (letter*4, LIMOFF or STPOFF)
 ; Out: FA2VAR: VARS[R0..R0+3] = FA.   VAR2FA: FA = VARS[R0..R0+3].   VAR2FB: FB = VARS[R0..R0+3]
@@ -849,9 +583,7 @@ PARSE_VAR_SAVE:
 ; In:  nothing
 ; Out: IBUF = NUL-terminated input line; IPH:IPL = IBUF (both callers used
 ;      to re-point IP via a separate SET_IP_IBUF call right after this -
-;      folded in here instead). Was a single shared LODI while IBUF sat at
-;      a hi==lo address; IBUF moved (v2.11, nibble-index RAM reorg) so this
-;      is now two LODIs (+2 bytes, accepted cost - see VERSION HISTORY)
+;      folded in here instead). 
 ; Clobbers: R0, R1
 GETLINE:
         LODI,R0 <IBUF
@@ -1160,7 +892,7 @@ DP_ITEM:
         COMI,R2 A'T'            ; 2b
         BCFR,EQ DP_EXPR         ; 2b
 DP_CK:
-        LODI,R1 2               ; v3.3: CHR$ has 'R' as its 3rd letter and TAB( has 'B'; anything else (COS, TAN...) is an expression
+        LODI,R1 2               ;CHR$ has 'R' for 3rd letter and TAB has 'B'; anything else is an expression
         LODA,R0 *IPH,R1
         COMI,R0 A'R'
         BCTR,EQ DP_KW
@@ -1174,7 +906,7 @@ DP_KW:
         COMI,R2 A'C'            ; 2b
         BCTR,EQ DP_C_KW         ; 2b
         STRZ R1                 ; 1b: 2650 opcode $51 — copies R0 -> R1 & sets CC (EQ if 0)
-        BCTA,EQ DP_SEP          ; 3b: TAB(0) no-op (absolute since v3.3: DP_CK moved DP_SEP out of BCTR range)
+        BCTA,EQ DP_SEP          ; 3b: TAB(0) no-op 
 DP_TAB_LOOP:
         ZBSR *VPRT_SPACE        ; 2b
         BDRR,R1 DP_TAB_LOOP     ; 2b
@@ -1531,7 +1263,7 @@ HI_SCAN:
 
 OPS_HIT_LO:
         BSTR,UN OPS_HIT_COM
-        LODA,R0 SWBASE-6,R3       ; the table offset OPS_HIT_COM saved (it sits under FA0..FA3 and
+        LODA,R0 SWBASE-7,R3       ; the table offset OPS_HIT_COM saved (7 bytes below the count: it sits under FA0..FA3 and
         COMI,R0 12                ; under the RET it pushed); rows 12+ are the
         BCTR,LT OHL_HI            ; relops (= < >)
         BSTA,UN PUSH_LOLOOP       ; relop: right operand is a whole + - chain
@@ -1549,17 +1281,17 @@ OPS_HIT_HI:
 
 ; =============================================================================
 ;  OPS_HIT_COM -- push the row offset and the LEFT operand (FA0..FA3, 4 bytes), eat the operator character, push OPS_HIT_RET.
-; In:  FA = left operand, R1 = TOK_CHARS row offset, R3 = SW-stack index, IP -> operator
+; In:  FA = left operand, R1 = TOK_CHARS row offset, R3 = SW-stack byte count, IP -> operator
 ; Out: stack grows by 5 + 2 bytes; IP past the operator (tail-jumps into PUSH_RET, which returns to the caller's caller)
 ; Clobbers: R0, R1, R3
 OPS_HIT_COM:
         ; Push the R1 table offset first (survives recursion), then the left operand FA0..FA3
         LODZ,R1
-        STRA,R0 SWBASE,R3+
+        STRA,R0 SWBASE-1,R3+             ; R3 = byte count: the pre-increment store lands on SWBASE + (old count)
         LODI,R1 $FC                      ; R1 = -4: BIRR counts it up to 0
 OHC_L:
         LODA,R0 FA-$FC,R1                ; FA0..FA3
-        STRA,R0 SWBASE,R3+
+        STRA,R0 SWBASE-1,R3+
         BIRR,R1 OHC_L
         ZBSR *VINC_IP            ; consume the operator char
         LODI,R0 >OPS_HIT_RET
@@ -1615,11 +1347,11 @@ RNDF_MIX:
 ; Out: FA = result (relops: -1.0 true / 0.0 false - see DO_EQOP)
 ; Clobbers: R0, R1, R3, BANG, SAVEH, SAVEL, NEGFLG, SC0, TMPH, TMPL
 EXPR:
-        LODI,R3 $FF                      ; SW cont-stack empty sentinel
         EORZ,R0
+        STRZ,R3                          ; R3 = 0: SW-stack byte count 
         STRA,R0 BANG                      ; relop-invert modifier off
         BSTA,UN PUSH_LOLOOP                 ; "once the HI-tier chain is fully
-                                            ; exhausted, scan for +-=<> here"   (BSTA since v3.3: BSTR is out of range)
+                                            ; exhausted, scan for +-=<> here"   
         BSTA,UN PUSH_HILOOP                 ; "once the first atom resolves,
                                             ; check for */  chaining first"
         db $EC                           ; COMA,R0: consume next 2 bytes
@@ -1638,7 +1370,7 @@ EXPR_ATOM:
         BCTR,EQ EA_NEG
         COMI,R0 A'+'
         BCTR,EQ EA_POS
-        LODI,R0 >POW_LOOP               ; v3.6: every atom is followed by a '^' check (the unary signs recurse into EXPR_ATOM instead)
+        LODI,R0 >POW_LOOP               ; every atom is followed by a '^' check (the unary signs recurse into EXPR_ATOM instead)
         LODI,R1 <POW_LOOP
         ZBSR *VPUSH_RET
         ZBSR *VWSKIP                    ; R0 = char[0] again
@@ -1653,7 +1385,7 @@ EXPR_ATOM:
         ZBSR *VWSKIP            ; re-peek with R0 = char[0]
         COMI,R0 A'R'
         BCTA,EQ DO_RND          ; Starts with 'R'? Try RND (absolute: DO_RND is out of BCTR range)
-        BCTR,UN FN_DSP          ; v3.5: every other function name is found by the table scanner below
+        BCTR,UN FN_DSP          ; every other function name is found by the table scanner below
         ; not a known function: FN_DSP comes back here
 END_FUNCS:
         ZBSR *VWSKIP            ; re-peek with R0 = char[0]
@@ -1669,7 +1401,7 @@ EX_PRA:
         ZBRR *VEXPR_ATOM                   ; parse the operand
 
 ; -----------------------------------------------------------------------------
-; FN_DSP -- table-driven dispatch of the unary functions (v3.5: replaces the compare chain and the DO_ABS / DO_SIN / DO_COS stubs)
+; FN_DSP -- table-driven dispatch of the unary functions 
 ;   In     : R0 = first letter, IP -> the word, the second character is known to be a letter
 ;   Out    : name found: the word is eaten, the function's continuation address is pushed (EX_PRA) and the operand is parsed;
 ;            not found: jumps back to END_FUNCS (the word is a variable)
@@ -1818,8 +1550,7 @@ PARSE_FACTOR:
 ; =============================================================================
 ;  PF_LOADVAR (+ VAR2FA / VAR2FB) -- Load variable value from VARS into FA
 ; In:  R0 = index (0..25, PARSE_FACTOR's SUBI result - not re-subtracted
-;      here); IP -> that letter char.  (v3.3: the copy loops VAR2FA/VAR2FB follow immediately; DO_NEXT calls them
-;      directly with R0 = byte offset into VARS)
+;      here); IP -> that letter char. 
 ; Out: FA = variable value (4 bytes)
 ; Clobbers: R0, R1 (the loops themselves run in the alternate bank)
 PF_LOADVAR:
@@ -1872,7 +1603,7 @@ PF_GO:
         PPSL PSW_RS
         BCTA,UN FLT_PARSE                 ; tail jump; FLT_PARSE ends CPSL $10 / RETC
 PFI_NEG:
-        ZBSR *VINC_IP                     ; v3.3: the sign is handled here, so FLT_PARSE has none (EXPR_ATOM eats unary signs itself)
+        ZBSR *VINC_IP                     ; sign is handled here, so FLT_PARSE has none (EXPR_ATOM eats unary signs itself)
         BSTR,UN PF_NUM
         ZBRR *VFLT_NEGATE                 ; tail: FA = -FA (R1 only)
 PF_INT:
@@ -1887,7 +1618,7 @@ FIX_EXP:
 ; =============================================================================
 ;  PRT_INT / PRT_FA -- print through the MBF4 printer
 ;  PRT_INT: print the signed 16-bit integer in EXP (FREE, error line number, LIST)
-;  PRT_FA : print FA (PRINT expression); FA is DESTROYED (v3.3: FLT_PRINT no longer restores it - nothing reads FA afterwards)
+;  PRT_FA : print FA (PRINT expression); FA is DESTROYED 
 ; Clobbers: R0, R1, FA, FB and the library scratch (T0 = EXP)
 PRT_INT:
         PPSL PSW_RS
@@ -1972,9 +1703,7 @@ ET_RET:
 
 ; =============================================================================
 ;  REG16_TO_REG16 -- generic 16-bit copy between any two IPH-relative
-;  register pairs, addressed by a packed nibble pair (v2.11 code-golf:
-;  replaces the single-parameter EXP16_TO_ET/TMP_TO_ET family below plus
-;  5 previously-inline manual copy loops -- see VERSION HISTORY).
+;  register pairs, addressed by a packed nibble pair 
 ; In:  R0 = (SRC_IDX<<4)|DST_IDX; each idx*2 = byte offset from IPH.
 ;      Use the IDX_* EQUs above. Valid idx range 0-15 (offsets 0-30).
 ; Out: dest 16-bit value = source 16-bit value
@@ -2192,15 +1921,6 @@ FSW_L:
         RETC,UN
 
 ; -----------------------------------------------------------------------------
-; FLT_ADD -- FA = FA + FB (mantissas aligned on the larger exponent, one guard byte, round-bit rounding)
-;   In     : FA, FB (canonical; either may be zero)
-;   Out    : FA = FA + FB, normalised and rounded; exact cancellation gives canonical zero.
-;            Shortcuts: FA = 0 gives FA = FB (v3.3: by FSWAP, so FB becomes 0);  FB = 0 leaves FA and FB unchanged.
-;   Clobber: R0-R3;  FB, FBG, FDB, FSA, FSB, FER.  FB is NOT preserved: it may be swapped with FA, is shifted for alignment
-;            and has its sign bit replaced by the hidden bit.  Only the FB = 0 shortcut leaves it intact.
-;   Errors : exponent overflow -> FP_OVF ('O')
-;   RAS    : 1  (FSWAP, SUB_A_B, ADD_A_B, SHR4/SHR_A; NORM_PACK is entered by jump and calls SHL_MANTISSA)
-; -----------------------------------------------------------------------------
 ; FLT_NEGATE_B -- FB = -FB (zero is left as canonical zero)
 ;   In     : FB
 ;   Out    : FB with the sign bit flipped; unchanged if FB = 0
@@ -2218,8 +1938,24 @@ FLT_NEGATE:
         STRA,R0 FA+1,R1
         RETC,UN
 
+; -----------------------------------------------------------------------------
+; FLT_SUB -- FA = FA - FB: negates FB, then FALLS INTO FLT_ADD 
+;   In     : FA, FB (canonical; either may be zero)
+;   Out    : FA = FA - FB, normalised and rounded
+;   Clobber: as FLT_ADD, plus R1 (FLT_NEGATE_B)
+;   Errors : exponent overflow -> FP_OVF ('O')
+;   RAS    : 1  (FLT_NEGATE_B returns before FLT_ADD runs and FLT_ADD is entered by falling in, not by a call: its FSWAP / SUB_A_B / ADD_A_B / SHR4 are the only level)
 FLT_SUB:
         BSTR,UN FLT_NEGATE_B
+; -----------------------------------------------------------------------------
+; FLT_ADD -- FA = FA + FB (mantissas aligned on the larger exponent, one guard byte, round-bit rounding)
+;   In     : FA, FB (canonical; either may be zero)
+;   Out    : FA = FA + FB, normalised and rounded; exact cancellation gives canonical zero.
+;            Shortcuts: FA = 0 gives FA = FB 
+;   Clobber: R0-R3;  FB, FBG, FDB, FSA, FSB, FER.  FB is NOT preserved: it may be swapped with FA, is shifted for alignment
+;            and has its sign bit replaced by the hidden bit.  Only the FB = 0 shortcut leaves it intact.
+;   Errors : exponent overflow -> FP_OVF ('O')
+;   RAS    : 1  (FSWAP, SUB_A_B, ADD_A_B, SHR4/SHR_A; NORM_PACK is entered by jump and calls SHL_MANTISSA)
 FLT_ADD:
         LODA,R0 FA
         BCTR,EQ FSWAP                    ; FA = 0: result = FB (swap; FB is not preserved by FLT_ADD anyway)
@@ -2510,7 +2246,7 @@ DIV_BY_TEN:
 ; FLT_DIV -- FA = FA / FB (32-iteration restoring division; the dividend is never pre-shifted; FDSUB is the shared R -= D step)
 ;   In     : FA = dividend, FB = divisor (canonical)
 ;   Out    : FA = quotient, normalised and rounded.  FA = 0 returns at once;  exponent underflow flushes to zero.
-;   Clobber: R0-R3;  FB+1 (bit 7 forced to 1, the rest of FB is intact), FDV..FDV+2, RD..RD+2, FSA, FER, FDB.   (v3.3: the trial subtract is done in place and put back by an add on borrow, so the RT scratch is gone)
+;   Clobber: R0-R3;  FB+1 (bit 7 forced to 1, the rest of FB is intact), FDV..FDV+2, RD..RD+2, FSA, FER, FDB.   
 ;            FDE is NOT touched (it is live in FLT_PARSE / FLT_PRINT across DIV_BY_TEN: FER is the scratch here).
 ;   Errors : FB = 0 -> FP_DZERR ('Z'), tested first even when FA = 0;  exponent overflow -> FP_OVF ('O')
 ;   RAS    : 1  (CALC_SIGN_EXP, EXPCHK, SHL_MANTISSA; NORM_PACK is entered by jump)
@@ -2573,7 +2309,7 @@ FDR_L:
         CPSL    $08
         TPSL    $01
         BCTR,EQ FDFORCE         ; C=1: R overflowed 24 bits, so R >= D: subtract unconditionally
-        BSTR,UN FDSUB           ; trial: R -= D in place (v3.3: no RT copy)
+        BSTR,UN FDSUB           ; trial: R -= D in place 
         TPSL    $01
         BCTR,EQ FDINC           ; no borrow: keep it, Q bit = 1
         CPSL    $01             ; borrow: put it back, R += D (Q bit stays 0)
@@ -2654,8 +2390,8 @@ S_CONV:
 ;   RAS    : 0
 ;   Note   : FLT_ZERO loads R1 = 0, DB $EC skips the next LODI,R1 (skip-2 idiom), and the code runs on into F_ZERO.
 FLT_ZERO:
-        ;LODI,R1 0
         EORZ,R0
+        STRZ,R1                         ; R1 = 0 (R0 = 0)
         DB      $EC
 ; -----------------------------------------------------------------------------
 ; FLT_ZERO_B -- FB = canonical zero 00 00 00 00 (the guard byte FBG is not written)
@@ -2670,8 +2406,7 @@ F_ZERO:
         LODI,R2 4
         EORZ,R0
 FZL:
-        STRA,R0 FA,R1
-        ADDI,R1 1
+        STRA,R0 FA-1,R1+                ; pre-increment: stores at FA + (old R1)
         BDRR,R2 FZL
         RETC,UN
 
@@ -2679,7 +2414,7 @@ FZL:
 ; FLT_FROM_INT -- FA = (float) the signed 16-bit integer in T0 (T0 = high byte, T0+1 = low byte)
 ;   In     : T0:T0+1 = -32768..32767
 ;   Out    : FA = value (exact: 16 bits fit the 24-bit mantissa); 0 gives canonical zero;  the guard byte FDB is not written
-;   Clobber: R0-R3 (alt R2 = exponent, alt R3 = sign since v3.3), T0:T0+1 (negated / normalised)
+;   Clobber: R0-R3 (alt R2 = exponent, alt R3 = sign ), T0:T0+1 (negated / normalised)
 ;   RAS    : 1  (NEG16)
 ;   Note   : FLT_FROM_INT loads R1 = 0 (FA), DB $EC skips the next LODI,R1 (skip-2 idiom), FLT_SHARED does the work.
 FLT_FROM_INT:
@@ -2699,11 +2434,11 @@ FLT_SHARED:
         BCTR,EQ F_ZERO
         LODA,R0 T0
         ANDI,R0 $80
-        STRZ,R3                         ; sign bit parked in alt R3 (v3.3: was FSA); STRZ sets CC
+        STRZ,R3                         ; sign bit parked in alt R3 ; STRZ sets CC
         BCTR,EQ F_POS
         BSTR,UN NEG16
 F_POS:
-        LODI,R2 $90                     ; exponent in alt R2 (v3.3: was FER)
+        LODI,R2 $90                     ; exponent in alt R2 
 F_NORM:
         LODA,R0 T0
         BCTR,LT F_PACK
@@ -2751,7 +2486,7 @@ NEG16:
 ; FLT_FLOOR is an alias for the same entry (it does not floor negative fractions).
 ;   In     : FA
 ;   Out    : T0 = high byte, T0+1 = low byte, -32768..32767
-;   Clobber: R0, R1, R2 (the integer-bit count; was FDE before v3.3), T0:T0+1
+;   Clobber: R0, R1, R2 , T0:T0+1
 ;   Errors : |FA| beyond +32767 / -32768 -> FP_RANGE ('R'); the result never wraps and never saturates (v0.11)
 ;   RAS    : 1  (NEG16)
 FLT_FLOOR:
@@ -2765,7 +2500,7 @@ FLT_TO_INT:
         SUBI,R0 $80
         COMI,R0 17
         BCFA,LT FP_RANGE                ; |FA| >= 65536: out of range
-        STRZ,R2                         ; integer-bit count in alt R2 (v3.3: was FDE, so PRINT no longer parks FDE in T2)
+        STRZ,R2                         ; integer-bit count in alt R2 
         LODA,R0 FA+1
         IORI,R0 $80
         STRA,R0 T0
@@ -2824,7 +2559,7 @@ PINC:
         RETC,UN
 
 ; -----------------------------------------------------------------------------
-; FLT_PARSE -- parse digits[.digits] at *IP into FA and advance IP past it (no E notation; v3.3: no sign - PF_INP handles it).
+; FLT_PARSE -- parse digits[.digits] at *IP into FA and advance IP past it 
 ; Integer digits accumulate as FA = FA*10 + digit.  The 65C02's recursive PARSE_FRAC is a loop here: it
 ; reads the fraction digits backwards through *IP+R1 and adds them as (digit + fraction)/10 steps.
 ;   In     : RS=1 (caller did PPSL $10), IP -> first character (via IPH:IPL, high byte first)
@@ -2851,27 +2586,25 @@ FPDT:
         COMI,R0 '.'
         BCFA,EQ FPSX
         BSTR,UN PINC
-        LODI,R1 4                       ; park FA in PSAVE (inlined SAVE_A; v3.3: its only caller).  R1 ends 0 = the FPCNT index
+        LODI,R1 4                       ; park FA in PSAVE
 FPSV_L:
         LODA,R0 FA-1,R1
         STRA,R0 PSAVE-1,R1
         BDRR,R1 FPSV_L
+        LODI,R1 $FF                     ; pre-increment index: the first load is at IP+0
 FPCNT:
-        LODA,R0 *IPH,R1
+        LODA,R0 *IPH,R1+
         SUBI,R0 '0'
         COMI,R0 10
-        BCFR,LT FPCE
-        ADDI,R1 1
-        BCTR,UN FPCNT
+        BCTR,LT FPCNT                   ; a digit: next (R1 ends = the number of digits)
 FPCE:
         STRA,R1 FPN
         ZBSR *VFLT_ZERO
 FPFL:
         LODA,R1 FPN
         BCTR,EQ FPFD
-        SUBI,R1 1
+        LODA,R0 *IPH,R1-                ; pre-decrement: R1 = FPN - 1, the next fraction digit (last first)
         STRA,R1 FPN
-        LODA,R0 *IPH,R1
         SUBI,R0 '0'
         STRA,R0 T0+1
         EORZ,R0
@@ -2891,7 +2624,7 @@ FPSK:
         BCTR,UN FPSK
 FPSKD:
         ZBSR *VFSWAP                   ; FB = fraction (FA's junk goes to FB, overwritten next)
-        LODI,R1 4                       ; FA = PSAVE (inlined REST_A; v3.3: its only caller)
+        LODI,R1 4                       ; FA = PSAVE
 FPRS_L:
         LODA,R0 PSAVE-1,R1
         STRA,R0 FA-1,R1
@@ -2913,7 +2646,7 @@ S_PRINT:
 ; routines clobber alt R1/R2.
 ;   In     : FA (canonical);  RS=1
 ;   Out    : characters through PUTC / COUT:  "0" for zero;  "-" first for a negative value;  |x| < 1 prints as "0." + leading zeros + digits.
-;            FA is DESTROYED (v3.3; before it was restored to |FA| - no caller in the interpreter reads it afterwards).
+;            FA is DESTROYED 
 ;   Clobber: R0-R3;  FA (see Out), FB, FBG, FDB, FSA, FSB, FER, FMA, FDV, RD, T0, FDE, FPLIM, FPY, DIGI, DIG..DIG+6
 ;   Errors : none expected for a canonical FA: it is scaled into [1,10) before the MUL / DIV / FIX steps, so they cannot overflow or leave range
 ;   RAS    : 3  (FLT_SUB -> FLT_ADD -> FSWAP, or PUTC -> COUT -> its inner level)
@@ -2962,8 +2695,7 @@ FPDIG:
         LODA,R0 T0+1
         IORI,R0 '0'
         LODA,R1 DIGI
-        STRA,R0 DIG,R1
-        ADDI,R1 1
+        STRA,R0 DIG-1,R1+               ; pre-increment: stores at DIG + DIGI
         STRA,R1 DIGI
         ZBSR *VFROM_INT_B               ; FB = float(digit)
         BSTA,UN FLT_SUB
@@ -3112,6 +2844,7 @@ SC_P:
         ANDI,R0 2
         BCTA,EQ FN_END
         ZBSR *VFLT_NEGATE       ; n AND 2: FA = -FA
+        ZBRR *VFN_END           ; (FN_END no longer follows: it sits in front of PARSER_RET)
 
 ; -----------------------------------------------------------------------------
 ; ATN_RET / ATN_BODY -- ATN(x)  (ATN_BODY is also entered from ASN_2, in bank 1, with FA = the ratio)
@@ -3388,7 +3121,7 @@ E_ERR:
 
 ; -----------------------------------------------------------------------------
 ; ST_FA / LD_FB -- 4-byte copies between FA / FB and a slot of the scratch TS (the guard bytes FDB / FBG are not touched)
-;   Entries: ST_Z / ST_T / LD_Z / LD_T (v3.6) load R2 = ZSLOT / TSLOT themselves (skip-2 idiom) and fall into ST_FA / LD_FB: one call instead of two.
+;   Entries: ST_Z / ST_T / LD_Z / LD_T load R2 = ZSLOT / TSLOT themselves (skip-2 idiom) and fall into ST_FA / LD_FB: one call instead of two.
 ;   In     : R2 = slot offset (ZSLOT / TSLOT / XSLOT), RS = 1;  ST_FA: FA;  LD_FB: TS[R2..R2+3]
 ;   Out    : ST_FA: TS[R2..R2+3] = FA;   LD_FB: FB = TS[R2..R2+3]
 ;   Clobber: R0, R1, R2 (left at offset+3)
@@ -3471,20 +3204,6 @@ LBP_L:
         RETC,UN
 
 ; -----------------------------------------------------------------------------
-; POW_LOOP -- continuation pushed by EXPR_ATOM after every atom: is the next token '^'?
-;   In     : IP -> after the atom;  FA = the atom's value;  R3 = SW-stack index
-;   Out    : no '^': on to the next continuation (PARSER_RET).  '^': OPS_HIT_HI pushes row 21 and FA, eats the '^' and parses ONE more atom,
-;            which pushes POW_LOOP itself, so x^y^z is x^(y^z) (right associative) and binds tighter than * / and unary minus.
-;   Clobber: R0, R1 (+ what OPS_HIT_HI does)
-;   RAS    : 0 (jumps only)
-POW_LOOP:
-        ZBSR *VWSKIP
-        COMI,R0 A'^'
-        BCFA,EQ PARSER_RET
-        LODI,R1 21                      ; TOK_CHARS row offset of '^'
-        BCTA,UN OPS_HIT_HI
-
-; -----------------------------------------------------------------------------
 ; DO_POW -- operator '^':  x^y   (entered through JMP_VEC from OPS_HIT_RET: FB = x, FA = y)
 ;   Method : y an integer 0..255: FA = 1, then FA = FA * x, y times (exact whenever the products are; x may be zero or negative; x^0 = 1).
 ;            Any other y: x^y = EXP(y * LN(x)) as a chain of stages (LN stage, POW_2 = multiply by y, EXP stage); needs x > 0.
@@ -3537,6 +3256,8 @@ POW_2:
         CPSL PSW_RS
         BCTA,UN EXP_RET
 
+
+
 ; #############################################################################
 ; Helpers all called by ZBxx
 ; #############################################################################
@@ -3557,6 +3278,20 @@ EW_ADV:
         ZBSR *VINC_IP 
         BCTR,UN EATWORD
 
+; -----------------------------------------------------------------------------
+; POW_LOOP -- continuation pushed by EXPR_ATOM after every atom: is the next token '^'?
+;   In     : IP -> after the atom;  FA = the atom's value;  R3 = SW-stack byte count
+;   Out    : no '^': on to the next continuation (PARSER_RET).  '^': OPS_HIT_HI pushes row 21 and FA, eats the '^' and parses ONE more atom,
+;            which pushes POW_LOOP itself, so x^y^z is x^(y^z) (right associative) and binds tighter than * / and unary minus.
+;   Clobber: R0, R1 (+ what OPS_HIT_HI does)
+;   RAS    : 0 (jumps only)
+POW_LOOP:
+        ZBSR *VWSKIP
+        COMI,R0 A'^'
+        BCFR,EQ PARSER_RET
+        LODI,R1 21                      ; TOK_CHARS row offset of '^'
+        BCTA,UN OPS_HIT_HI
+        
 ; =============================================================================
 ;  WSKIP -- Skip whitespace, then peek the current char at IP into R0
 ; Out: R0 = *IPH; CC set by that load (EQ if NUL)
@@ -3604,15 +3339,15 @@ NEG_RET:
 ;       is empty, do a real hw RETC to the true external caller of EXPR()).
 ;  Clobbers: R0 (all three); R1 (PUSH_RET only, on entry, consumed)
 PUSH_RET:
-        ADDI,R3 1                            ; R3 = index of the first free byte ($FF empty + 1 wraps to 0 = count so far)
-        COMI,R3 SWCAP_LIMIT                  ; (COM=1: unsigned, and the wrapped 0-based count is what is compared)
+        COMI,R3 SWCAP_LIMIT                  ; R3 = byte count = index of the first free byte (COM=1: unsigned)
         BCTR,LT PR_ROOM
         LODI,R0 ERR_EXPR
         ZBRR *VDO_ERROR                     ; tail call and bail (R3 is reset by the next EXPR)
 PR_ROOM:
-        STRA,R0 SWBASE,R3                   ; push lo (R0 still holds it - no SC0 stash needed since v3.3)
+        STRA,R0 SWBASE-1,R3+                ; push lo the pre-increment lands on SWBASE + old count
         LODZ,R1                              ; R0 = R1 (hi byte)
-        STRA,R0 SWBASE,R3+                  ; push hi (R3 ends on the hi byte, as before)
+        STRA,R0 SWBASE-1,R3+                ; push hi (R3 ends = the new byte count)
+        RETC,UN
         RETC,UN
 
 ; -----------------------------------------------------------------------------
@@ -3622,15 +3357,14 @@ FN_END:
         CPSL PSW_RS
 ;        ZBRR *VPARSER_RET
 PARSER_RET:
-        COMI,R3 $FF                          ; R3==$FF (empty)? -> EQ
+        LODZ,R3                              ; R0 = R3 = byte count: EQ when the stack is empty (every EXPR caller reloads R0; a pop overwrites it)
         RETC,EQ                              ; SW stack empty: real hw return
         ; drop through
 SWRETURN:
-        LODA,R0 SWBASE,R3                   ; hi byte (topmost)
+        LODA,R0 SWBASE,R3-                  ; pre-decrement: hi byte (topmost, SWBASE + count - 1)
         STRA,R0 TEMPRETH
-        LODA,R0 SWBASE-1,R3                 ; lo byte
+        LODA,R0 SWBASE,R3-                  ; lo byte; the count now sits below this frame
         STRA,R0 TEMPRETL
-        SUBI,R3 2                            ; step past both (now below this frame)
         BCTA,UN *TEMPRETH                    ; indirect jump to popped addr
 
 ; =============================================================================
@@ -3682,7 +3416,7 @@ FNA:
         DB <EXP_RET,>EXP_RET
 
 BANNER:
-        DB CR, LF, "miniBASIC2650 3.6", CR, LF, NUL        
+        DB CR, LF, "miniBASIC2650 1.0", CR, LF, NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -3716,7 +3450,8 @@ TOK_CHARS:
         DB NUL
 
 
-; Streams (4 bytes per entry, MBF4 [E][S|M1][M2][M3]); all in one page.  tools/gen_coeffs.py makes every entry.
+; Streams (4 bytes per entry, MBF4 [E][S|M1][M2][M3]); all in ONE page, checked at assembly time by the RES guard at E_TBL (the tables float: no ORG pin).
+; tools/gen_coeffs.py makes every entry.
 ; SCT : SIN / COS:  2/PI, 1.0, c4..c0 of sin(PI*t/2) = t * (c0 + c1 t^2 + ... + c4 t^8)
 SCT:
         DB $80,$22,$F9,$83          ; 2/PI = 0.6366197467
@@ -3766,15 +3501,16 @@ ONES:
         DB $80,$31,$72,$18          ; LN2 = 0.6931471825
 
 E_TBL:
+        RES (<SCT)-(<(E_TBL-1))         ; build guard: a negative count is an ERROR unless SCT..E_TBL-1 lie in ONE page (SETP puts SCT's page in HPTR for every stream)
 
 ROMEND: 
 
 ;  RAM variables -- sequential RES block 
  
-        ORG 4096                ; RAM at $1000, directly above the 4 KB EPROM: the assembler's ORG overwrite check fails the build if the ROM passes $1000
-
+        ORG 4096                ; RAM at $1000, directly above the 4 KB EPROM
+        
 ; --- Ordered group: offsets from IPH used by INC_ET/DEC_ET/NEG_SHARED and
-; by REG16_TO_REG16's packed-nibble index scheme (see IDX_* EQUs, v2.11).
+; by REG16_TO_REG16's packed-nibble index scheme 
 ; IBUF's hi==lo GETLINE trick was dropped when this group grew past 16
 ; bytes to bring PE/SC0/RNDSEED into nibble range (+2B in GETLINE, noted
 ; in VERSION HISTORY).
@@ -3787,8 +3523,7 @@ GOTOL   RES 1       ; pending target lo
 CURH    RES 1       ; current line hi  (error reporting; IDX_CUR=3)
 CURL    RES 1       ; current line lo
 
-; v3.0: the FOR frame is built from FWRK (see DO_FOR), so SWSTK/EXP/LNUM/FVAR no longer have to be contiguous.  Historical note (v2.11): DO_FOR pushed
-; the seven bytes with one loop and DO_NEXT pops them back the same way.
+;  FOR frame is built from FWRK (see DO_FOR), so SWSTK/EXP/LNUM/FVAR no longer have to be contiguous. 
 ; During a FOR: EXP = step, LNUM = limit (LNUM is untouched by expression
 ; evaluation, so it can hold the limit while the STEP expression is parsed).
 SWSTK   RES 2       ; next-line pointer cache [NLP_H][NLP_L] written by DR_EXEC (IDX_SWSTK=4)
@@ -3796,7 +3531,7 @@ EXPH    RES 1       ; expression result hi                                     (
 EXPL    RES 1       ; expression result lo
 LNUMH   RES 1       ; scratch line number hi                                   (IDX_LNUM=6)
 LNUML   RES 1       ; scratch line number lo
-FVAR    RES 1       ; spare since v3.0 (was FOR variable staging; FWRK replaces it) - kept so PE/SC0/RNDSEED stay in nibble range
+FVAR    RES 1       ; spare
 NIBPAD  RES 1       ; unused - restores even alignment after odd-length FVAR so
                      ; everything below is reachable by REG16_TO_REG16 (idx*2)
 PEH     DB <SHOWCASE_END       ; Program end pointer hi                        (IDX_PE=8)
@@ -3828,17 +3563,15 @@ FSTK    RES 44      ; FOR frames, 4 levels x 11 bytes (FWRK order reversed, see 
                     ; frame bytes 0..10 = FWRK+8..FWRK+0 [step3..step0][limit3..limit0][var], then body lo, body hi
 
 ;  SW call stack -- used by PARSE_EXPR / PRINT_S16 only
-; R3 = index ($FF=empty, grows up). Each frame = [lo][hi].
-; Push: STRA,R0 *SWBASE,R3+ (lo first), STRA,R0 *SWBASE,R3+ (hi).
-; Pop:  LODA,R0 *SWBASE,R3- (hi first), LODA,R0 *SWBASE,R3- (lo).
+; R3 = byte COUNT  Each frame = [lo][hi].
+; Push: STRA,R0 SWBASE-1,R3+ (lo first), STRA,R0 SWBASE-1,R3+ (hi): the pre-increment store lands on SWBASE + the old count.
+; Pop:  LODA,R0 SWBASE,R3- (hi first), LODA,R0 SWBASE,R3- (lo): the pre-decrement load reads SWBASE + count - 1, the top byte.
 ; Also now holds PUSH_RET/SWRETURN continuation addresses (2 bytes each),
 ; interleaved LIFO with OPS_HIT's own operand pushes - see CHANGE HISTORY.
 SWBASE  RES 96      ; SW stack base. Guard fires with ERR_EXPR when full.
-SWCAP_LIMIT EQU 92   ; PUSH_RET refuses a new 2-byte push at/past this R3
-                     ; value (leaves 2 bytes slack - a push adds 2 bytes and
-                     ; R3 is the current top index, so at R3=46 the next push
-                     ; would land at 46+47=bytes 46-47, exactly filling the
-                     ; 48-byte SWBASE; refusing at 46 catches this cleanly)
+SWCAP_LIMIT EQU 92   ; PUSH_RET refuses a new 2-byte push when R3 (the byte count)
+                     ; is at/past this value: the push would land at bytes 92-93
+                     ; of the 96-byte SWBASE, leaving 2 bytes slack
 
 VARS    RES 104     ; A-Z variables, 4 bytes each (MBF4: exponent first)
 FWRK    RES 9       ; FOR work block [var offset][limit 4][step 4] - MUST follow VARS: FA2VAR/VAR2FA/VAR2FB reach the limit and step as VARS+LIMOFF/STPOFF
@@ -3862,7 +3595,7 @@ FPY     RES     1               ; PRINT: index of the next digit in DIG
 DIGI    RES     1               ; PRINT: digits extracted so far (0..7)
 DIG     RES     8               ; PRINT digit buffer, DIG..DIG+6 used (the 65C02 used IBUF; here a private buffer)
 PSAVE   RES     4               ; FLT_PARSE: parked copy of FA (the integer part while the fraction is built)
-; v3.4/v3.5: the function routines borrow RAM that is free while a function is evaluated.  FLT_PRINT fills DIG only after the expression has
+; The function routines borrow RAM that is free while a function is evaluated.  FLT_PRINT fills DIG only after the expression has
 ; been evaluated, and FLT_PARSE uses PSAVE only inside itself (no literal is half parsed while a function runs).  DIG and PSAVE are adjacent,
 ; so together they form three 4-byte FP slots.
 TS      EQU     DIG             ; DIG..DIG+11 (= DIG + PSAVE): three 4-byte FP slots (packed like FA), copied by ST_FA / LD_FB with R2 = slot offset
@@ -3878,20 +3611,19 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 
 
 ; =============================================================================
-;  Pre-loaded SHOWCASE program (v3.6: floating point, 8-step RND, SIN/COS, ATN..EXP, ^)
+;  Pre-loaded SHOWCASE program inc floating point, 8-step RND, SIN/COS, ATN..EXP, ^
 ;
 ;  Line format: <lineno_hi> <lineno_lo> <body_ASCII> <NUL>
 ;  Format: DB hi,lo,"text",$00  -- hi-then-lo matches DR_EXEC record format.  DQ=$22 (double quote); a ';' outside a quoted DB string is $3B.
 ;  Every body stays under 60 bytes (IBUF is 64): the lines can be LISTed and typed back in.
 ;
 ;  Lines  10-190: feature demos: PRINT / CHR$ / TAB (30-44), integer arithmetic (60-70), FLOATING POINT (71-79: true division, decimals,
-;                 6-digit printing, no 16-bit wrap, RND: 77 seed + 0..1 value, 78 five raw RNDs, 79 three 0..1 values; v3.2),
+;                 6-digit printing, no 16-bit wrap, RND: 77 seed + 0..1 value, 78 five raw RNDs, 79 three 0..1 values,
 ;                 comparisons incl. decimals (80-139), a GOTO loop (140-190)
 ;  Lines 195-241: GOSUB/RETURN, 4 levels deep
 ;  Lines 250-297: FOR/NEXT: STEP -4, nested 3x3 table, and (271-274) a fractional STEP 0.25; 297 jumps to the trig section
-;  Lines 570-580: ATN, ASIN, ACOS, SQR, LN, EXP (v3.5) and the ^ operator (v3.6: 578 integer and fractional powers, 580 right associativity,
-;                 ^ over unary minus), a second block inside the trig section
-;  Lines 520-590: SIN and COS (v3.3): values, a degrees table, S^2+C^2, an odd/small argument, a one-period sine wave plot (TAB( with a float
+;  Lines 570-580: ATN, ASIN, ACOS, SQR, LN, EXP and the ^ operator 
+;  Lines 520-590: SIN and COS: values, a degrees table, S^2+C^2, an odd/small argument, a one-period sine wave plot (TAB( with a float
 ;                 expression); 590 jumps back to 300
 ;  Lines 300-650: Mandelbrot set, floating point: 44 columns x 21 rows, escape count in a GOSUB'd FOR loop (levels: 2 loops + 1 inside the sub)
 ;
@@ -3915,15 +3647,15 @@ PROG:
         DB 0,50,"PRINT ",$22,"--- ARITHMETIC ---",$22,$00
         DB 0,60,"PRINT ",$22,"3+4=",$22,$3B,"3+4",$3B,$22,"  10-3=",$22,$3B,"10-3",$3B,$22,"  6*7=",$22,$3B,"6*7",$00
         DB 0,70,"PRINT ",$22,"20/4=",$22,$3B,"20/4",$00
-        DB 0,71,"PRINT ",DQ,"--- FLOATING POINT ---",DQ,$00                  ; 71  v3.1: true division, decimals, 6 digits, RND
+        DB 0,71,"PRINT ",DQ,"--- FLOATING POINT ---",DQ,$00                  ; 71 rue division, decimals, 6 digits, RND
         DB 0,72,"PRINT ",DQ,"7/2=",DQ,";7/2;",DQ,"  1/3=",DQ,";1/3;",DQ,"  22/7=",DQ,";22/7",$00   ; 72  3.5  0.333333  3.14286
         DB 0,73,"PRINT ",DQ,"0.1+0.2=",DQ,";0.1+0.2;",DQ,"  2.5*1.5=",DQ,";2.5*1.5",$00         ; 73  0.3  3.75
         DB 0,74,"PRINT ",DQ,"-0.5*3=",DQ,";-0.5*3;",DQ,"  1-0.9=",DQ,";1-0.9",$00               ; 74  -1.5  0.1
         DB 0,75,"PRINT ",DQ,"1234567=",DQ,";1234567;",DQ,"  1/7=",DQ,";1/7",$00                  ; 75  6 significant digits: 1234570  0.142857
         DB 0,76,"PRINT ",DQ,"32767+1=",DQ,";32767+1;",DQ,"  100000*100000=",DQ,";100000*100000",$00   ; 76  no 16-bit wrap: 32768  10000000000
         DB 0,77,"PRINT ",DQ,"RND=",DQ,";RND;",DQ,"  ABS(RND)/32768=",DQ,";ABS(RND)/32768",$00     ; 77  integer seed, then a 0..1 value (varies per session)
-        DB 0,78,"PRINT ",DQ,"RND x5: ",DQ,";RND;",DQ," ",DQ,";RND;",DQ," ",DQ,";RND;",DQ," ",DQ,";RND;",DQ," ",DQ,";RND",$00   ; 78  v3.2: five RNDs - no halving runs (v3.1 printed runs like 16352 8176 4088)
-        DB 0,79,"PRINT ABS(RND)/32768;",DQ," ",DQ,";ABS(RND)/32768;",DQ," ",DQ,";ABS(RND)/32768",$00              ; 79  v3.2: three 0..1 values
+        DB 0,78,"PRINT ",DQ,"RND x5: ",DQ,";RND;",DQ," ",DQ,";RND;",DQ," ",DQ,";RND;",DQ," ",DQ,";RND;",DQ," ",DQ,";RND",$00   ; 78 five RNDs - no halving runs (printed runs like 16352 8176 4088)
+        DB 0,79,"PRINT ABS(RND)/32768;",DQ," ",DQ,";ABS(RND)/32768;",DQ," ",DQ,";ABS(RND)/32768",$00              ; 79   three 0..1 values
         DB 0,80,"PRINT ",$22,"--- COMPARISONS ---",$22,$00
         DB 0,90,"IF 3<9 PRINT ",$22,"3<9 ok",$22,$00
         DB 0,100,"IF 7=7 PRINT ",$22,"7=7 ok",$22,$00
@@ -3932,8 +3664,8 @@ PROG:
         DB 0,130,"IF 9>4 PRINT ",$22,"9>4 ok",$22,$00                      ; native '>'
         DB 0,131,"IF 5<2+9 PRINT ",$22,"5<2+9 ok",$22,$00                  ; relop RHS is a whole + - expr
         DB 0,132,"IF 1+2*3>4*5-14 PRINT ",$22,"7>6 ok",$22,$00             ; * / then + - then relop
-        DB 0,133,"IF 0.5<0.75 PRINT ",DQ,"0.5<0.75 ok",DQ,$00                ; 133 v3.1: decimals compare
-        DB 0,134,"IF 0.1+0.2=0.3 PRINT ",DQ,"0.1+0.2=0.3 ok",DQ,$00          ; 134 v3.1: '=' is exact, but the sum rounds to the same MBF4 value
+        DB 0,133,"IF 0.5<0.75 PRINT ",DQ,"0.5<0.75 ok",DQ,$00                ; 133  decimals compare
+        DB 0,134,"IF 0.1+0.2=0.3 PRINT ",DQ,"0.1+0.2=0.3 ok",DQ,$00          ; 134  '=' is exact, but the sum rounds to the same MBF4 value
         DB 0,135,"IF 6!>9 PRINT ",$22,"6<=9 ok",$22,$00                    ; '!' inverts '>'
         DB 0,136,"IF 9>4 THEN PRINT ",$22,"THEN ok",$22,$00                ; optional THEN
         DB 0,137,"LET K=5",$00                                             ; optional LET
@@ -3969,7 +3701,7 @@ PROG:
         DB 1,4,"PRINT I*I",$3B,$22," ",$22,$3B,$00                              ; 260  expect 1 4 9 16 25
         DB 1,9,"NEXT I",$00
         DB 1,14,"PRINT",$00
-        DB 1,15,"FOR X=0 TO 1 STEP 0.25",$00                                  ; 271 v3.1: fractional STEP, expect 0 0.25 0.5 0.75 1
+        DB 1,15,"FOR X=0 TO 1 STEP 0.25",$00                                  ; 271  fractional STEP, expect 0 0.25 0.5 0.75 1
         DB 1,16,"PRINT X",$3B,DQ," ",DQ,$3B,$00                              ; 272
         DB 1,17,"NEXT X",$00                                                  ; 273
         DB 1,18,"PRINT",$00                                                   ; 274
@@ -3983,13 +3715,13 @@ PROG:
         DB 1,38,"PRINT C",$3B,$22," ",$22,$3B,$00                              ; 294
         DB 1,39,"NEXT C",$00                                                   ; 295
         DB 1,40,"PRINT",$00                                                    ; 296
-        DB 1,41,"GOTO 520",$00                                                 ; 297 v3.3: on to the trig section (it ends with GOTO 300)
+        DB 1,41,"GOTO 520",$00                                                 ; 297  on to the trig section (it ends with GOTO 300)
         DB 1,44,"PRINT ",$22,"--- MANDELBROT ---",$22,$00                  ; 300
         DB 1,49,"M=16",$00                                                 ; 305 iteration limit (a variable FOR limit)
         DB 1,54,"FOR R=0 TO 20",$00                                        ; 310 21 rows       (FOR level 1)
-        DB 1,64,"LET D=(R-10)/8",$00                                       ; 320 imaginary part -1.25..1.25 (v3.1: was R*6-64 in 1/64 units)
+        DB 1,64,"LET D=(R-10)/8",$00                                       ; 320 imaginary part -1.25..1.25 
         DB 1,84,"FOR Q=0 TO 43",$00                                        ; 340 44 columns    (FOR level 2)
-        DB 1,94,"LET C=Q/16-2.25",$00                                      ; 350 real part -2.25..0.4375 (v3.1: was Q*4-144 in 1/64 units)
+        DB 1,94,"LET C=Q/16-2.25",$00                                      ; 350 real part -2.25..0.4375 
         DB 1,104,"A=C",$00                                                 ; 360
         DB 1,105,"B=D",$00                                                 ; 361
         DB 1,106,"E=0",$00                                                 ; 362
@@ -4000,7 +3732,7 @@ PROG:
         DB 1,224,"PRINT",$00                                               ; 480 end of row newline
         DB 1,234,"NEXT R",$00                                              ; 490
         DB 1,254,"END",$00                                                 ; 510
-        DB 2,8,"PRINT ",DQ,"--- TRIG: SIN COS (radians) ---",DQ,$00 ; 520 v3.3: trig section, runs between FOR/NEXT and the Mandelbrot plot
+        DB 2,8,"PRINT ",DQ,"--- TRIG: SIN COS (radians) ---",DQ,$00 ; 520  trig section, runs between FOR/NEXT and the Mandelbrot plot
         DB 2,13,"PRINT ",DQ,"SIN(1)=",DQ,";SIN(1);",DQ,"  COS(1)=",DQ,";COS(1)",$00 ; 525 0.841471  0.540302
         DB 2,16,"K=0.0174532925",$00                        ; 528 radians per degree
         DB 2,18,"FOR D=0 TO 80 STEP 20",$00                 ; 530 degrees
@@ -4011,11 +3743,11 @@ PROG:
         DB 2,43,"FOR X=0 TO 6.5 STEP 0.5",$00               ; 555 one period of a sine wave, TAB( takes the float
         DB 2,48,"PRINT TAB(20+SIN(X)*18);",DQ,"*",DQ,$00    ; 560 column 2..38
         DB 2,53,"NEXT X",$00                                ; 565 
-        DB 2,58,"PRINT ",DQ,"--- ATN ASIN ACOS SQR LN EXP ---",DQ,$00 ; 570 v3.5: the other functions
+        DB 2,58,"PRINT ",DQ,"--- ATN ASIN ACOS SQR LN EXP ---",DQ,$00 ; 570  other functions
         DB 2,60,"PRINT ",DQ,"4*ATN(1)=",DQ,";4*ATN(1);",DQ," ASIN(.5)=",DQ,";ASIN(0.5)",$00 ; 572 3.14159  0.523599
         DB 2,62,"PRINT ",DQ,"SQR(2)=",DQ,";SQR(2);",DQ," LN(10)=",DQ,";LN(10);",DQ," EXP(1)=",DQ,";EXP(1)",$00 ; 574 1.41421  2.30259  2.71828
         DB 2,64,"PRINT ",DQ,"SIN(ASIN(.3))=",DQ,";SIN(ASIN(0.3))",$00 ; 576 0.3, functions nest
-        DB 2,66,"PRINT ",DQ,"2^10=",DQ,";2^10;",DQ," 2^0.5=",DQ,";2^0.5;",DQ," 2^-2=",DQ,";2^-2",$00 ; 578 v3.6: 1024  1.41421  0.25
+        DB 2,66,"PRINT ",DQ,"2^10=",DQ,";2^10;",DQ," 2^0.5=",DQ,";2^0.5;",DQ," 2^-2=",DQ,";2^-2",$00 ; 578 1024  1.41421  0.25
         DB 2,68,"PRINT ",DQ,"2^3^2=",DQ,";2^3^2;",DQ," -2^2=",DQ,";-2^2;",DQ," 10^0.3=",DQ,";10^0.3",$00 ; 580 512 (right assoc.)  -4  1.99526
         DB 2,78,"GOTO 300",$00                              ; 590 on to the Mandelbrot plot
         DB 2,88,"FOR N=1 TO M",$00                                         ; 600 escape-count subroutine, a FOR loop
