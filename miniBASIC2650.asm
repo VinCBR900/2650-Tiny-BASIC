@@ -1,6 +1,6 @@
 ; =============================================================================
-; miniBASIC2650 v1.0  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
-;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP and ^ operator 
+; miniBASIC2650 v1.1  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
+;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP/INT and ^ operator 
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -39,6 +39,7 @@
 ;   ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS
 ;   SQRT(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives 0
 ;   LN(expr) : natural logarithm; zero or a negative argument gives ?R.   
+;   INT(expr): floor, the whole number at or below x: INT(2.7) is 2, INT(-2.7) is -3.  |x| >= 32768 gives ?R (as TAB( and CHR$()
 ;
 ; Numbers : MBF4 floating point: 24-bit mantissa (exact integers to 16777216), exponent range about 1E-38 .. 1.7E38.
 ;           Literals [digits][.digits].  PRINT shows 6 significant digits in plain notation
@@ -51,7 +52,8 @@
 ;
 ; Floating point
 ;   - No E notation: 1E3 reads as 1 (the E3 is silently ignored); write 1000.  
-;   - No INT() rounding.
+;   - INT(x) is the floor (toward minus infinity) for |x| < 32768; |x| >= 32768 gives ?R (the 16-bit integer path, as TAB( / CHR$( / GOTO).
+;     RND is a 16-bit integer: INT(RND*6) is ?R, write INT(ABS(RND)/32768*6).  There is no FIX / SGN.
 ;   - FOR/NEXT with a fractional STEP accumulates rounding error: STEP 0.25 is exact, STEP 0.1 is not
 ;   - RND is 16-bit LFSR seed as a float (signed, -32768..32767; never 0, so ABS(RND)/32768 is 0 < x <= 1).
 ;
@@ -59,6 +61,9 @@
 ;   - SIN/COS reduces  argument y = |x|*2/PI in single precision, angular error of about 6E-8*|x| radians
 ;   - The library rounds half away from zero.  Against mbf4.py with rounding RN_AWAY, * and / were bit-exact and + - differed by 1 ULP in 1 of
 ;     300 random pairs (tools/lib_bitexact.py); the library was not changed.
+;   - FLT_ADD / FLT_SUB keep ONE 8-bit guard byte and no sticky bit: an effective subtraction (signs differ) with an exponent difference of 9..24 can be
+;     1 ULP high when the bits shifted out past the guard byte decide the rounding (v1.1 measured, tests/addprec2.py: about 1 random pair in 1000;
+;     0.4% of the pairs in that range, 0.7% when the larger operand is an exact power of two).  Additions and differences up to 8 or from 26 up are exact.
 ;
 ; Transcendental functions
 ;   - Maximum error: ATN 1.6E-7 (absolute), ASIN 2.2E-7, ACOS 3.7E-7, LN 1.4E-7 on [0.1,10] and 1.4E-6 over 1E-6..1E7 (values up to 16), SQR 6.7E-7
@@ -165,6 +170,20 @@
 ; =============================================================================
 ;
 ;                                                                                                        
+; v1.1 (Oct 2026) - INT(), a FUNC(x)^y fix, golf,  ROMEND $0FD8 (4056 bytes)
+;   - INT(x) = floor, Range |x| < 32768 (the 16-bit path), else ?R.
+;     Showcase lines 582, 584.
+;   - FLT_TEN_B - looped
+;   - FLT_ADD: the 'FB is ignored' cutoff is now ea-eb >= 26 (was 25), 0 bytes.
+;
+; v1.1 fix, reported by the owner: FUNC(x)^y applied the ^ to the ARGUMENT (PRINT LN(2)^2 gave 1.38629 = LN(2^2), INT(2.5)^2 gave 6, SIN(1)^2 gave SIN(1^2)):
+;     the operand's '(' was an atom of its own and pushed a '^' check above the function continuation, so it fired right after the ')' and before the
+;     function ran.  EXPR_ATOM now pushes POW_LOOP first and then looks at the sign / '(' / name (label EA_NP); FN_DSP pushes the function continuation and
+;     enters at EA_NP, so the operand pushes no check of its own and the function atom's check (pushed first) runs after the stage: LN(2)^2 = 0.480453.
+;     +1 byte (FN_DSP tail +3, EXPR_ATOM -2).  A bare operand (ABS 3^2, ABS -3) works as before.  Side effects on the nesting limits, measured with PRINT:
+;     ABS(ABS(..)) / INT(INT(..)) 7 -> 8 levels, a unary minus chain -(-(..)) 8 -> 7 (a sign is an atom and now pushes its own check), ((..)) 10, 1+(1+(..)) 6.
+;     tests/fnpow.py: 243 FUNC(x)^y cases (all ten functions, chains, signs, F as the exponent) against float64: 0 bad (130 bad before the fix).
+;
 ; v1.0 (Oct 2026) - Code Golf and Power Operator ROMEND $0FAF (4015 bytes)
 ;   - ^ (+120 bytes): EXPR_ATOM pushes the continuation POW_LOOP after every
 ;     atom (one site: the unary signs recurse into
@@ -174,7 +193,7 @@
 ;     EXP with k*ln2 and a Horner polynomial) 
 ;   - DISPATCH:Aded FN_DSP to dispatch functions based on 2 character matching.
 ;
-; v0.6 trig branch (Oct 2026) - Stage 5 tier 1: SIN and COS (radians).  ROMEND $0E99 (3737 bytes)
+; v0.6 trig branch (Oct 2026) - Minibasic Stage 5 tier 1: SIN and COS (radians).  ROMEND $0E99 (3737 bytes)
 ;   - DO_SIN/DO_COS (atoms), SIN_RET/COS_RET, SC_CORE, HORNER_ODD, table-driven, reusable for ATN/LN/EXP
 ;     LD_B_PTR / LD_B_Z / SAVE_Z, and SCT (2/PI, 1.0, five minimax coefficients.
 ;   - Method: y = |x|*2/PI, q = TRUNC(y), f = y - q;  n = (q + offset) AND 3 
@@ -1365,15 +1384,15 @@ EXPR:
 EA_POS:
         ZBSR *VINC_IP  
 EXPR_ATOM:
-        ZBSR *VWSKIP            ; returns with R0 = char[0]
+        LODI,R0 >POW_LOOP               ; every atom is followed by a '^' check
+        LODI,R1 <POW_LOOP
+        ZBSR *VPUSH_RET
+EA_NP:                                  ; the operand of a function enters here: its '^' check is the function's own (pushed by the caller's EXPR_ATOM)
+        ZBSR *VWSKIP                    ; returns with R0 = char[0]
         COMI,R0 A'-'
         BCTR,EQ EA_NEG
         COMI,R0 A'+'
         BCTR,EQ EA_POS
-        LODI,R0 >POW_LOOP               ; every atom is followed by a '^' check (the unary signs recurse into EXPR_ATOM instead)
-        LODI,R1 <POW_LOOP
-        ZBSR *VPUSH_RET
-        ZBSR *VWSKIP                    ; R0 = char[0] again
         COMI,R0 A'('
         BCTA,EQ EA_PAREN
 
@@ -1403,9 +1422,9 @@ EX_PRA:
 ; -----------------------------------------------------------------------------
 ; FN_DSP -- table-driven dispatch of the unary functions 
 ;   In     : R0 = first letter, IP -> the word, the second character is known to be a letter
-;   Out    : name found: the word is eaten, the function's continuation address is pushed (EX_PRA) and the operand is parsed;
+;   Out    : name found: the word is eaten, the function's continuation address is pushed and the operand is parsed at EA_NP (no '^' check of its own);
 ;            not found: jumps back to END_FUNCS (the word is a variable)
-;   Key    : the FIRST TWO letters (AB ABS, SI SIN, CO COS, AT ATN/ATAN, AS ASIN, AC ACOS, SQ SQR/SQRT, LN, EX EXP); the rest of the word is eaten
+;   Key    : the FIRST TWO letters (AB ABS, SI SIN, CO COS, AT ATN/ATAN, AS ASIN, AC ACOS, SQ SQR/SQRT, LN, EX EXP, IN INT); the rest of the word is eaten
 ;   Clobber: R0, R1, DIG, DIG+1 (parse time: free);  R2 / R3 untouched
 ;   RAS    : 1 (EATWORD)
 FN_DSP:
@@ -1432,7 +1451,8 @@ FN_HIT:
         LODA,R0 FNA,R1
         STRZ,R1                 ; R1 = high byte
         LODA,R0 DIG             ; R0 = low byte
-        BCTR,UN EX_PRA          ; push the continuation, parse the operand
+        ZBSR *VPUSH_RET         ; push the continuation
+        BCTA,UN EA_NP           ; parse the operand: no '^' check of its own, so FUNC(x)^y is (FUNC(x))^y
 
 ; =============================================================================
 ;  PUSH_LOLOOP / PUSH_HILOOP -- shared "push a continuation of LO_LOOP/
@@ -1803,20 +1823,45 @@ ABS_RET:
         ZBRR *VPARSER_RET
 
 ; -----------------------------------------------------------------------------
+; INT_RET -- continuation for INT(...): FA = FLOOR(FA), the whole number at or below x, as a float
+;   In     : FA = x, |x| < 32768, RS=0
+;   Out    : FA = floor(x) (INT(2.7) = 2, INT(-2.7) = -3, INT(-3) = -3) -> FN_END
+;   Method : q = TRUNC(x) (FLT_TO_INT), FB = float(q); x < q happens only for a negative fraction, then FA = FA - 1.0 (x, or q when
+;            FLT_CMP swapped the two) and TRUNC again: TRUNC(x - 1) = TRUNC(x) - 1 for every negative x, so rounding of the subtract is harmless.
+;   Clobber: R0-R3, FA, FB, T0, HPTR, the FP library scratch
+;   Errors : |x| >= 32768 -> FP_RANGE ('R'), as TAB( / CHR$( / GOTO (the 16-bit integer path); INT(-32768.5) is out of range too
+;   RAS    : 2 (the library calls)
+INT_RET:
+        PPSL PSW_RS
+        BSTA,UN FLT_TO_INT              ; T0 = q = TRUNC(x), FA = x
+        ZBSR *VFROM_INT_B               ; FB = float(q) (T0 destroyed)
+        ZBSR *VFLT_CMP                  ; CC = x vs q: LT only for a negative fraction.  Both negative: swapped (FA = q): TRUNC(FA) is q either way
+        BCFR,LT INT_Q
+        LODI,R0 >(ONES-1)
+        ZBSR *VSETP
+        ZBSR *VLD_B_PTR                 ; FB = 1.0
+        BSTA,UN FLT_SUB                 ; FA = FA - 1
+INT_Q:
+        BSTA,UN FLT_TO_INT              ; T0 = TRUNC(FA) = floor(x)
+        BSTA,UN FLT_FROM_INT            ; FA = float(T0)
+        ZBRR *VFN_END
+
+; -----------------------------------------------------------------------------
 ; FLT_TEN_B -- FB = 10.0 (packed $84 $20 $00 $00)
 ;   In     : -
 ;   Out    : FB = 10.0 (the guard byte FBG is not written)
-;   Clobber: R0
+;   Clobber: R0, R1
 ;   RAS    : 0
+;   Note   : BDRR decrements BEFORE it tests, so R1 runs 4..1 and both bases are offset by -1 (as FPRS_L / LD_B_PTR); TENC is the 4 data bytes.
 FLT_TEN_B:
-        LODI,R0 $84
-        STRA,R0 FB
-        LODI,R0 $20
-        STRA,R0 FB+1
-        EORZ,R0
-        STRA,R0 FB+2
-        STRA,R0 FB+3
+        LODI,R1 4
+FTBL:
+        LODA,R0 TENC-1,R1
+        STRA,R0 FB-1,R1
+        BDRR,R1 FTBL
         RETC,UN
+TENC:
+        DB $84,$20,$00,$00      ; 10.0
 E_GLUE:
 
 ; =============================================================================
@@ -1985,8 +2030,8 @@ FASL:
         EORZ,R0
         STRA,R0 FDB
         STRA,R0 FBG
-; ea-eb >= 25: FB is ignored (result = FA, straight to FANM2);  ea = eb: no alignment needed (FAOP)
-        COMI,R3 25
+; ea-eb >= 26: FB is ignored (result = FA, straight to FANM2: FB < 1/4 of an FA ULP rounds away even from a power of two, v1.1);  ea = eb: no alignment needed (FAOP)
+        COMI,R3 26
         BCFA,LT FANM2
         COMI,R3 0
         BCTR,EQ FAOP
@@ -3256,8 +3301,6 @@ POW_2:
         CPSL PSW_RS
         BCTA,UN EXP_RET
 
-
-
 ; #############################################################################
 ; Helpers all called by ZBxx
 ; #############################################################################
@@ -3279,7 +3322,7 @@ EW_ADV:
         BCTR,UN EATWORD
 
 ; -----------------------------------------------------------------------------
-; POW_LOOP -- continuation pushed by EXPR_ATOM after every atom: is the next token '^'?
+; POW_LOOP -- continuation pushed by EXPR_ATOM after every atom (not a function's operand: the function atom's own check follows the stage): is the next token '^'?
 ;   In     : IP -> after the atom;  FA = the atom's value;  R3 = SW-stack byte count
 ;   Out    : no '^': on to the next continuation (PARSER_RET).  '^': OPS_HIT_HI pushes row 21 and FA, eats the '^' and parses ONE more atom,
 ;            which pushes POW_LOOP itself, so x^y^z is x^(y^z) (right associative) and binds tighter than * / and unary minus.
@@ -3403,6 +3446,7 @@ FNK:
         DB A'S',A'Q'
         DB A'L',A'N'
         DB A'E',A'X'
+        DB A'I',A'N'
         DB 0
 FNA:
         DB <ABS_RET,>ABS_RET
@@ -3414,9 +3458,10 @@ FNA:
         DB <SQR_RET,>SQR_RET
         DB <LN_RET,>LN_RET
         DB <EXP_RET,>EXP_RET
+        DB <INT_RET,>INT_RET
 
 BANNER:
-        DB CR, LF, "miniBASIC2650 1.0", CR, LF, NUL        
+        DB CR, LF, "miniBASIC2650 1.1", CR, LF,"Bytes Free:", NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -3622,7 +3667,7 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;                 comparisons incl. decimals (80-139), a GOTO loop (140-190)
 ;  Lines 195-241: GOSUB/RETURN, 4 levels deep
 ;  Lines 250-297: FOR/NEXT: STEP -4, nested 3x3 table, and (271-274) a fractional STEP 0.25; 297 jumps to the trig section
-;  Lines 570-580: ATN, ASIN, ACOS, SQR, LN, EXP and the ^ operator 
+;  Lines 570-586: ATN, ASIN, ACOS, SQR, LN, EXP, the ^ operator and INT (582-584: floor, negatives, a rounding idiom; 586: FUNC(x)^y)
 ;  Lines 520-590: SIN and COS: values, a degrees table, S^2+C^2, an odd/small argument, a one-period sine wave plot (TAB( with a float
 ;                 expression); 590 jumps back to 300
 ;  Lines 300-650: Mandelbrot set, floating point: 44 columns x 21 rows, escape count in a GOSUB'd FOR loop (levels: 2 loops + 1 inside the sub)
@@ -3635,7 +3680,8 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;     PRINT LN(0)         ?R   LN of zero or of a negative number
 ;     PRINT EXP(89)       ?O   EXP result beyond about 1.7E38 (so is EXP(1000); EXP of a large negative number gives 0)
 ;     PRINT 2^128         ?O   power beyond about 1.7E38;   PRINT (-2)^0.5   ?R   non-integer power of a negative base (LN)
-;  No LIST in the showcase.  Not shown either: E notation (unsupported), INT() (none).
+;  No LIST in the showcase.  Not shown either: E notation (unsupported).
+;     PRINT INT(40000)    ?R   INT argument beyond +-32767 (the 16-bit integer path)
 ; =============================================================================
 PROG:
         DB 0,10,"REM -- Rem does nothing --", $00
@@ -3749,6 +3795,9 @@ PROG:
         DB 2,64,"PRINT ",DQ,"SIN(ASIN(.3))=",DQ,";SIN(ASIN(0.3))",$00 ; 576 0.3, functions nest
         DB 2,66,"PRINT ",DQ,"2^10=",DQ,";2^10;",DQ," 2^0.5=",DQ,";2^0.5;",DQ," 2^-2=",DQ,";2^-2",$00 ; 578 1024  1.41421  0.25
         DB 2,68,"PRINT ",DQ,"2^3^2=",DQ,";2^3^2;",DQ," -2^2=",DQ,";-2^2;",DQ," 10^0.3=",DQ,";10^0.3",$00 ; 580 512 (right assoc.)  -4  1.99526
+        DB 2,70,"PRINT ",DQ,"INT(2.7)=",DQ,";INT(2.7);",DQ," INT(-2.7)=",DQ,";INT(-2.7)",$00 ; 582 2  -3 (floor, not truncation)
+        DB 2,72,"PRINT ",DQ,"INT(-3)=",DQ,";INT(-3);",DQ," 2.567~",DQ,";INT(2.567*100+0.5)/100",$00 ; 584 -3  2.57 (round to 2 places)
+        DB 2,74,"PRINT ",DQ,"LN(2)^2=",DQ,";LN(2)^2;",DQ," INT(2.5)^2=",DQ,";INT(2.5)^2",$00 ; 586 0.480453  4 (^ applies to the function's result)
         DB 2,78,"GOTO 300",$00                              ; 590 on to the Mandelbrot plot
         DB 2,88,"FOR N=1 TO M",$00                                         ; 600 escape-count subroutine, a FOR loop
         DB 2,98,"IF E>0 GOTO 640",$00                                      ; 610   (FOR level 3, inside a GOSUB, inside
