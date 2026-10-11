@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC2650 v1.1  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
+; miniBASIC2650 v1.2  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
 ;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP/INT and ^ operator 
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
@@ -39,10 +39,11 @@
 ;   ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS
 ;   SQRT(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives 0
 ;   LN(expr) : natural logarithm; zero or a negative argument gives ?R.   
-;   INT(expr): floor, the whole number at or below x: INT(2.7) is 2, INT(-2.7) is -3.  |x| >= 32768 gives ?R (as TAB( and CHR$()
+;   INT(expr): floor, the whole number at or below x: INT(2.7) is 2, INT(-2.7) is -3.  
+;            |x| >= 32768 gives ?R (as TAB( and CHR$()
 ;
 ; Numbers : MBF4 floating point: 24-bit mantissa (exact integers to 16777216), exponent range about 1E-38 .. 1.7E38.
-;           Literals [digits][.digits].  PRINT shows 6 significant digits in plain notation
+;           Literals [digits][.digits][e[+-]digits]: 1e3, 1.45e-2, 6.02e23 (lower-case e only, see the limits below).  PRINT shows 6 significant digits in plain notation
 ;           (1234567 prints 1234570, 1/3 prints 0.333333, trailing zeros trimmed).  Integer uses (GOTO/GOSUB target, line
 ;
 ; Variables: A-Z (26), MBF4 values (4 bytes each); no arrays or string variables
@@ -51,19 +52,18 @@
 ; KNOWN LIMITATIONS
 ;
 ; Floating point
-;   - No E notation: 1E3 reads as 1 (the E3 is silently ignored); write 1000.  
+;   - E notation is lower-case only: 1e3 is 1000, but an upper-case 1E3 still reads as 1 (the E3 is silently ignored): the language is upper case, so a lower-case
+;     e after a number can never clash with a program, while an upper-case E could (IF A=1END, 1EXP(..)).  An exponent is 1 or 2 digits (more wrap modulo 256);
+;     'e' with no digit (1e, 1e+) reads as 1.  Scaling: the total decimal exponent K = exponent - (digits after the '.') must be >= -38 (else ?O; 1.5e-38 is K = -39);
+;     |K| <= 10 with up to 7 significant digits is correctly rounded (a K < 0 literal is ONE division by 10^-K), a larger K or more digits is within a few ULP.
 ;   - INT(x) is the floor (toward minus infinity) for |x| < 32768; |x| >= 32768 gives ?R (the 16-bit integer path, as TAB( / CHR$( / GOTO).
-;     RND is a 16-bit integer: INT(RND*6) is ?R, write INT(ABS(RND)/32768*6).  There is no FIX / SGN.
 ;   - FOR/NEXT with a fractional STEP accumulates rounding error: STEP 0.25 is exact, STEP 0.1 is not
 ;   - RND is 16-bit LFSR seed as a float (signed, -32768..32767; never 0, so ABS(RND)/32768 is 0 < x <= 1).
 ;
 ; Trigonometry 
 ;   - SIN/COS reduces  argument y = |x|*2/PI in single precision, angular error of about 6E-8*|x| radians
-;   - The library rounds half away from zero.  Against mbf4.py with rounding RN_AWAY, * and / were bit-exact and + - differed by 1 ULP in 1 of
-;     300 random pairs (tools/lib_bitexact.py); the library was not changed.
 ;   - FLT_ADD / FLT_SUB keep ONE 8-bit guard byte and no sticky bit: an effective subtraction (signs differ) with an exponent difference of 9..24 can be
-;     1 ULP high when the bits shifted out past the guard byte decide the rounding (v1.1 measured, tests/addprec2.py: about 1 random pair in 1000;
-;     0.4% of the pairs in that range, 0.7% when the larger operand is an exact power of two).  Additions and differences up to 8 or from 26 up are exact.
+;     1 ULP high when the bits shifted out past the guard byte decide the rounding 
 ;
 ; Transcendental functions
 ;   - Maximum error: ATN 1.6E-7 (absolute), ASIN 2.2E-7, ACOS 3.7E-7, LN 1.4E-7 on [0.1,10] and 1.4E-6 over 1E-6..1E7 (values up to 16), SQR 6.7E-7
@@ -168,15 +168,19 @@
 ; =============================================================================
 ; VERSION HISTORY 
 ; =============================================================================
-;
 ;                                                                                                        
-; v1.1 (Oct 2026) - INT(), a FUNC(x)^y fix, golf,  ROMEND $0FD8 (4056 bytes)
+; v1.2 (Oct 2026) - 1e3 notation, Golf, ATN fix.  ROMEND $0FFB (4091 bytes)
+;   - E notation: [digits][.digits][e[+-]digits], lower-case e only. Works 
+;     wherever a number is read, 1E3 still reads as 1.
+;   - Golf: FLT_PARSE rerfactored to include exponent by looping. RAS unchanged
+;   -ATN(x) fix due to golfing
+;
+; v1.1 (Oct 2026) - INT(), a FUNC(x)^y fix, golf,  ROMEND $0FD4 (4052 bytes)
 ;   - INT(x) = floor, Range |x| < 32768 (the 16-bit path), else ?R.
 ;     Showcase lines 582, 584.
 ;   - FLT_TEN_B - looped
 ;   - FLT_ADD: the 'FB is ignored' cutoff is now ea-eb >= 26 (was 25), 0 bytes.
-;
-; v1.1 fix, reported by the owner: FUNC(x)^y applied the ^ to the ARGUMENT (PRINT LN(2)^2 gave 1.38629 = LN(2^2), INT(2.5)^2 gave 6, SIN(1)^2 gave SIN(1^2)):
+;   - FUNC(x)^y applied the ^ to the ARGUMENT (PRINT LN(2)^2 gave 1.38629 = LN(2^2), INT(2.5)^2 gave 6, SIN(1)^2 gave SIN(1^2)):
 ;     the operand's '(' was an atom of its own and pushed a '^' check above the function continuation, so it fired right after the ')' and before the
 ;     function ran.  EXPR_ATOM now pushes POW_LOOP first and then looks at the sign / '(' / name (label EA_NP); FN_DSP pushes the function continuation and
 ;     enters at EA_NP, so the operand pushes no check of its own and the function atom's check (pushed first) runs after the stage: LN(2)^2 = 0.480453.
@@ -578,7 +582,7 @@ DO_ASK:
         BSTA,UN PRT_QUEST
         ZBSR *VPRT_SPACE  
         BSTR,UN GETLINE                   ; [+1] also sets IPH:IPL = IBUF
-        BSTA,UN PF_INP                   ; [+1] FA = [+-]digits[.digits]
+        BSTA,UN PF_INP                   ; [+1] FA = [+-]digits[.digits][e[+-]digits]
         BCTR,UN DL_STORE
 
 ; =============================================================================
@@ -1600,8 +1604,8 @@ V2F_L:
 ;  PF_INP / PF_NUM / PF_INT / FIX_EXP -- numeric literal glue for the MBF4 library
 ;  FLT_PARSE accepts an empty number (FA = 0, IP unmoved), so the entry points first
 ;  insist on a digit or '.', keeping uBASIC's syntax error for a malformed factor.
-;  PF_INP: INPUT literal [+-]digits[.digits] (the digit test looks past one sign char)
-;  PF_NUM: factor/literal digits[.digits] (EXPR_ATOM has already consumed unary + and -)
+;  PF_INP: INPUT literal [+-]digits[.digits][e[+-]digits] (the digit test looks past one sign char)
+;  PF_NUM: factor/literal digits[.digits][e[+-]digits] (EXPR_ATOM has already consumed unary + and -)
 ;  PF_INT: PF_NUM, then EXP = int16(FA)  (line numbers: TRY_STORE_LINE)
 ;  FIX_EXP: EXP = int16(FA), truncating toward zero; |FA| >= 32768 raises ?R
 ; In:  IP -> literal.  Out: FA (EXP for PF_INT/FIX_EXP), IP past the number.
@@ -2292,7 +2296,7 @@ DIV_BY_TEN:
 ;   In     : FA = dividend, FB = divisor (canonical)
 ;   Out    : FA = quotient, normalised and rounded.  FA = 0 returns at once;  exponent underflow flushes to zero.
 ;   Clobber: R0-R3;  FB+1 (bit 7 forced to 1, the rest of FB is intact), FDV..FDV+2, RD..RD+2, FSA, FER, FDB.   
-;            FDE is NOT touched (it is live in FLT_PARSE / FLT_PRINT across DIV_BY_TEN: FER is the scratch here).
+;            FDE is NOT touched (it is live in FLT_PRINT across DIV_BY_TEN: FER is the scratch here).
 ;   Errors : FB = 0 -> FP_DZERR ('Z'), tested first even when FA = 0;  exponent overflow -> FP_OVF ('O')
 ;   RAS    : 1  (CALC_SIGN_EXP, EXPCHK, SHL_MANTISSA; NORM_PACK is entered by jump)
 FLT_DIV:
@@ -2335,7 +2339,7 @@ FDQ:
         LODA,R0 FB                      ; exponent = ea - eb + 128 (+1 if quotient >= 1): eb + R3 - 32 = eb or eb-1
         ADDZ,R3
         SUBI,R0 32
-        STRA,R0 FER                     ; (FDE is live in PARSE/PRINT across DIV_BY_TEN: use FER as the scratch)
+        STRA,R0 FER                     ; (FDE is live in PRINT across DIV_BY_TEN: use FER as the scratch)
         LODA,R0 FA
         SUBA,R0 FER
         BSTA,UN EXPCHK                  ; range check after the quotient size is known
@@ -2604,20 +2608,29 @@ PINC:
         RETC,UN
 
 ; -----------------------------------------------------------------------------
-; FLT_PARSE -- parse digits[.digits] at *IP into FA and advance IP past it 
-; Integer digits accumulate as FA = FA*10 + digit.  The 65C02's recursive PARSE_FRAC is a loop here: it
-; reads the fraction digits backwards through *IP+R1 and adds them as (digit + fraction)/10 steps.
+; FLT_PARSE -- parse digits[.digits][e[+-]digits] at *IP into FA and advance IP past it  (v1.2: one digit loop and one scale step)
+; Digits on either side of the '.' go through the same loop: FA = FA*10 + d.  D (PSAVE) turns 1 at the first '.', and every digit then
+; counts K (FPN) down by D, so K = -(fraction digits).  A lower-case e, an optional + or - and the exponent digits follow: e is built in
+; R2 as e*10+d with the sign mask in R3 (0 or $FF), and K += (e xor mask) - mask.  Then FA is scaled by 10^K:
+;   K > 0 : K times MUL_BY_TEN.
+;   K < 0 : ONE division.  The mantissa is parked in ZSLOT, 10^-K is built from 10.0 with MUL_BY_TEN, and FLT_DIV does mantissa / 10^-K,
+;           so a literal of up to 7 digits (exact in 24 bits) with -K <= 10 (10^-K exact) is correctly rounded.  (v1.1 divided by 10 once per
+;           fraction digit: up to 3 ULP.  Repeated MUL_BY_TEN for K > 0 rounds at every step once the product passes 2^24.)
 ;   In     : RS=1 (caller did PPSL $10), IP -> first character (via IPH:IPL, high byte first)
 ;   Out    : FA = value (no digits gives 0);  IP -> first character after the number;  RS=0 (CPSL $10 inside, then RETC,UN)
 ;   Entry  : by tail jump from PARSE_FACTOR (PPSL $10 / BCTA,UN FLT_PARSE): no RAS level is used at entry
-;   Clobber: R0-R3;  FA, FB, FBG, FDB, FSA, FSB, FER, FMA, FDV, RD, T0, FPN, PSAVE
-;   Errors : value too large -> FP_OVF ('O');  too small flushes to 0
-;   RAS    : 2  (PINC -> INC_IP;  MUL_BY_TEN;  FLT_ADD -> FSWAP;  INC_IP and DIGIT_CHECK counted as leaves)
+;   Clobber: R0-R3;  FA, FB, FBG, FDB, FSA, FSB, FER, FMA, FDV, RD, T0, FPN, PSAVE, ZSLOT (= DIG..DIG+3)
+;   Errors : value too large -> FP_OVF ('O');  K < -38 (10^-K overflows) -> FP_OVF;  too small flushes to 0
+;   Syntax : a second '.' ends the number (as before: the caller then reports its syntax error);  'e' not followed by a digit is eaten
+;            (1e = 1, 1e+ = 1);  more than 2 exponent digits wrap modulo 256;  an upper-case E is not an exponent
+;   RAS    : 2  (PINC -> INC_IP;  MUL_BY_TEN;  FLT_ADD -> FSWAP;  FLT_DIV -> CALC_SIGN_EXP;  ST_Z / LD_Z, INC_IP and DIGIT_CHECK are leaves)
 FLT_PARSE:
-        ZBSR *VFLT_ZERO
-FPAI:
-        ZBSR    *VDIGIT_CHECK
-        BCTR,GT FPDT
+        ZBSR *VFLT_ZERO                 ; FA = 0, R0 = 0
+        STRA,R0 FPN                     ; K = 0
+        STRA,R0 PSAVE                   ; D = 0 (no '.' yet)
+FPL:
+        ZBSR *VDIGIT_CHECK
+        BCTR,GT FPX                     ; not a digit
         STRA,R0 T0+1
         EORZ,R0
         STRA,R0 T0
@@ -2625,58 +2638,78 @@ FPAI:
         ZBSR *VMUL_BY_TEN
         ZBSR *VFROM_INT_B
         ZBSR *VFLT_ADD
-        BCTR,UN FPAI
-FPDT:
-        LODA,R0 *IPH
-        COMI,R0 '.'
-        BCFA,EQ FPSX
+        LODA,R0 FPN
+        SUBA,R0 PSAVE                   ; K -= D: one per digit after the '.'
+        STRA,R0 FPN
+        BCTR,UN FPL
+FPX:
+        COMI,R0 '.'-'0'
+        BCFR,EQ FPE
+        LODA,R0 PSAVE
+        BCFR,EQ FPS                     ; a second '.': the number ends here
+        LODI,R0 1
+        STRA,R0 PSAVE
         BSTR,UN PINC
-        LODI,R1 4                       ; park FA in PSAVE
-FPSV_L:
-        LODA,R0 FA-1,R1
-        STRA,R0 PSAVE-1,R1
-        BDRR,R1 FPSV_L
-        LODI,R1 $FF                     ; pre-increment index: the first load is at IP+0
-FPCNT:
-        LODA,R0 *IPH,R1+
-        SUBI,R0 '0'
-        COMI,R0 10
-        BCTR,LT FPCNT                   ; a digit: next (R1 ends = the number of digits)
-FPCE:
-        STRA,R1 FPN
-        ZBSR *VFLT_ZERO
-FPFL:
-        LODA,R1 FPN
-        BCTR,EQ FPFD
-        LODA,R0 *IPH,R1-                ; pre-decrement: R1 = FPN - 1, the next fraction digit (last first)
-        STRA,R1 FPN
-        SUBI,R0 '0'
-        STRA,R0 T0+1
+        BCTR,UN FPL
+FPE:
+        COMI,R0 'e'-'0'                 ; (R0 = char - '0' from DIGIT_CHECK)
+        BCFR,EQ FPS
         EORZ,R0
-        STRA,R0 T0
-        ZBSR *VFROM_INT_B
-        ZBSR *VFLT_ADD
-        BSTA,UN DIV_BY_TEN
-        BCTR,UN FPFL
-FPFD:
-        LODI,R1 0
-FPSK:
-        LODA,R0 *IPH,R1
-        SUBI,R0 '0'
-        COMI,R0 10
-        BCFR,LT FPSKD
+        STRZ,R2                         ; R2 = e = 0
+        STRZ,R3                         ; R3 = sign mask = 0
+        BSTA,UN PINC                    ; eat the 'e'
+        ZBSR *VDIGIT_CHECK
+        COMI,R0 '+'-'0'
+        BCTR,EQ $+8                     ; '+': skip the '-' test, eat it
+        COMI,R0 '-'-'0'
+        BCFR,EQ FPEL
+        LODI,R3 $FF                     ; '-'
+        BSTA,UN PINC                    ; eat the sign
+FPEL:
+        ZBSR *VDIGIT_CHECK
+        BCTR,GT FPEK
+        STRZ,R1                         ; R1 = d
+        LODZ,R2                         ; e = e*10 + d  (R2 and R3 survive PINC and DIGIT_CHECK)
+        ADDZ,R0
+        STRZ,R2
+        ADDZ,R0
+        ADDZ,R0
+        ADDZ,R2
+        ADDZ,R1
+        STRZ,R2
         BSTA,UN PINC
-        BCTR,UN FPSK
-FPSKD:
-        ZBSR *VFSWAP                   ; FB = fraction (FA's junk goes to FB, overwritten next)
-        LODI,R1 4                       ; FA = PSAVE
-FPRS_L:
-        LODA,R0 PSAVE-1,R1
-        STRA,R0 FA-1,R1
-        BDRR,R1 FPRS_L
-        ZBSR *VFLT_ADD
-FPSX:
-        CPSL    $10                     ; FLT_PARSE owns the bank: entered by 'PPSL $10 / BCTA FLT_PARSE' from PARSE_FACTOR
+        BCTR,UN FPEL
+FPEK:
+        LODZ,R2                         ; K += (e xor mask) - mask
+        EORZ,R3
+        SUBZ,R3
+        ADDA,R0 FPN
+        STRA,R0 FPN
+FPS:
+        LODA,R0 FPN
+        BCTR,LT FPDV                    ; K < 0: divide
+        BCTR,EQ FPQ
+        SUBI,R0 1
+        STRA,R0 FPN
+        ZBSR *VMUL_BY_TEN
+        BCTR,UN FPS
+FPDV:
+        BSTA,UN ST_Z                    ; park the mantissa
+        ZBSR *VFLT_TEN_B
+        ZBSR *VFSWAP                    ; FA = 10 = 10^1
+FPDL:
+        LODA,R0 FPN
+        ADDI,R0 1
+        STRA,R0 FPN
+        BCTR,EQ FPDD
+        ZBSR *VMUL_BY_TEN
+        BCTR,UN FPDL
+FPDD:
+        BSTA,UN LD_Z                    ; FB = mantissa
+        ZBSR *VFSWAP                    ; FA = mantissa, FB = 10^-K
+        BSTA,UN FLT_DIV
+FPQ:
+        CPSL    $10
         RETC,UN
 E_PARSE:
 
@@ -2836,7 +2869,7 @@ E_PRINT:
 ;   LN       x = m*2^E, m moved into [1/sqrt2, sqrt2) so that LN(1) is exactly 0;  z = (m-1)/(m+1);  ln m = z*Q(z*z);  result E*ln2 + ln m.  x <= 0 gives ?R.
 ;   EXP      k = TRUNC(x*log2e) (must fit a signed byte), r = x - k*ln2, exp(r) = P(r) (Horner), exponent += k.  Result overflow gives ?O, underflow 0.
 ;
-; Scratch (no RAM beyond QF/HPTR/HCNT/EK): TS = DIG..DIG+11 = DIG (PRINT's digit buffer, free while a function runs) + PSAVE (FLT_PARSE's, likewise),
+; Scratch (no RAM beyond QF/HPTR/HCNT/EK): TS = DIG..DIG+11 = DIG (PRINT's digit buffer, free while a function runs; FLT_PARSE parks a mantissa in ZSLOT) + PSAVE (FLT_PARSE's flag, likewise),
 ;   three 4-byte slots ZSLOT / TSLOT / XSLOT copied by ST_FA / LD_FB (R2 = slot offset).
 ; Constants and coefficients are 4-byte MBF4 entries [E][S|M1][M2][M3] in ONE page ($0Dxx): LD_B_PTR walks a stream with HPTR (low byte += 4),
 ;   SETP points HPTR at a stream (the high byte is the page of SCT).  tools/check_tables.py verifies that the whole table sits in one page.
@@ -2918,11 +2951,13 @@ AT_NR:
         LODI,R0 8               ; number of coefficients in ATT
         STRA,R0 HCNT
         BSTA,UN HORNER_ODD      ; FA = atan(t)
-        ZBSR *VLD_B_PTR        ; FB = PI/2 (always loaded: it keeps HPTR in step)
         LODA,R0 QF
         ANDI,R0 1
         BCTR,EQ AT_S
         ZBSR *VFLT_NEGATE
+        LODI,R0 >(PIO2-1)       ; v1.2: PIO2 is SIN's c0 now (v1.1), no longer the entry after ATT: point at it
+        ZBSR *VSETP
+        ZBSR *VLD_B_PTR         ; FB = PI/2
         ZBSR *VFLT_ADD          ; reduced: FA = PI/2 - atan(1/a)
 AT_S:
         LODA,R0 QF
@@ -3432,7 +3467,6 @@ SETP:
         STRA,R0 HPTR
         RETC,UN
 
-
 ; #############################################################################
 ;  TABLES 
 ; #############################################################################
@@ -3461,7 +3495,7 @@ FNA:
         DB <INT_RET,>INT_RET
 
 BANNER:
-        DB CR, LF, "miniBASIC2650 1.1", CR, LF,"Bytes Free:", NUL        
+        DB CR, LF, "miniBASIC2650 1.2", CR, LF,"Bytes Free:", NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -3505,7 +3539,8 @@ SCT:
         DB $79,$99,$37,$F9          ; c3 = -0.00467586191
         DB $7D,$23,$35,$25          ; c2 = 0.0796912089
         DB $80,$A5,$5D,$E7          ; c1 = -0.645964086
-        DB $81,$49,$0F,$DB          ; c0 = 1.57079637
+PIO2:
+        DB $81,$49,$0F,$DB          ; c0 = 1.570796371
 ; ONES + ATT : ASIN reads ONES and the first entry of ATT (1.0, 1.0); ATN reads ATT, then PIO2:  1.0, c7..c0 of atan(t) = t * P(t^2), then PI/2
 ;ONES:
 ;        DB $81,$00,$00,$00          ; 1.0 = 1
@@ -3519,8 +3554,7 @@ ATT:
         DB $7E,$4C,$49,$71          ; c2 = 0.199498907
         DB $7F,$AA,$A6,$90          ; c1 = -0.333302021
         DB $80,$7F,$FF,$F7          ; c0 = 0.999999464
-PIO2:
-        DB $81,$49,$0F,$DB          ; PI/2 = 1.570796371
+
 ; EXPT : EXP:  log2e, ln2, c7..c0 of exp(r) = c0 + c1 r + ... + c7 r^7
 EXPT:
         DB $81,$38,$AA,$3B          ; LOG2E = 1.442695022
@@ -3639,9 +3673,9 @@ FPLIM   RES     1               ; PRINT: number of significant digits after trim
 FPY     RES     1               ; PRINT: index of the next digit in DIG
 DIGI    RES     1               ; PRINT: digits extracted so far (0..7)
 DIG     RES     8               ; PRINT digit buffer, DIG..DIG+6 used (the 65C02 used IBUF; here a private buffer)
-PSAVE   RES     4               ; FLT_PARSE: parked copy of FA (the integer part while the fraction is built)
+PSAVE   RES     4               ; FLT_PARSE: byte 0 = D, 1 once a '.' has been seen (each digit then counts K down);  bytes 1..3 are free (XSLOT)
 ; The function routines borrow RAM that is free while a function is evaluated.  FLT_PRINT fills DIG only after the expression has
-; been evaluated, and FLT_PARSE uses PSAVE only inside itself (no literal is half parsed while a function runs).  DIG and PSAVE are adjacent,
+; been evaluated, and FLT_PARSE uses PSAVE and (a literal with a negative K) ZSLOT only inside itself (no literal is half parsed while a function runs).  DIG and PSAVE are adjacent,
 ; so together they form three 4-byte FP slots.
 TS      EQU     DIG             ; DIG..DIG+11 (= DIG + PSAVE): three 4-byte FP slots (packed like FA), copied by ST_FA / LD_FB with R2 = slot offset
 ZSLOT   EQU     0               ; Horner: z (the evaluation point)
@@ -3651,7 +3685,7 @@ QF      RES     1               ; SIN/COS: quadrant offset on entry, then n;  AT
 HPTR    RES     2               ; coefficient-stream pointer, high byte first, points ONE BYTE BEFORE the next 4-byte entry
 HCNT    RES     1               ; Horner: coefficients still to apply
 EK      RES     1               ; LN: E (exponent - 128);  EXP: k
-FPN     RES     1               ; PARSE: count of fraction digits ahead of IP
+FPN     RES     1               ; PARSE: K, the decimal exponent adjust (minus the fraction digits, plus the exponent), a signed byte
 T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL (high byte first)
 
 
