@@ -1,6 +1,6 @@
 /* ============================================================================
  * asm2650.c  —  Signetics 2650 cross-assembler
- * Version: 1.23
+ * Version: 1.24
  * Build:   gcc -Wall -O2 -o asm2650 asm2650.c
  *
  * USAGE
@@ -64,6 +64,7 @@
  *     dead      unlabelled code after an unconditional transfer
  *
  * VERSION HISTORY  (summary; the full change notes follow, newest first)
+ *   1.24  Label table raised from 512 to 2048 entries (miniBASIC2650 reached 512).
  *   1.23  skipbyte split: skipbyte (proven safe) + skipmaybe (programmer verifies).
  *   1.22  New default-on hint "skipbyte": BCTx,UN over 1-2 bytes -> DB $E4 / $EC.
  *   1.21  Peephole hints (clear, test, zpage, next, psw, retcc, condtail, loop,
@@ -108,6 +109,12 @@
  *            grouping. Division by zero is an error. Trailing text the
  *            grammar can't parse is a hard error (was silently dropped
  *            pre-1.17 — BUG-ASM-15).
+ *
+ * Changes v1.23 -> v1.24:
+ *   MAX_LABELS 512 -> 2048 (labels[] and the thunk pass's lsites[] follow it; about
+ *   160 KB of static data). The "label table full" error now names the limit.
+ *   Nothing else changes: hex output is identical to v1.23; the listing differs only
+ *   in the version on its first line.
  *
  * Changes v1.22 -> v1.23:
  *   "skipbyte" is split into two hints, both default on:
@@ -462,11 +469,11 @@
 #include <ctype.h>
 #include <stdarg.h>
 
-#define MAX_LABELS  512
+#define MAX_LABELS  2048
 #define MAX_LINE    256
 #define MAX_ROM   32768
 #define UNDEF      (-1)
-#define ASM2650_VERSION "1.23"
+#define ASM2650_VERSION "1.24"
 
 typedef struct { char name[64]; int value; int referenced; int def_line; int refs; } Label;
 static Label labels[MAX_LABELS];
@@ -597,7 +604,7 @@ static void label_define(const char *n, int v){
         }
         labels[i].value=v; return;
     }
-    if(nlabels>=MAX_LABELS){ fprintf(stderr,"ERROR: label table full\n"); errors++; return; }
+    if(nlabels>=MAX_LABELS){ fprintf(stderr,"ERROR: label table full (MAX_LABELS = %d)\n",MAX_LABELS); errors++; return; }
     strncpy(labels[nlabels].name,n,63); labels[nlabels].name[63]=0;
     labels[nlabels].value=v; labels[nlabels].referenced=0; labels[nlabels].refs=0; labels[nlabels].def_line=lineno; nlabels++;
 }
