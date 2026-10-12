@@ -1,6 +1,6 @@
 ; =============================================================================
-; miniBASIC2650 v1.2  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
-;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP/INT and ^ operator 
+; miniBASIC2650 v1.3  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
+;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP/INT, PI and ^ operator 
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -39,8 +39,9 @@
 ;   ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS
 ;   SQRT(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives 0
 ;   LN(expr) : natural logarithm; zero or a negative argument gives ?R.   
-;   INT(expr): floor, the whole number at or below x: INT(2.7) is 2, INT(-2.7) is -3.  
-;            |x| >= 32768 gives ?R (as TAB( and CHR$()
+;   EXP(expr): e to the power x; x above about 88 gives ?O, x below about -88.7 gives 0
+;   PI       : 3.14159274, no argument: PI*2, SIN(PI/2).  A word of P and a letter is PI (as R and a letter is RND); the variable P is unaffected
+;   INT(expr): floor, the whole number at or below x: INT(2.7) is 2, INT(-2.7) is -3.  |x| >= 32768 gives ?R (as TAB( and CHR$()
 ;
 ; Numbers : MBF4 floating point: 24-bit mantissa (exact integers to 16777216), exponent range about 1E-38 .. 1.7E38.
 ;           Literals [digits][.digits][e[+-]digits]: 1e3, 1.45e-2, 6.02e23 (lower-case e only, see the limits below).  PRINT shows 6 significant digits in plain notation
@@ -52,18 +53,21 @@
 ; KNOWN LIMITATIONS
 ;
 ; Floating point
-;   - E notation is lower-case only: 1e3 is 1000, but an upper-case 1E3 still reads as 1 (the E3 is silently ignored): the language is upper case, so a lower-case
-;     e after a number can never clash with a program, while an upper-case E could (IF A=1END, 1EXP(..)).  An exponent is 1 or 2 digits (more wrap modulo 256);
-;     'e' with no digit (1e, 1e+) reads as 1.  Scaling: the total decimal exponent K = exponent - (digits after the '.') must be >= -38 (else ?O; 1.5e-38 is K = -39);
-;     |K| <= 10 with up to 7 significant digits is correctly rounded (a K < 0 literal is ONE division by 10^-K), a larger K or more digits is within a few ULP.
+;   - E notation is lower-case only: 1e3 is 1000, but upper-case 1E3 reads as 1 (E3 is silently ignored). 
+;     Total decimal exponent K = exponent - (digits after the '.') must be >= -38 (else ?O; 1.5e-38 is K = -39);
+;     |K| <= 10 <7 significant digits is correctly rounded (a K < 0 literal is ONE division by 10^-K), a larger K or more digits is within a few ULP.
 ;   - INT(x) is the floor (toward minus infinity) for |x| < 32768; |x| >= 32768 gives ?R (the 16-bit integer path, as TAB( / CHR$( / GOTO).
+;     RND is a 16-bit integer: INT(RND*6) is ?R, write INT(ABS(RND)/32768*6).  There is no FIX / SGN.
 ;   - FOR/NEXT with a fractional STEP accumulates rounding error: STEP 0.25 is exact, STEP 0.1 is not
 ;   - RND is 16-bit LFSR seed as a float (signed, -32768..32767; never 0, so ABS(RND)/32768 is 0 < x <= 1).
 ;
 ; Trigonometry 
 ;   - SIN/COS reduces  argument y = |x|*2/PI in single precision, angular error of about 6E-8*|x| radians
+;   - The library rounds half away from zero.  Against mbf4.py with rounding RN_AWAY, * and / were bit-exact and + - differed by 1 ULP in 1 of
+;     300 random pairs (tools/lib_bitexact.py); the library was not changed.
 ;   - FLT_ADD / FLT_SUB keep ONE 8-bit guard byte and no sticky bit: an effective subtraction (signs differ) with an exponent difference of 9..24 can be
-;     1 ULP high when the bits shifted out past the guard byte decide the rounding 
+;     1 ULP high when the bits shifted out past the guard byte decide the rounding (v1.1 measured, tests/addprec2.py: about 1 random pair in 1000;
+;     0.4% of the pairs in that range, 0.7% when the larger operand is an exact power of two).  Additions and differences up to 8 or from 26 up are exact.
 ;
 ; Transcendental functions
 ;   - Maximum error: ATN 1.6E-7 (absolute), ASIN 2.2E-7, ACOS 3.7E-7, LN 1.4E-7 on [0.1,10] and 1.4E-6 over 1E-6..1E7 (values up to 16), SQR 6.7E-7
@@ -169,11 +173,28 @@
 ; VERSION HISTORY 
 ; =============================================================================
 ;                                                                                                        
-; v1.2 (Oct 2026) - 1e3 notation, Golf, ATN fix.  ROMEND $0FFB (4091 bytes)
-;   - E notation: [digits][.digits][e[+-]digits], lower-case e only. Works 
-;     wherever a number is read, 1E3 still reads as 1.
-;   - Golf: FLT_PARSE rerfactored to include exponent by looping. RAS unchanged
-;   -ATN(x) fix due to golfing
+; v1.3 (Oct 2026) - PI, golf.  ROMEND $0FF0 (4080 bytes), 16 free
+;   - DO_PI constant PI added.
+;   - Golf: vectors for FLT_TO_INT / FLT_SUB / FLT_DIV in, INC_ET / EXPR_ATOM / FA2VAR out
+;
+; v1.2 (Oct 2026) - E notation (1e3, 1.45e-2), FLT_PARSE looped, ATN fix.  ROMEND $0FFB (4091 bytes), 5 free (v1.1: $0FD4)
+;   - E notation: [digits][.digits][e[+-]digits], lower-case e only (an upper-case E could follow a number in a valid program: IF A=1END; the language is upper
+;     case, so a lower-case e never could).  Works wherever a number is read: expressions, INPUT, FOR, GOTO / line numbers, 1e1^2.  1E3 still reads as 1.
+;   - FLT_PARSE: 121 -> 156 bytes (+35) INCLUDING the exponent; the v1.1 structure (integer loop, fraction counted then built backwards, park and restore
+;     FA, skip loop) would have needed about +76.  One digit loop for both sides of the '.', K = exponent - fraction digits, one scale step: K > 0 by MUL_BY_TEN,
+;     K < 0 by ONE division by 10^-K (mantissa parked in ZSLOT by ST_Z, 10^-K built from 10.0).  RAS unchanged (2), labels 510 -> 509, RAM unchanged
+;     (FPN is K, PSAVE byte 0 is the '.' flag).  Time: 3.14159 15.6k instructions (13.8k), 0.000123 11.7k (15.3k), 123456.789 19.0k (16.7k), 12345 6.35k (6.34k).
+;   - Accuracy, against exact decimal -> MBF4 on random literals through the simulator:  plain decimals of up to 7 significant digits are now ALL correctly rounded
+;     (v1.1: 93.5%, worst 2 ULP); 8 or more digits are WORSE (v1.1: 97% correctly rounded, worst 1 ULP;  v1.2: 54%, 95% within 1 ULP, worst 3 ULP: the
+;     mantissa itself is rounded once it passes 2^24).  With an exponent: |K| <= 10 and up to 7 digits 99.0% correctly rounded, worst 2 ULP; beyond 1E10 / below
+;     1E-10 the error grows by about half an ULP per decade (observed worst 6).  Common constants (3.14159265, 2.718281828, 6.62607015 ...) are within 1 ULP in both.
+;   - Limits: K >= -38 or ?O (1e-39 and 1.5e-38 are ?O; 1e-38 is fine);  an exponent of 3 digits wraps modulo 256;  1e, 1e+ read as 1.
+;   - FIX, found while testing (v1.1 as uploaded): ATN(x) was wrong for |x| > 1 (ATN(2.5) 1.06219, true 1.19029), so ASIN / ACOS were wrong for |x| >= 0.8: the v1.1
+;     table change made PIO2 the last entry of SCT (sin's c0), but ATN_RET still took PI/2 as the entry after ATT (it now read LOG2E: PI/2 - 0.1281).  ATN_RET now
+;     points HPTR at PIO2 with SETP, only when the argument was reduced (+4 bytes).  Whole-library check, 485 points over SIN, COS, ATN, ASN, ACS, SQR, LN, EXP, INT
+;     against float64 (tolerance 1.2E-5 relative): 85 bad before, 0 after.  Random FUNC / ^ expressions (700): 0 wrong after (15 per 300 before, all ATN).
+;   - Checked: showcase RUN output identical to v1.1 apart from the banner; peak hardware stack 7 (no wrap) with exponent literals in FOR inside GOSUB, nested
+;     expressions and INPUT.  Comment fixes: FDE was never live in FLT_PARSE.
 ;
 ; v1.1 (Oct 2026) - INT(), a FUNC(x)^y fix, golf,  ROMEND $0FD4 (4052 bytes)
 ;   - INT(x) = floor, Range |x| < 32768 (the 16-bit path), else ?R.
@@ -307,10 +328,10 @@ VPARSER_RET:
         DW PARSER_RET
 VEATWORD:
         DW EATWORD
-VEXPR_ATOM:
-        DW EXPR_ATOM
-VINC_ET:
-        DW INC_ET
+VFLT_SUB:
+        DW FLT_SUB
+VFLT_TO_INT:
+        DW FLT_TO_INT
 VDIGIT_CHECK:
         DW DIGIT_CHECK
 VFLT_ADD:
@@ -319,8 +340,8 @@ VPUTC:
         DW PUTC
 VFLT_ZERO:
         DW FLT_ZERO
-VFA2VAR:
-        DW FA2VAR
+VFLT_DIV:
+        DW FLT_DIV
 VFLT_CMP:
         DW FLT_CMP
 VFLT_NEGATE:
@@ -821,7 +842,7 @@ DN_POP9:
         ZBSR *VFLT_ADD                  ; FA = var + step
         CPSL PSW_RS
         LODA,R0 FWRK
-        ZBSR *VFA2VAR                   ; var = var + step
+        BSTA,UN FA2VAR                   ; var = var + step
         LODI,R0 LIMOFF
         BSTA,UN VAR2FB                   ; FB = limit
         PPSL PSW_RS
@@ -1146,7 +1167,7 @@ DEL_LP:
         STRA,R0 *EXPH
         ZBSR *VINC_TMP
         LODI,R0 EXPH-IPH
-        ZBSR *VINC_ET                   ; dst++
+        BSTA,UN INC_ET                   ; dst++
         BCTR,UN DEL_LP
 DEL_END:
         LODI,R0 (IDX_EXP*16)+IDX_PE
@@ -1171,7 +1192,7 @@ OPEN_GAP:
         STRZ,R2                          ; R2 = size, as the INC_ET step count
 OG_ADD:
         LODI,R0 EXPH-IPH
-        ZBSR *VINC_ET                   ; EXP++ (R2 times: EXP = PE + size)
+        BSTA,UN INC_ET                   ; EXP++ (R2 times: EXP = PE + size)
         BDRR,R2 OG_ADD
         LODA,R0 EXPH
         COMI,R0 <PROGLIM+1
@@ -1297,7 +1318,7 @@ OHL_HI:
         db $EC                           ; COMA,R0: consume next 2 bytes
 OPS_HIT_HI:
         BSTR,UN OPS_HIT_COM
-        ZBRR *VEXPR_ATOM         ; right operand is ONE atom only - further
+        BCTA,UN EXPR_ATOM         ; right operand is ONE atom only - further
                                   ; */  chaining ("2*3*4") happens via
                                   ; DO_MUL/DO_DIV looping back to HI_LOOP
                                   ; themselves, left-associatively, not here
@@ -1408,6 +1429,8 @@ EA_NP:                                  ; the operand of a function enters here:
         ZBSR *VWSKIP            ; re-peek with R0 = char[0]
         COMI,R0 A'R'
         BCTA,EQ DO_RND          ; Starts with 'R'? Try RND (absolute: DO_RND is out of BCTR range)
+        COMI,R0 A'P'
+        BCTR,EQ DO_PI           ; Starts with 'P'? PI
         BCTR,UN FN_DSP          ; every other function name is found by the table scanner below
         ; not a known function: FN_DSP comes back here
 END_FUNCS:
@@ -1419,9 +1442,19 @@ EA_NEG:
         ZBSR *VINC_IP  
         LODI,R0 >NEG_RET
         LODI,R1 <NEG_RET
-EX_PRA:
         ZBSR *VPUSH_RET
-        ZBRR *VEXPR_ATOM                   ; parse the operand
+        BCTR,UN EXPR_ATOM                   ; parse the operand
+
+; DO_PI -- PI atom: FA = 3.14159274;  the word is eaten (as RND: P and a letter).  Bank 0, R2 / R3 untouched.   Clobber: R0, R1, FA
+;   Labelless loop (the label table is full): the constant follows the code, LODA is 9 bytes before the data - 1, BDRR goes back to the LODA.
+DO_PI:
+        ZBSR *VEATWORD
+        LODI,R1 4
+        LODA,R0 $+9,R1                  ; the 4 data bytes, indexed 4..1 from (data - 1)
+        STRA,R0 FA-1,R1
+        BDRR,R1 $-6
+        ZBRR *VPARSER_RET
+        DB $82,$49,$0F,$DB              ; PI = 3.14159274 (PIO2 with the exponent + 1)
 
 ; -----------------------------------------------------------------------------
 ; FN_DSP -- table-driven dispatch of the unary functions 
@@ -1479,7 +1512,7 @@ EA_PAREN:
         ZBSR *VPUSH_RET                     
         BSTR,UN PUSH_LOLOOP                
         BSTR,UN PUSH_HILOOP                 
-        ZBRR *VEXPR_ATOM                   
+        BCTA,UN EXPR_ATOM                   
 
 ; =============================================================================
 ;  DO_ADD / DO_SUB / DO_MUL / DO_DIV -- MBF4 operator handlers.  EXPR leaves the RIGHT
@@ -1505,7 +1538,7 @@ DO_MUL:
 DO_DIV:                                 ; left / right = FB / FA: swap, then FA = FA / FB
         PPSL PSW_RS
         ZBSR *VFSWAP
-        BSTA,UN FLT_DIV
+        ZBSR *VFLT_DIV
 DM_END:
         CPSL PSW_RS
         BSTR,UN PUSH_HILOOP             ; "2*3*4" chains left to right via HI_LOOP
@@ -1635,7 +1668,7 @@ PF_INT:
         ; drop through
 FIX_EXP:
         PPSL PSW_RS
-        BSTA,UN FLT_TO_INT                ; T0 (= EXP) = int16(FA)
+        ZBSR *VFLT_TO_INT                ; T0 (= EXP) = int16(FA)
         CPSL PSW_RS
         RETC,UN
 
@@ -1771,7 +1804,7 @@ DO_FOR:
         ZBSR *VEATWORD
         ZBSR *VPARSE_EXPR                ; FA = limit
         LODI,R0 LIMOFF
-        ZBSR *VFA2VAR                   ; FWRK limit (safe across the STEP expression)
+        BSTA,UN FA2VAR                   ; FWRK limit (safe across the STEP expression)
         ZBSR *VWSKIP
         COMI,R0 A'S'
         BCTR,EQ DF_STEP
@@ -1786,7 +1819,7 @@ DF_STEP:
         ZBSR *VPARSE_EXPR                ; FA = step
 DF_GOT:
         LODI,R0 STPOFF
-        ZBSR *VFA2VAR                   ; FWRK step
+        BSTA,UN FA2VAR                   ; FWRK step
         LODA,R1 FSP
         COMI,R1 FSTKLIM
         BCFA,LT DRT_UFLOW                ; all frames in use
@@ -1837,16 +1870,16 @@ ABS_RET:
 ;   RAS    : 2 (the library calls)
 INT_RET:
         PPSL PSW_RS
-        BSTA,UN FLT_TO_INT              ; T0 = q = TRUNC(x), FA = x
+        ZBSR *VFLT_TO_INT              ; T0 = q = TRUNC(x), FA = x
         ZBSR *VFROM_INT_B               ; FB = float(q) (T0 destroyed)
         ZBSR *VFLT_CMP                  ; CC = x vs q: LT only for a negative fraction.  Both negative: swapped (FA = q): TRUNC(FA) is q either way
         BCFR,LT INT_Q
         LODI,R0 >(ONES-1)
         ZBSR *VSETP
         ZBSR *VLD_B_PTR                 ; FB = 1.0
-        BSTA,UN FLT_SUB                 ; FA = FA - 1
+        ZBSR *VFLT_SUB                 ; FA = FA - 1
 INT_Q:
-        BSTA,UN FLT_TO_INT              ; T0 = TRUNC(FA) = floor(x)
+        ZBSR *VFLT_TO_INT              ; T0 = TRUNC(FA) = floor(x)
         BSTA,UN FLT_FROM_INT            ; FA = float(T0)
         ZBRR *VFN_END
 
@@ -2437,20 +2470,11 @@ S_CONV:
 ;   Out    : FA = 0
 ;   Clobber: R0, R1, R2
 ;   RAS    : 0
-;   Note   : FLT_ZERO loads R1 = 0, DB $EC skips the next LODI,R1 (skip-2 idiom), and the code runs on into F_ZERO.
+;   Note   : FLT_ZERO loads R1 = 0 and runs on into F_ZERO, the common tail: R1 = 0 zeroes FA, R1 = 5 zeroes FB (FLT_SHARED enters it for a zero
+;            integer; v1.3: the unused FLT_ZERO_B entry and its skip byte are gone, 3 bytes).
 FLT_ZERO:
         EORZ,R0
         STRZ,R1                         ; R1 = 0 (R0 = 0)
-        DB      $EC
-; -----------------------------------------------------------------------------
-; FLT_ZERO_B -- FB = canonical zero 00 00 00 00 (the guard byte FBG is not written)
-;   In     : -
-;   Out    : FB = 0
-;   Clobber: R0, R1, R2
-;   RAS    : 0
-;   Note   : F_ZERO below is the common tail: R1 = 0 zeroes FA, R1 = 5 zeroes FB (also entered by FLT_SHARED for a zero integer).
-FLT_ZERO_B:
-        LODI,R1 5
 F_ZERO:
         LODI,R2 4
         EORZ,R0
@@ -2707,7 +2731,7 @@ FPDL:
 FPDD:
         BSTA,UN LD_Z                    ; FB = mantissa
         ZBSR *VFSWAP                    ; FA = mantissa, FB = 10^-K
-        BSTA,UN FLT_DIV
+        ZBSR *VFLT_DIV
 FPQ:
         CPSL    $10
         RETC,UN
@@ -2769,14 +2793,14 @@ FPSC:
         EORZ,R0
         STRA,R0 DIGI
 FPDIG:
-        BSTA,UN FLT_TO_INT              ; T0 = 0, T0+1 = the digit (FA < 10)
+        ZBSR *VFLT_TO_INT              ; T0 = 0, T0+1 = the digit (FA < 10)
         LODA,R0 T0+1
         IORI,R0 '0'
         LODA,R1 DIGI
         STRA,R0 DIG-1,R1+               ; pre-increment: stores at DIG + DIGI
         STRA,R1 DIGI
         ZBSR *VFROM_INT_B               ; FB = float(digit)
-        BSTA,UN FLT_SUB
+        ZBSR *VFLT_SUB
         LODA,R0 FA+1
         BCFR,LT FPCL
         ZBSR *VFLT_ZERO
@@ -2903,13 +2927,13 @@ SC_GO:
         BSTA,UN FLT_ABS         ; FA = |x|
         ZBSR *VLD_B_PTR        ; FB = 2/PI
         ZBSR *VFLT_MUL          ; FA = y = |x| * 2/PI
-        BSTA,UN FLT_TO_INT      ; T0:T0+1 = q = TRUNC(y); FA = y is left alone
+        ZBSR *VFLT_TO_INT      ; T0:T0+1 = q = TRUNC(y); FA = y is left alone
         LODA,R0 QF
         ADDA,R0 T0+1            ; offset + low byte of q
         ANDI,R0 3
         STRA,R0 QF              ; QF = n
         ZBSR *VFROM_INT_B       ; FB = q (FA = y is left alone)
-        BSTA,UN FLT_SUB         ; FA = f = y - q, 0 <= f < 1
+        ZBSR *VFLT_SUB         ; FA = f = y - q, 0 <= f < 1
         ZBSR *VLD_B_PTR        ; FB = 1.0 (always loaded: it keeps HPTR in step)
         LODA,R0 QF
         ANDI,R0 1
@@ -2921,7 +2945,8 @@ SC_P:
         LODA,R0 QF
         ANDI,R0 2
         BCTA,EQ FN_END
-        ZBSR *VFLT_NEGATE       ; n AND 2: FA = -FA
+SC_NG:
+        ZBSR *VFLT_NEGATE       ; n AND 2: FA = -FA   (ATN joins here for x < 0)
         ZBRR *VFN_END           ; (FN_END no longer follows: it sits in front of PARSER_RET)
 
 ; -----------------------------------------------------------------------------
@@ -2946,7 +2971,7 @@ ATN_BODY:
         IORI,R0 1
         STRA,R0 QF
         ZBSR *VFSWAP            ; FA = 1.0, FB = a
-        BSTA,UN FLT_DIV         ; FA = 1/a, 0 < 1/a < 1
+        ZBSR *VFLT_DIV         ; FA = 1/a, 0 < 1/a < 1
 AT_NR:
         LODI,R0 8               ; number of coefficients in ATT
         STRA,R0 HCNT
@@ -2954,17 +2979,24 @@ AT_NR:
         LODA,R0 QF
         ANDI,R0 1
         BCTR,EQ AT_S
-        ZBSR *VFLT_NEGATE
-        LODI,R0 >(PIO2-1)       ; v1.2: PIO2 is SIN's c0 now (v1.1), no longer the entry after ATT: point at it
-        ZBSR *VSETP
-        ZBSR *VLD_B_PTR         ; FB = PI/2
-        ZBSR *VFLT_ADD          ; reduced: FA = PI/2 - atan(1/a)
+        BSTR,UN PIO2_SUB        ; reduced: FA = PI/2 - atan(1/a)
 AT_S:
         LODA,R0 QF
         ANDI,R0 $80
-        BCTA,EQ FN_END
-        ZBSR *VFLT_NEGATE       ; x < 0: FA = -FA
+        BCFR,EQ SC_NG           ; x < 0: FA = -FA, as the end of SIN
         ZBRR *VFN_END
+; -----------------------------------------------------------------------------
+; PIO2_B / PIO2_SUB -- the PI/2 constant is SIN's c0 (the last entry of SCT), not the entry after ATT, so it is fetched with SETP.
+;   PIO2_B   : FB = PI/2 (HPTR = after it);  PIO2_SUB : FA = PI/2 - FA.   Shared by ATN, ASN_2 and ACS_2.   Clobber: R0, R1, R2 + FLT_ADD's
+;   RAS      : 2 for PIO2_B (SETP), PIO2_SUB 1 + 2 (FLT_ADD is entered by jump)
+PIO2_B:
+        LODI,R0 >(PIO2-1)
+        ZBSR *VSETP
+        ZBRR *VLD_B_PTR
+PIO2_SUB:
+        ZBSR *VFLT_NEGATE
+        BSTR,UN PIO2_B
+        ZBRR *VFLT_ADD
 ; -----------------------------------------------------------------------------
 ; ASN_2 -- ASIN(x), stage 2: FA = d = sqrt(1-x*x).  d = 0 gives +-PI/2, otherwise ATN of x/d.
 ;   In     : FA = d, XSLOT = x
@@ -2977,9 +3009,7 @@ ASN_2:
         ZBSR *VFSWAP            ; FA = x, FB = d
         LODA,R0 FB
         BCFR,EQ AS_DIV          ; d <> 0
-        LODI,R0 >(PIO2-1)
-        ZBSR *VSETP
-        ZBSR *VLD_B_PTR        ; FB = PI/2
+        BSTR,UN PIO2_B          ; FB = PI/2
         LODA,R0 FA+1
         ANDI,R0 $80
         IORA,R0 FB+1
@@ -2987,18 +3017,14 @@ ASN_2:
         ZBSR *VFSWAP            ; FA = +-PI/2
         ZBRR *VFN_END
 AS_DIV:
-        BSTA,UN FLT_DIV         ; FA = x/d
+        ZBSR *VFLT_DIV         ; FA = x/d
         BCTA,UN ATN_BODY        ; (HPTR is set there)
 
 ; -----------------------------------------------------------------------------
 ; ACS_RET / ACS_2 -- ACOS(x) = PI/2 - ASIN(x)
 ACS_2:
         PPSL PSW_RS
-        ZBSR *VFLT_NEGATE       ; FA = -asin(x)
-        LODI,R0 >(PIO2-1)
-        ZBSR *VSETP
-        ZBSR *VLD_B_PTR        ; FB = PI/2
-        ZBSR *VFLT_ADD          ; FA = PI/2 - asin(x)
+        BSTR,UN PIO2_SUB        ; FA = PI/2 - asin(x)
         ZBRR *VFN_END
 ACS_RET:
         LODI,R0 >ACS_2
@@ -3019,7 +3045,7 @@ ASN_RET:
         LODI,R2 XSLOT
         BSTA,UN ST_FA           ; X = x
         ZBSR *VLD_B_PTR        ; FB = 1.0
-        BSTA,UN FLT_SUB         ; FA = x - 1
+        ZBSR *VFLT_SUB         ; FA = x - 1
         BSTA,UN ST_T            ; T = x - 1
         LODI,R2 XSLOT
         BSTA,UN LD_FB           ; FB = x
@@ -3087,7 +3113,7 @@ LN_S:
         PPSL PSW_RS
         BSTA,UN ST_Z            ; X = m
         ZBSR *VLD_B_PTR        ; FB = 1.0
-        BSTA,UN FLT_SUB         ; FA = m - 1
+        ZBSR *VFLT_SUB         ; FA = m - 1
         BSTA,UN ST_T            ; T = m - 1
         BSTA,UN LD_Z            ; FB = m
         ZBSR *VFSWAP            ; FA = m
@@ -3095,7 +3121,7 @@ LN_S:
         ZBSR *VFLT_ADD          ; FA = m + 1
         BSTA,UN LD_T            ; FB = m - 1
         ZBSR *VFSWAP            ; FA = m - 1, FB = m + 1
-        BSTA,UN FLT_DIV         ; FA = z = (m-1)/(m+1)
+        ZBSR *VFLT_DIV         ; FA = z = (m-1)/(m+1)
         LODI,R0 4               ; number of coefficients in LNT
         STRA,R0 HCNT
         BSTA,UN HORNER_ODD      ; FA = ln m
@@ -3140,7 +3166,7 @@ EXP_RET:
         BSTA,UN ST_Z            ; X = x
         ZBSR *VLD_B_PTR        ; FB = log2e
         ZBSR *VFLT_MUL          ; FA = x * log2e
-        BSTA,UN FLT_TO_INT      ; T0:T0+1 = k
+        ZBSR *VFLT_TO_INT      ; T0:T0+1 = k
         LODA,R0 T0+1
         STRA,R0 EK
         RRL,R0                  ; bit 7 -> bit 0
@@ -3150,26 +3176,23 @@ EXP_RET:
         BSTR,UN CILN2           ; FA = k * ln2
         BSTA,UN LD_Z            ; FB = x
         ZBSR *VFSWAP            ; FA = x, FB = k*ln2
-        BSTA,UN FLT_SUB         ; FA = r = x - k*ln2
+        ZBSR *VFLT_SUB         ; FA = r = x - k*ln2
         LODI,R0 8               ; number of coefficients in EXPT
         STRA,R0 HCNT
         BSTA,UN HORNER_EVAL     ; FA = exp(r), 0.5 < exp(r) < 2
-        LODA,R0 EK
-        BCTR,LT EX_NEG
         LODA,R0 FA
         ADDA,R0 EK              ; exponent + k
         STRA,R0 FA
         TPSL $01
-        BCTR,EQ FP_OVF          ; carry out: exponent > 255
+        BCTR,EQ EX_C            ; carry out
+        LODA,R0 EK              ; no carry: fine for k >= 0, exponent < 0 for k < 0
+        BCTR,LT EX_ZERO
         ZBRR *VFN_END
-EX_NEG:
+EX_C:
+        LODA,R0 EK
+        BCFR,LT FP_OVF          ; carry with k >= 0: exponent > 255
         LODA,R0 FA
-        ADDA,R0 EK
-        STRA,R0 FA
-        TPSL $01
-        BCFR,EQ EX_ZERO         ; no carry: exponent < 0
-        LODA,R0 FA
-        BCFA,EQ FN_END          ; exponent byte <> 0 (a signed test would reject exponents >= $80)
+        BCFA,EQ FN_END          ; k < 0: exponent byte <> 0 (a signed test would reject exponents >= $80)
 EX_ZERO:
         ZBSR *VFLT_ZERO         ; underflow: 0
         ZBRR *VFN_END
@@ -3299,7 +3322,7 @@ DO_POW:
         LODA,R0 FA
         COMI,R0 $89
         BCFR,LT POW_EL                  ; |y| >= 256
-        BSTA,UN FLT_TO_INT              ; T0:T0+1 = TRUNC(y); FA = y is left alone
+        ZBSR *VFLT_TO_INT              ; T0:T0+1 = TRUNC(y); FA = y is left alone
         LODA,R0 T0
         BCFR,EQ POW_EL                  ; y < 0
         LODA,R0 T0+1
@@ -3467,6 +3490,7 @@ SETP:
         STRA,R0 HPTR
         RETC,UN
 
+
 ; #############################################################################
 ;  TABLES 
 ; #############################################################################
@@ -3495,7 +3519,7 @@ FNA:
         DB <INT_RET,>INT_RET
 
 BANNER:
-        DB CR, LF, "miniBASIC2650 1.2", CR, LF,"Bytes Free:", NUL        
+        DB CR, LF, "miniBASIC2650 1.3", CR, LF,"Bytes Free:", NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -3541,7 +3565,7 @@ SCT:
         DB $80,$A5,$5D,$E7          ; c1 = -0.645964086
 PIO2:
         DB $81,$49,$0F,$DB          ; c0 = 1.570796371
-; ONES + ATT : ASIN reads ONES and the first entry of ATT (1.0, 1.0); ATN reads ATT, then PIO2:  1.0, c7..c0 of atan(t) = t * P(t^2), then PI/2
+; ONES + ATT : ASIN reads ONES and the first entry of ATT (1.0, 1.0); ATN reads ATT (PIO2 = SIN's c0 is fetched with SETP, PIO2_B):  1.0, c7..c0 of atan(t) = t * P(t^2)
 ;ONES:
 ;        DB $81,$00,$00,$00          ; 1.0 = 1
 ATT:
@@ -3554,7 +3578,8 @@ ATT:
         DB $7E,$4C,$49,$71          ; c2 = 0.199498907
         DB $7F,$AA,$A6,$90          ; c1 = -0.333302021
         DB $80,$7F,$FF,$F7          ; c0 = 0.999999464
-
+;PIO2:
+;        DB $81,$49,$0F,$DB          ; PI/2 = 1.570796371
 ; EXPT : EXP:  log2e, ln2, c7..c0 of exp(r) = c0 + c1 r + ... + c7 r^7
 EXPT:
         DB $81,$38,$AA,$3B          ; LOG2E = 1.442695022
