@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC2650 v1.3  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
+; miniBASIC2650 v1.5  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
 ;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP/INT, PI and ^ operator 
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
@@ -41,6 +41,7 @@
 ;   LN(expr) : natural logarithm; zero or a negative argument gives ?R.   
 ;   EXP(expr): e to the power x; x above about 88 gives ?O, x below about -88.7 gives 0
 ;   PI       : 3.14159274, no argument: PI*2, SIN(PI/2).  A word of P and a letter is PI (as R and a letter is RND); the variable P is unaffected
+;   RND      : a random 16-bit integer as a float, -32768..32767 and never 0, no argument: ABS(RND)/32768 is 0 < x <= 1, INT(ABS(RND)/32768*6) is 0..5
 ;   INT(expr): floor, the whole number at or below x: INT(2.7) is 2, INT(-2.7) is -3.  |x| >= 32768 gives ?R (as TAB( and CHR$()
 ;
 ; Numbers : MBF4 floating point: 24-bit mantissa (exact integers to 16777216), exponent range about 1E-38 .. 1.7E38.
@@ -53,9 +54,10 @@
 ; KNOWN LIMITATIONS
 ;
 ; Floating point
-;   - E notation is lower-case only: 1e3 is 1000, but upper-case 1E3 reads as 1 (E3 is silently ignored). 
-;     Total decimal exponent K = exponent - (digits after the '.') must be >= -38 (else ?O; 1.5e-38 is K = -39);
-;     |K| <= 10 <7 significant digits is correctly rounded (a K < 0 literal is ONE division by 10^-K), a larger K or more digits is within a few ULP.
+;   - E notation is lower-case only: 1e3 is 1000, but an upper-case 1E3 still reads as 1 (the E3 is silently ignored): the language is upper case, so a lower-case
+;     e after a number can never clash with a program, while an upper-case E could (IF A=1END, 1EXP(..)).  An exponent is 1 or 2 digits (more wrap modulo 256);
+;     'e' with no digit (1e, 1e+) reads as 1.  Scaling: the total decimal exponent K = exponent - (digits after the '.') must be >= -38 (else ?O; 1.5e-38 is K = -39);
+;     |K| <= 10 with up to 7 significant digits is correctly rounded (a K < 0 literal is ONE division by 10^-K), a larger K or more digits is within a few ULP.
 ;   - INT(x) is the floor (toward minus infinity) for |x| < 32768; |x| >= 32768 gives ?R (the 16-bit integer path, as TAB( / CHR$( / GOTO).
 ;     RND is a 16-bit integer: INT(RND*6) is ?R, write INT(ABS(RND)/32768*6).  There is no FIX / SGN.
 ;   - FOR/NEXT with a fractional STEP accumulates rounding error: STEP 0.25 is exact, STEP 0.1 is not
@@ -173,9 +175,18 @@
 ; VERSION HISTORY 
 ; =============================================================================
 ;                                                                                                        
-; v1.3 (Oct 2026) - PI, golf.  ROMEND $0FF0 (4080 bytes), 16 free
-;   - DO_PI constant PI added.
-;   - Golf: vectors for FLT_TO_INT / FLT_SUB / FLT_DIV in, INC_ET / EXPR_ATOM / FA2VAR out
+; v1.5 (Oct 2026) - showcase line 588 prints 1e3, 1.45e-2 and PI; RND added to the language reference.  ROM unchanged ($0FF0), 21 showcase bytes free.
+;
+; v1.4 (Oct 2026) - showcase: Hypnotic Eye + Spiral Vortex, ported from minibasic65c02 (TAN is SIN/COS here).  ROMEND $0FF0 unchanged; showcase +718 bytes, 52 free.
+;   - Eye: SQR SIN EXP LN, ^ on a function result, E notation.  Vortex: ATN with |x| > 1, ASIN / ACOS near 1, SIN COS SQR PI.  Against float64 the Vortex differs in
+;     0 of 1553 characters, the Eye in 2 of 1623 (single precision at a threshold).  The Vortex shows the v1.1 ATN bug (72% of its characters differ there); the Eye does not.
+;
+; v1.3 (Oct 2026) - PI, golf.  ROMEND $0FF0 (4080 bytes), 16 free (v1.2: $0FFB).
+;   - PI atom (DO_PI, 22 bytes with its constant).  Golf -33: vectors for FLT_TO_INT / FLT_SUB / FLT_DIV in, INC_ET / EXPR_ATOM / FA2VAR out (-11), unused
+;     FLT_ZERO_B + skip byte (-3), PIO2_B / PIO2_SUB shared by ATN, ASN_2, ACS_2 (-6), EXP tail merged (-8), SIN / ATN negate tail shared (-2), 3 relative branches.
+;   - Streams SCT..LNT are already overlapped (EXPT c1, c0 = LNT's 1.0 pair; PIO2 = SIN c0); the two duplicates left (1.0 in SCT / ATT, LN2 in EXPT / LNT)
+;     cost 4 bytes of SETP code each to remove: no gain.  Labels 511 of 512 (the unused EX_PRA is gone): raise MAX_LABELS in asm2650.c before adding more.
+;   - Checked: 1922 function points print identically to v1.2, library check 0 bad, 700 random expressions, showcase identical, hardware stack peak 7.
 ;
 ; v1.2 (Oct 2026) - E notation (1e3, 1.45e-2), FLT_PARSE looped, ATN fix.  ROMEND $0FFB (4091 bytes), 5 free (v1.1: $0FD4)
 ;   - E notation: [digits][.digits][e[+-]digits], lower-case e only (an upper-case E could follow a number in a valid program: IF A=1END; the language is upper
@@ -3519,7 +3530,7 @@ FNA:
         DB <INT_RET,>INT_RET
 
 BANNER:
-        DB CR, LF, "miniBASIC2650 1.3", CR, LF,"Bytes Free:", NUL        
+        DB CR, LF, "miniBASIC2650 1.5", CR, LF,"Bytes Free:", NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -3728,7 +3739,11 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;  Lines 250-297: FOR/NEXT: STEP -4, nested 3x3 table, and (271-274) a fractional STEP 0.25; 297 jumps to the trig section
 ;  Lines 570-586: ATN, ASIN, ACOS, SQR, LN, EXP, the ^ operator and INT (582-584: floor, negatives, a rounding idiom; 586: FUNC(x)^y)
 ;  Lines 520-590: SIN and COS: values, a degrees table, S^2+C^2, an odd/small argument, a one-period sine wave plot (TAB( with a float
-;                 expression); 590 jumps back to 300
+;                 expression), E notation and PI (588); 590 jumps to 660
+;  Lines 660-732: Hypnotic Eye (ported from minibasic65c02): 61 x 19 character ripple, SIN damped by EXP(-5e-1*LN(D)^2): SQR, SIN, EXP, LN, ^ on a
+;                 function result, E notation (5e-2, 5e-1); the centre is skipped, LN(0) is ?R
+;  Lines 800-896: Spiral Vortex (ported from minibasic65c02): 61 x 27 pixel scan, ATN(Y/X) (|Y/X| > 1 uses the reduced path), SIN, COS (TAN = SIN/COS),
+;                 ACOS and ASIN of a value near 1, SQR, PI; TAB(C-L) skips the columns outside the vortex; 896 jumps to 300
 ;  Lines 300-650: Mandelbrot set, floating point: 44 columns x 21 rows, escape count in a GOSUB'd FOR loop (levels: 2 loops + 1 inside the sub)
 ;
 ;  NOT demonstrated, because an error ENDS the run (try them at the prompt):
@@ -3739,7 +3754,7 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;     PRINT LN(0)         ?R   LN of zero or of a negative number
 ;     PRINT EXP(89)       ?O   EXP result beyond about 1.7E38 (so is EXP(1000); EXP of a large negative number gives 0)
 ;     PRINT 2^128         ?O   power beyond about 1.7E38;   PRINT (-2)^0.5   ?R   non-integer power of a negative base (LN)
-;  No LIST in the showcase.  Not shown either: E notation (unsupported).
+;  No LIST in the showcase.
 ;     PRINT INT(40000)    ?R   INT argument beyond +-32767 (the 16-bit integer path)
 ; =============================================================================
 PROG:
@@ -3857,7 +3872,8 @@ PROG:
         DB 2,70,"PRINT ",DQ,"INT(2.7)=",DQ,";INT(2.7);",DQ," INT(-2.7)=",DQ,";INT(-2.7)",$00 ; 582 2  -3 (floor, not truncation)
         DB 2,72,"PRINT ",DQ,"INT(-3)=",DQ,";INT(-3);",DQ," 2.567~",DQ,";INT(2.567*100+0.5)/100",$00 ; 584 -3  2.57 (round to 2 places)
         DB 2,74,"PRINT ",DQ,"LN(2)^2=",DQ,";LN(2)^2;",DQ," INT(2.5)^2=",DQ,";INT(2.5)^2",$00 ; 586 0.480453  4 (^ applies to the function's result)
-        DB 2,78,"GOTO 300",$00                              ; 590 on to the Mandelbrot plot
+        DB 2,76,"PRINT 1e3;",DQ," ",DQ,";1.45e-2;",DQ," ",DQ,";PI",$00         ; 588 1000  0.0145  3.14159 (E notation, PI)
+        DB 2,78,"GOTO 660",$00                              ; 590 on to the Hypnotic Eye, then the Spiral Vortex, then (896) the Mandelbrot plot
         DB 2,88,"FOR N=1 TO M",$00                                         ; 600 escape-count subroutine, a FOR loop
         DB 2,98,"IF E>0 GOTO 640",$00                                      ; 610   (FOR level 3, inside a GOSUB, inside
         DB 2,108,"T=A*A-B*B+C",$00                                   ; 620    levels 1-2). Escaped points skip the
@@ -3866,6 +3882,52 @@ PROG:
         DB 2,118,"IF 4<A*A+B*B THEN IF E=0 THEN E=N",$00           ; 630    no frame behind. No parentheses:
         DB 2,128,"NEXT N",$00                                              ; 640    the relop takes a whole + - * / RHS
         DB 2,138,"RETURN",$00                                              ; 650
+        ; ---- Hypnotic Eye (65C02 showcase): ripple of SIN damped by EXP(-LN(D)^2/2); 5e-2 guards LN(0) at the centre ----
+        DB 2,148,"PRINT ",DQ,"=== HYPNOTIC EYE: LN EXP SIN ^ ===",DQ,$00        ; 660
+        DB 2,152,"FOR R=0 TO 26",$00        ; 664
+        DB 2,156,"Y=(R-13)/10",$00        ; 668
+        DB 2,160,"FOR C=0 TO 60",$00        ; 672
+        DB 2,164,"X=(C-30)/20",$00        ; 676
+        DB 2,168,"D=SQR(X*X+Y*Y)",$00        ; 680
+        DB 2,172,"S=32",$00        ; 684
+        DB 2,176,"IF D<5e-2 GOTO 720",$00        ; 688
+        DB 2,180,"W=SIN(10*D)*EXP(-5e-1*LN(D)^2)",$00        ; 692
+        DB 2,184,"Z=(W+1)/2",$00        ; 696
+        DB 2,188,"IF Z>.3 S=46",$00        ; 700
+        DB 2,192,"IF Z>.45 S=45",$00        ; 704
+        DB 2,196,"IF Z>.6 S=43",$00        ; 708
+        DB 2,200,"IF Z>.75 S=42",$00        ; 712
+        DB 2,204,"IF Z>.9 S=64",$00        ; 716
+        DB 2,208,"PRINT CHR$(S)",$3B,$00        ; 720
+        DB 2,212,"NEXT C",$00        ; 724
+        DB 2,216,"PRINT",$00        ; 728
+        DB 2,220,"NEXT R",$00        ; 732
+        ; ---- Spiral Vortex (65C02 showcase): ATN, SIN/COS (TAN = SIN/COS), ACOS, ASIN, SQR, PI; TAB(C-L) skips the columns outside D>1.2 ----
+        DB 3,32,"PRINT ",DQ,"=== SPIRAL VORTEX: ATN ASIN ACOS PI ===",DQ,$00        ; 800
+        DB 3,36,"FOR R=0 TO 26",$00        ; 804
+        DB 3,40,"L=0",$00        ; 808
+        DB 3,44,"FOR C=0 TO 60",$00        ; 812
+        DB 3,48,"X=(C-30)/27",$00        ; 816
+        DB 3,52,"Y=(R-13)/13",$00        ; 820
+        DB 3,56,"D=SQR(X*X+Y*Y)",$00        ; 824
+        DB 3,60,"IF D>1.2 GOTO 884",$00        ; 828
+        DB 3,64,"T=PI/2",$00        ; 832
+        DB 3,68,"IF X!=0 T=ATN(Y/X)",$00        ; 836
+        DB 3,72,"W=SIN(6*D-3*T)",$00        ; 840
+        DB 3,76,"U=SIN(W/2)/COS(W/2)",$00        ; 844
+        DB 3,80,"P=COS(U)",$00        ; 848
+        DB 3,84,"Z=ABS(ACOS(P)-ASIN(P))/PI",$00        ; 852
+        DB 3,88,"S=32",$00        ; 856
+        DB 3,92,"IF Z>.15 S=46",$00        ; 860
+        DB 3,96,"IF Z>.35 S=43",$00        ; 864
+        DB 3,100,"IF Z>.55 S=79",$00        ; 868
+        DB 3,104,"IF Z>.75 S=64",$00        ; 872
+        DB 3,108,"PRINT TAB(C-L)",$3B,"CHR$(S)",$3B,$00        ; 876
+        DB 3,112,"L=C+1",$00        ; 880
+        DB 3,116,"NEXT C",$00        ; 884
+        DB 3,120,"PRINT",$00        ; 888
+        DB 3,124,"NEXT R",$00        ; 892
+        DB 3,128,"GOTO 300",$00        ; 896  on to the Mandelbrot finale
 SHOWCASE_END:
 
         END
