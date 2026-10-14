@@ -1,5 +1,5 @@
 ; =============================================================================
-; miniBASIC2650 v1.5  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
+; miniBASIC2650 v1.6  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
 ;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP/INT, PI and ^ operator 
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
@@ -175,11 +175,17 @@
 ; VERSION HISTORY 
 ; =============================================================================
 ;                                                                                                        
-; v1.5 (Oct 2026) - showcase line 588 prints 1e3, 1.45e-2 and PI; RND added to the language reference.  ROM unchanged ($0FF0), 21 showcase bytes free.
+; v1.6 (Oct 2026) - RAM Update: 11 bytes shared by lifetime.  ROM unchanged ($0FF0); Bytes Free 21 -> 32.
+;   - The FVAR / NIBPAD alignment pads hold TEMPRETH/L (-2), the SC1 pad holds RXSAVE (-1), FDV = FMA (-3), 
+;   - PRINT / PARSE scratch FDE, FPLIM, FPY, DIGI, FPN sits on the stage scratch QF, HCNT, EK, HPTR (-5).
+;     A stage never runs inside FLT_PRINT / FLT_PARSE, nor they inside a stage.
 ;
-; v1.4 (Oct 2026) - showcase: Hypnotic Eye + Spiral Vortex, ported from minibasic65c02 (TAN is SIN/COS here).  ROMEND $0FF0 unchanged; showcase +718 bytes, 52 free.
-;   - Eye: SQR SIN EXP LN, ^ on a function result, E notation.  Vortex: ATN with |x| > 1, ASIN / ACOS near 1, SIN COS SQR PI.  Against float64 the Vortex differs in
-;     0 of 1553 characters, the Eye in 2 of 1623 (single precision at a threshold).  The Vortex shows the v1.1 ATN bug (72% of its characters differ there); the Eye does not.
+; v1.5 (Oct 2026) - Showcase update, ROM unchanged ($0FF0), 21 showcase bytes free.
+;   - Showcase line 588 prints 1e3, 1.45e-2 and PI; RND added to the language reference. 
+;
+; v1.4 (Oct 2026) - showcase: Hypnotic Eye + Spiral Vortex, ported from minibasic65c02.  ROMEND $0FF0 unchanged; showcase +718 bytes, 52 free.
+;   - Eye: SQR SIN EXP LN, ^ on a function result, E notation.  Vortex: ATN with |x| > 1, ASIN / ACOS near 1, SIN COS SQR PI. 
+;     The Vortex shows the v1.1 ATN bug (72% of its characters differ there); the Eye does not.
 ;
 ; v1.3 (Oct 2026) - PI, golf.  ROMEND $0FF0 (4080 bytes), 16 free (v1.2: $0FFB).
 ;   - PI atom (DO_PI, 22 bytes with its constant).  Golf -33: vectors for FLT_TO_INT / FLT_SUB / FLT_DIV in, INC_ET / EXPR_ATOM / FA2VAR out (-11), unused
@@ -437,7 +443,7 @@ DO_ERROR:
         BSTR,UN PRT_QUEST               ; Print Question mark
         LODZ,R1
         ZBSR *VCOUT                     ; print error code
-        LODA,R0 RUNFLG                  ; OPT-10: SC1=RUNFLG, 0->EQ, 1->GT
+        LODA,R0 RUNFLG                  ; OPT-10: RUNFLG, 0->EQ, 1->GT
         BCTR,EQ DE_NL                   ; not running, no line number
         LODI,R0 '@'                     
         ZBSR *VCOUT                     ; Print at line
@@ -608,7 +614,7 @@ F2V_L:
 ; Syntax: ASK V
 ; In:  IP -> variable letter
 ; Out: VARS[V] = parsed value
-; Clobbers: R0, R2, SC0, SC1, EXPH, EXPL, TMPH, TMPL, IBUF
+; Clobbers: R0, R2, SC0, EXPH, EXPL, TMPH, TMPL, IBUF
 DO_ASK:
         BSTR,UN PARSE_VAR_SAVE
         BSTA,UN PRT_QUEST
@@ -907,7 +913,7 @@ PCA_RET:
 ;   TAB(n):  output n spaces (n=0 is a no-op; not a column-seek)
 ; In:  IP -> first char after PRINT keyword
 ; Out: text written to COUT; IP advanced past statement
-; Clobbers: R0, R1, R2, EXPH, EXPL, TMPH, TMPL, NEGFLG, LNUMH, LNUML, SC0, SC1
+; Clobbers: R0, R1, R2, EXPH, EXPL, TMPH, TMPL, NEGFLG, LNUMH, LNUML, SC0
 DP_STRING:
         ZBSR *VINC_IP           ; 2b
 PRTSTR:
@@ -3530,7 +3536,7 @@ FNA:
         DB <INT_RET,>INT_RET
 
 BANNER:
-        DB CR, LF, "miniBASIC2650 1.5", CR, LF,"Bytes Free:", NUL        
+        DB CR, LF, "miniBASIC2650 1.6", CR, LF,"Bytes Free:", NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -3638,7 +3644,7 @@ GOTOL   RES 1       ; pending target lo
 CURH    RES 1       ; current line hi  (error reporting; IDX_CUR=3)
 CURL    RES 1       ; current line lo
 
-;  FOR frame is built from FWRK (see DO_FOR), so SWSTK/EXP/LNUM/FVAR no longer have to be contiguous. 
+;  FOR frame is built from FWRK (see DO_FOR), so SWSTK/EXP/LNUM no longer have to be contiguous. 
 ; During a FOR: EXP = step, LNUM = limit (LNUM is untouched by expression
 ; evaluation, so it can hold the limit while the STEP expression is parsed).
 SWSTK   RES 2       ; next-line pointer cache [NLP_H][NLP_L] written by DR_EXEC (IDX_SWSTK=4)
@@ -3646,13 +3652,13 @@ EXPH    RES 1       ; expression result hi                                     (
 EXPL    RES 1       ; expression result lo
 LNUMH   RES 1       ; scratch line number hi                                   (IDX_LNUM=6)
 LNUML   RES 1       ; scratch line number lo
-FVAR    RES 1       ; spare
-NIBPAD  RES 1       ; unused - restores even alignment after odd-length FVAR so
-                     ; everything below is reachable by REG16_TO_REG16 (idx*2)
+TEMPRETH RES 1      ; SWRETURN scratch: popped continuation addr hi (v1.6: was the FVAR alignment pad)
+TEMPRETL RES 1      ; SWRETURN scratch: popped continuation addr lo (was NIBPAD; PE below must stay at an even offset for REG16_TO_REG16, idx*2)
 PEH     DB <SHOWCASE_END       ; Program end pointer hi                        (IDX_PE=8)
 PEL     DB >SHOWCASE_END       ; Program end pointer lo
 SC0     RES 1       ; Scratch byte 0                                          (IDX_SC0=9)
-SC1     RES 1       ; Scratch byte 1
+RXSAVE  RES 1       ; (was SC1, an alignment pad: RNDSEED below must stay at an even offset) Save/restore R3 in PARSE_U16, R1 in DO_MUL, and the
+                     ; 3rd keyword char (STMT_EXEC -> DO_GO/DO_RU) - all three uses have disjoint lifetimes, safe to share
 RNDSEED  RES 2      ; pseudo random number                                    (IDX_RND=10)
 FSP     RES 1       ; bytes used in FSTK: 0,7,14,21; 28=full - NOT nibble-indexed
 
@@ -3660,17 +3666,9 @@ FSP     RES 1       ; bytes used in FSTK: 0,7,14,21; 28=full - NOT nibble-indexe
 IBUF    RES 64      ; Input buffer 64 bytes
 
 ; --- Remaining --- (order doesn't matter; not nibble-indexed)
-TEMPRETH RES 1      ; SWRETURN scratch: popped continuation addr hi (was PDEPTH -
-                     ; PDEPTH itself removed, see CHANGE HISTORY: paren nesting
-                     ; no longer needs a separate SW-tracked depth counter, the
-                     ; PUSH_RET/PARSER_RET continuation stack IS the tracking)
-TEMPRETL RES 1      ; SWRETURN scratch: popped continuation addr lo
 
 ;  --- Flags & Stuff --- 
 RUNFLG  RES 1       ; $01=running $00=immediate
-RXSAVE  RES 1       ; Save/restore R3 in PARSE_U16, R1 in DO_MUL, and the
-                     ; 3rd keyword char (STMT_EXEC -> DO_GO/DO_RU) - all
-                     ; three uses have disjoint lifetimes, safe to share
 BANG    RES 1       ; '!' relop-invert modifier: $00 clear, $FF armed -
 GSSTK   RES 8       ; GOSUB return-address stack, 4 levels x [hi][lo]
 GSSP    RES 1       ; GOSUB stack offset into GSSTK: 0,2,4,6; 8=full
@@ -3700,14 +3698,10 @@ FB      RES     4               ; FLT_B [E][S|M1][M2][M3]: right operand (FB = F
 FBG     RES     1               ; FB+4: guard byte below FB's mantissa
 FSA     RES     1               ; result sign (bit 7); FA's sign inside FLT_ADD
 FER     RES     1               ; working result exponent
-FMA     RES     3               ; MUL multiplicand copy (hi,mid,lo)
+FMA     RES     3               ; MUL multiplicand copy (hi,mid,lo); also the DIV divisor FDV (MUL and DIV never overlap); 3 bytes here fill FSA..FSB
+FDV     EQU     FMA             ; DIV divisor (hi,mid,lo)
 FSB     RES     1               ; FB's sign (bit 7), FLT_ADD only.  MUST be FSA+5 (FLT_ADD's sign loop indexes FSA by 0 / 5)
-FDE     RES     1               ; PRINT decimal exponent (live across MUL_BY_TEN, DIV_BY_TEN, FLT_TO_INT)
-FDV     RES     3               ; DIV divisor (hi,mid,lo)
 RD      RES     3               ; DIV remainder (hi,mid,lo)
-FPLIM   RES     1               ; PRINT: number of significant digits after trimming trailing zeros
-FPY     RES     1               ; PRINT: index of the next digit in DIG
-DIGI    RES     1               ; PRINT: digits extracted so far (0..7)
 DIG     RES     8               ; PRINT digit buffer, DIG..DIG+6 used (the 65C02 used IBUF; here a private buffer)
 PSAVE   RES     4               ; FLT_PARSE: byte 0 = D, 1 once a '.' has been seen (each digit then counts K down);  bytes 1..3 are free (XSLOT)
 ; The function routines borrow RAM that is free while a function is evaluated.  FLT_PRINT fills DIG only after the expression has
@@ -3721,7 +3715,12 @@ QF      RES     1               ; SIN/COS: quadrant offset on entry, then n;  AT
 HPTR    RES     2               ; coefficient-stream pointer, high byte first, points ONE BYTE BEFORE the next 4-byte entry
 HCNT    RES     1               ; Horner: coefficients still to apply
 EK      RES     1               ; LN: E (exponent - 128);  EXP: k
-FPN     RES     1               ; PARSE: K, the decimal exponent adjust (minus the fraction digits, plus the exponent), a signed byte
+; PRINT and PARSE scratch share the function-stage scratch above: a stage never runs inside FLT_PRINT or FLT_PARSE, nor they inside a stage
+FDE     EQU QF          ; PRINT decimal exponent (live across MUL_BY_TEN, DIV_BY_TEN, FLT_TO_INT)
+FPLIM   EQU HCNT        ; PRINT: number of significant digits after trimming trailing zeros
+FPY     EQU EK          ; PRINT: index of the next digit in DIG
+DIGI    EQU HPTR        ; PRINT: digits extracted so far (0..7)
+FPN     EQU HPTR+1      ; PARSE: K, the decimal exponent adjust (minus the fraction digits, plus the exponent), a signed byte
 T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL (high byte first)
 
 
