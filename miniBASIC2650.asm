@@ -1,6 +1,6 @@
 ; =============================================================================
-; miniBASIC2650 v1.6  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
-;                         SIN/COS/ATN/ASIN/ACOS/SQR/LN/EXP/INT, PI and ^ operator 
+; miniBASIC2650 v1.7  --  Signetics 2650 Tiny BASIC with 32-bit MBF4 floating point, 
+;                         SIN/COS/TAN/ATN/ASIN/ACOS/SQR/LN/EXP/INT, PI and ^ operator 
 ;
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
@@ -25,6 +25,8 @@
 ;   INPUT  END  FREE  GOTO <expr>  GOSUB <expr>  IF <cond> [THEN] <stmt>
 ;   LIST  NEW  PRINT  RETURN  RUN  [LET] <var>=<expr>  (LET and THEN optional)
 ;   FOR <var>=<expr> TO <expr> [STEP <expr>]   NEXT [<var>]
+;   LIST [first][,last]: LIST = the whole program, LIST 100 = line 100 to the end, LIST 100,200 = lines 100..200, LIST ,200 = up to line 200
+;                        (decimal numbers, not expressions; the lines need not exist; first > last lists nothing)
 ;
 ; PRINT items: "literal", CHR$(n), TAB(n), or an expression; separate with ';'.
 ;
@@ -35,11 +37,12 @@
 ;
 ; Functions:
 ;   ABS(expr): absolute value function - expressions allowed
-;   SIN(expr) COS(expr): sine and cosine in RADIANS.  Accurate to about 5E-7 for |x| <= 2*PI;
-;   ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS
-;   SQRT(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives 0
+;   SIN(expr) COS(expr) TAN(expr): sine, cosine and tangent in RADIANS, any |x| below 205887 (reduced modulo 2*PI with a two-part constant): absolute error about
+;                          5E-7 for |x| < 1E5 and 2E-6 up to 205887; |x| >= 205887 gives ?R.  SIN and COS never exceed 1.  TAN = SIN/COS: COS = 0 gives ?Z
+;   ATN(expr) ASIN(expr) ACOS(expr): arctangent (-PI/2..PI/2), arcsine, arccosine (0..PI), RADIANS;  ASIN / ACOS of |x| > 1 give ?R
+;   SQRT(expr): square root = EXP(0.5*LN(x)); 0 gives 0 and a negative argument gives ?R
 ;   LN(expr) : natural logarithm; zero or a negative argument gives ?R.   
-;   EXP(expr): e to the power x; x above about 88 gives ?O, x below about -88.7 gives 0
+;   EXP(expr): e to the power x; x above about 88 gives ?O (also for any larger x), x below about -88.7 gives 0 (also for any lower x)
 ;   PI       : 3.14159274, no argument: PI*2, SIN(PI/2).  A word of P and a letter is PI (as R and a letter is RND); the variable P is unaffected
 ;   RND      : a random 16-bit integer as a float, -32768..32767 and never 0, no argument: ABS(RND)/32768 is 0 < x <= 1, INT(ABS(RND)/32768*6) is 0..5
 ;   INT(expr): floor, the whole number at or below x: INT(2.7) is 2, INT(-2.7) is -3.  |x| >= 32768 gives ?R (as TAB( and CHR$()
@@ -64,7 +67,12 @@
 ;   - RND is 16-bit LFSR seed as a float (signed, -32768..32767; never 0, so ABS(RND)/32768 is 0 < x <= 1).
 ;
 ; Trigonometry 
-;   - SIN/COS reduces  argument y = |x|*2/PI in single precision, angular error of about 6E-8*|x| radians
+;   - SIN / COS / TAN reduce the argument modulo 2*PI: K = TRUNC(|x|/2PI), r = |x| - K*D1 - K*D2 with 2PI = D1 + D2 (D1 = 6.28125 has 8 bits, so K*D1 is exact for
+;     K < 2^15; Cody-Waite), then y = r*2/PI selects the quadrant.  Absolute error about 5E-7 for |x| < 1E5 (the print resolution) and 2E-6 up to |x| = 205887; |x| >= 205887
+;     (K needs more than 15 bits) gives ?R.  Before v1.7 the error was 6E-8*|x| (2E-3 at |x| = 50000) and the limit 51471.  The polynomial can overshoot by an ulp
+;     (COS(0) was 1.0000001): the result is clamped to +-1, so ASIN(SIN(x)) and SQR(1-SIN(x)^2) stay in range.
+;   - TAN is SIN/COS (three stages): accuracy falls near the poles, because COS carries an absolute error of about 2E-7 (|TAN| above 1E6 or so is noise).  The float nearest PI/2
+;     (1.5707964) has COS = 0 here, so TAN of it is ?Z, not the true -2.3E7; a quotient above 1.7E38 would be ?O.
 ;   - The library rounds half away from zero.  Against mbf4.py with rounding RN_AWAY, * and / were bit-exact and + - differed by 1 ULP in 1 of
 ;     300 random pairs (tools/lib_bitexact.py); the library was not changed.
 ;   - FLT_ADD / FLT_SUB keep ONE 8-bit guard byte and no sticky bit: an effective subtraction (signs differ) with an exponent difference of 9..24 can be
@@ -76,6 +84,8 @@
 ;     relative, EXP 1.2E-6 relative for |x| <= 20 and 4.1E-6 for |x| <= 80 (about 6E-8*|x|: k*ln2 is formed in single precision).  LN(1) is exactly 0.
 ;   - ASIN / ACOS use (1-x)(1+x), exact near |x| = 1.  SQR(x) = EXP(0.5*LN(x)) is not exact for perfect squares in the last digit only (SQR(0.0001)
 ;     prints 0.00999999).
+;   - Domain errors (v1.7; v1.6 clamped silently): SQR of a negative number, ASIN / ACOS of |x| > 1 give ?R (ASIN of |x| above about 1E19 gives ?O: x*x overflows).
+;     EXP of a large |x| gives ?O (above 88) or 0 (below -88.7) for ANY size of x; it was ?R for |x*1.4427| >= 32768.  So x^y with y*LN(x) huge is ?O or 0.
 ;   - Function calls nest, but each pending call costs software-stack bytes: about 8 nested functions (SQR(SQR(SQR(...)))) end in ?8.
 ;
 ; UPPERCASE only apart from PRINT "String literals"
@@ -119,7 +129,9 @@
 ;   Full random line editing: a numbered line is inserted in order,
 ;   replaces an existing line of the same number, or (empty body) deletes it.
 ;   Permitted Line numbers are 0-32767.
-;   Input is not bounds-checked; overlong lines will corrupt memory.
+;   Input editing (v1.7): BS ($08) or DEL ($7F) erases the last character (echoed as BS, space, BS; ignored at the start of the line).  A line holds at most 63
+;   characters (IBUF is 64 bytes): further characters are ignored, with no echo, until CR.  Any other control code up to CR (LF, TAB) still ends the line.
+;   There is no line-cancel key.  LIST takes decimal first / last limits, not expressions.
 ;
 ; SYNTAX VALIDATION
 ;   Minimal; malformed constructs may produce a generic syntax/runtime
@@ -175,6 +187,19 @@
 ; VERSION HISTORY 
 ; =============================================================================
 ;                                                                                                        
+; v1.7 (Oct 2026) - Golf, trig guards, TAN, GETLINE editing, LIST range.  ROMEND $0FA4 (4004 bytes), 92 free (v1.6: $0FEF): golf -274 ($0EDD), features +199.  RAM unchanged.
+;   - SIN / COS reduce mod 2*PI (SC_RED; 1/2PI, D1, D2 in SCT): error 2E-3 -> 5E-7 at |x| = 50000, range 51471 -> 205887 (+49).  Result clamped to +-1 (COS(0) was 1.0000001) (+12).
+;   - TAN = SIN / COS in three stages TAN_RET / TAN_2 / TAN_3 (+58).  ?R beyond 205887, ?Z at COS = 0, ?O on overflow.  FNK key 'TA': a variable word starting TA is now TAN.
+;   - Guards (8 trig functions x 33 edge arguments, tests trig / tan): SQR(x < 0), ASIN / ACOS(|x| > 1) now ?R (were clamped); EXP of a huge |x| is ?O or 0 (was ?R), POW follows.
+;     ASIN / ACOS of |x| above about 1E19 is ?O (x*x overflows).
+;   - GETLINE: BS / DEL editing, 63 character limit (the 65th character overwrote RUNFLG / BANG / GSSTK) (+31).  LIST [first][,last] (LS_ARG, FIND_INS, 16-bit compare) (+50).
+;   - Showcase: the vortex uses TAN, line 576 prints TAN(1); no LIST.
+;   - Golf (-274): FLT_DIV on SUB_A_B / ADD_A_B / SHLQ (DIV_BY_TEN, RD / FDV scratch gone); FLT_MUL on SHR4; FLT_ADD subtract path (NEGLP gone); NG16L; HID_SGN leaf shared by
+;     ADD / MUL / DIV (CALC_SIGN_EXP, FER gone); FLT_TO_INT / FLT_FROM_INT on R2:R3 / R0:R3 shifts (DO_POW count in T0+1, HCNT free); FLT_PARSE (BSTR PINC, PUTC inside);
+;     FLT_PRINT rounding + trim merged; HORNER_* count in R0; SIN / COS / ATN quadrant by RRL / RRR; SQR, LN, EXP tail, NORM_PACK (exponent in R3, BDRR / BIRR); DO_NEXT;
+;     PRINT block; INC_ET; DOP_TRUE (F_ZERO FZL loop, -2, RS kept set); FCMPW tail call; SETP by EORZ; FIND_LINE folded into FIND_INS; PUSH_LH.
+;     Coefficient streams moved behind the vector table (RES guards keep SCT..E_TBL-1 in one page).  Vector swap: VDO_ERROR, VSHL_MANT out; VADD_A_B, VFLT_FROM_INT in.
+;
 ; v1.6 (Oct 2026) - RAM Update: 11 bytes shared by lifetime.  ROM unchanged ($0FF0); Bytes Free 21 -> 32.
 ;   - The FVAR / NIBPAD alignment pads hold TEMPRETH/L (-2), the SC1 pad holds RXSAVE (-1), FDV = FMA (-3), 
 ;   - PRINT / PARSE scratch FDE, FPLIM, FPY, DIGI, FPN sits on the stage scratch QF, HCNT, EK, HPTR (-5).
@@ -310,7 +335,7 @@ IDX_RND   EQU 10
 ; Callers use ZBRR/ZBSR *Vxxx (2 bytes) vs BCTA/BSTA,UN xxx (3 bytes)
 ;
 RESET:
-        BCTR,UN MAIN            ; trampoline over vector table ($0000)
+        BCTA,UN MAIN            ; trampoline over the vector table and the coefficient streams ($0000)
 ;  Page-zero vector table for ZBSR/ZBRR *Vxxx (2 bytes vs 3 for BSTA/BCTA).
 ;  A vector costs 2 bytes and saves 1 per call, so an entry pays for itself
 ;  only from 3 callers up: keep every entry >= 3, and re-count after any
@@ -331,8 +356,8 @@ VPARSE_EXPR:
         DW EXPR
 VPRT_SPACE:
         DW PRT_SPACE
-VDO_ERROR:
-        DW DO_ERROR
+VADD_A_B:
+        DW ADD_A_B
 VSET_TMP_PROG:
         DW SET_TMP_PROG
 VCMP_TMP_PE:
@@ -367,8 +392,8 @@ VFSWAP:
         DW FSWAP
 VFLT_TEN_B:
         DW FLT_TEN_B
-VSHL_MANT:
-        DW SHL_MANTISSA
+VFLT_FROM_INT:
+        DW FLT_FROM_INT
 VMUL_BY_TEN:
         DW MUL_BY_TEN
 VFROM_INT_B:
@@ -381,6 +406,69 @@ VSETP:
         DW SETP
 VFN_END:
         DW FN_END
+
+; #############################################################################
+;  TABLES 
+; #############################################################################
+; (v1.7: the streams sit right after the page-zero vector table, so their page and offsets never move with the code: SCT = $0041, E_TBL = $00BD)
+; Streams (4 bytes per entry, MBF4 [E][S|M1][M2][M3]); all in ONE page, checked at assembly time by the RES guard at E_TBL (the tables float: no ORG pin).
+; tools/gen_coeffs.py makes every entry.
+; SCT : SIN / COS:  1/(2PI), D1, D2 (2PI = D1 + D2, D1 = 6.28125 has 8 bits so K*D1 is exact for K < 2^15), 2/PI, 1.0, c4..c0 of sin(PI*t/2) = t * (c0 + c1 t^2 + ... + c4 t^8)
+; SETP builds the stream pointers as (page of SCT):(low byte of stream-1): all streams in ONE page, and SCT-1 in that page (SCT's low byte may not be 0).
+SCT:
+        DB $7E,$22,$F9,$83          ; 1/(2PI) = 0.1591549431
+        DB $83,$49,$00,$00          ; D1 = 6.28125
+        DB $77,$7D,$AA,$22          ; D2 = 2PI - D1 = 0.001935307180
+        DB $80,$22,$F9,$83          ; 2/PI = 0.6366197467
+        DB $81,$00,$00,$00          ; 1.0 = 1
+        DB $74,$1F,$CE,$19          ; c4 = 0.00015240199
+        DB $79,$99,$37,$F9          ; c3 = -0.00467586191
+        DB $7D,$23,$35,$25          ; c2 = 0.0796912089
+        DB $80,$A5,$5D,$E7          ; c1 = -0.645964086
+PIO2:
+        DB $81,$49,$0F,$DB          ; c0 = 1.570796371
+
+ATT:
+        DB $81,$00,$00,$00          ; 1.0 = 1
+        DB $79,$87,$4E,$26          ; c7 = -0.00412918907
+        DB $7B,$35,$86,$4C          ; c6 = 0.0221587643
+        DB $7C,$E6,$E9,$FA          ; c5 = -0.0563754812
+        DB $7D,$46,$38,$30          ; c4 = 0.0967868567
+        DB $7E,$8E,$94,$B7          ; c3 = -0.139239177
+        DB $7E,$4C,$49,$71          ; c2 = 0.199498907
+        DB $7F,$AA,$A6,$90          ; c1 = -0.333302021
+        DB $80,$7F,$FF,$F7          ; c0 = 0.999999464
+
+; EXPT : EXP:  log2e, ln2, c7..c0 of exp(r) = c0 + c1 r + ... + c7 r^7
+EXPT:
+        DB $81,$38,$AA,$3B          ; LOG2E = 1.442695022
+        DB $80,$31,$72,$18          ; LN2 = 0.6931471825
+        DB $74,$5B,$35,$23          ; c7 = 0.000209052625
+        DB $77,$38,$8C,$00          ; c6 = 0.00140798092
+        DB $7A,$08,$6A,$DC          ; c5 = 0.00832625851
+        DB $7C,$2A,$A7,$07          ; c4 = 0.0416631959
+        DB $7E,$2A,$AA,$FD          ; c3 = 0.166667894
+        DB $80,$00,$00,$00          ; c2 = 0.5
+;        DB $81,$00,$00,$00          ; c1 = 1
+;        DB $81,$00,$00,$00          ; c0 = 1
+
+; LNT : LN:  1.0, 1.0, q3..q0 of ln(m) = z * (q0 + q1 z^2 + q2 z^4 + q3 z^6), then ln2
+LNT:
+; ONES + ATT : ASIN reads ONES and the first entry of ATT (1.0, 1.0); ATN reads ATT (PIO2 = SIN's c0 is fetched with SETP, PIO2_B):  1.0, c7..c0 of atan(t) = t * P(t^2)
+ONES:
+        DB $81,$00,$00,$00          ; 1.0 = 1
+        DB $81,$00,$00,$00          ; 1.0 = 1
+        DB $7F,$18,$17,$3D          ; c3 = 0.297052294
+        DB $7F,$4C,$BA,$40          ; c2 = 0.399858475
+        DB $80,$2A,$AA,$AD          ; c1 = 0.666666806
+        DB $82,$00,$00,$00          ; c0 = 2
+        DB $80,$31,$72,$18          ; LN2 = 0.6931471825
+
+E_TBL:
+        RES (<SCT)-(<(E_TBL-1))         ; build guard: a negative count is an ERROR unless SCT..E_TBL-1 lie in ONE page (SETP puts SCT's page in HPTR for every stream)
+        RES -(<SCT)                     ; build guard: an ERROR unless SCT is in page 0 (SETP loads the page with EORZ,R0)
+        RES (<(SCT-1))-(<SCT)               ; build guard: an ERROR if SCT-1 is on another page (SCT's low byte 0): SETP would point the streams a page too high
+
 
 ; =============================================================================
 ; MAIN - Program init
@@ -619,7 +707,7 @@ DO_ASK:
         BSTR,UN PARSE_VAR_SAVE
         BSTA,UN PRT_QUEST
         ZBSR *VPRT_SPACE  
-        BSTR,UN GETLINE                   ; [+1] also sets IPH:IPL = IBUF
+        BSTA,UN GETLINE                   ; [+1] also sets IPH:IPL = IBUF
         BSTA,UN PF_INP                   ; [+1] FA = [+-]digits[.digits][e[+-]digits]
         BCTR,UN DL_STORE
 
@@ -639,38 +727,13 @@ PARSE_VAR_SAVE:
         STRZ,R2                          ; R2 = byte offset in VARS, for DL_STORE
         ZBRR *VINC_IP         ; tail call  
 
-; =============================================================================
-;  GETLINE -- Read a line from input into IBUF; also points IP at it
-; In:  nothing
-; Out: IBUF = NUL-terminated input line; IPH:IPL = IBUF (both callers used
-;      to re-point IP via a separate SET_IP_IBUF call right after this -
-;      folded in here instead). 
-; Clobbers: R0, R1
-GETLINE:
-        LODI,R0 <IBUF
-        STRA,R0 IPH
-        LODI,R0 >IBUF
-        STRA,R0 IPL
-        LODI,R1 $FF                      ; R1 = empty-buffer sentinel (pre-inc convention)
-GL_LP:
-        BSTA,UN PRE_CHIN                 ; [+1] blocking read (stirs the RND LFSR first)
-        COMI,R0 CR+1
-        BCTR,LT GL_EOL                  ; everything less than CR
-        STRA,R0 IBUF,R1+                 ; R1++ (pre-inc); IBUF[R1]=char
-        ZBSR *VCOUT  
-        BCTR,UN GL_LP
-GL_EOL:
-        EORZ,R0
-        STRA,R0 IBUF,R1+                 ; R1++ (pre-inc, one past last char); NUL-terminate
-        BCTA,UN PRT_CRLF                ; tail call
-
 JERRVAR:
         LODI,R0 ERR_VAR
         db $EC                  ; COMA,R0: consume next 2 bytes
 DGS_OFLOW:                              ; all report ERR_OOM: GOSUB/FOR stack full,
 DRT_UFLOW:                              ; RETURN/NEXT with nothing pushed, program
         LODI,R0 ERR_OOM                 ; store full (OPEN_GAP) - one shared exit
-        ZBRR *VDO_ERROR
+        BCTA,UN DO_ERROR
 
 DO_GO:
         LODA,R0 RXSAVE
@@ -712,7 +775,7 @@ DO_GOTO:
         BSTA,UN FIX_EXP                   ; EXP = int16(FA), truncating (|x| >= 32768: ?R)
         LODI,R0 (IDX_EXP*16)+IDX_LNUM
         ZBSR *VREG16_TO_REG16              ; LNUMH:LNUML = EXPH:EXPL (target line)
-        BSTA,UN FIND_LINE                  ; [+1] TMPH:TMPL = found record
+        BSTA,UN FIND_INS                   ; [+1] TMPH:TMPL = the record, or the first larger one, or PE
         LODI,R0 (IDX_TMP*16)+IDX_SWSTK
         ZBRR *VREG16_TO_REG16              ; Tail call
 
@@ -791,7 +854,7 @@ DR_HDR:
         ZBSR *VINC_IP
         ; advance TMP past this whole record (header+body+terminator) to
         ; find the next one; stash for SWSTK/DR_LP's next iteration (or a
-        ; GOTO's redirection). Reuses the same shared scan FIND_LINE/
+        ; GOTO's redirection). Reuses the same shared scan FIND_INS/
         ; FIND_INS/TSL_MATCH already use - one routine, one terminator.
         BSTA,UN ADV_TMP_PAST_REC
         LODI,R0 (IDX_TMP*16)+IDX_SWSTK
@@ -863,16 +926,13 @@ DN_POP9:
         LODI,R0 LIMOFF
         BSTA,UN VAR2FB                   ; FB = limit
         PPSL PSW_RS
-        ZBSR *VFLT_CMP                  ; CC = var : limit  (CPSL keeps CC)
-        CPSL PSW_RS
-        BCTR,EQ DN_GO                    ; var = limit: one more pass
-        BCTR,GT DN_UP                    ; var above limit
-        LODA,R0 FWRK+6                   ; var below limit: still going unless the step is negative
-        BCTR,LT DN_POP                   ;   (bit 7 of the step's S|M1 byte)
-        BCTR,UN DN_GO
-DN_UP:
-        LODA,R0 FWRK+6                   ; var above limit: going only if step < 0
-        BCTR,LT DN_GO
+        LODA,R0 FWRK+6                   ; bit 7 of the step's S|M1 byte: negative step
+        BCFR,LT DN_C
+        ZBSR *VFSWAP                     ;   counting down: compare limit : var instead
+DN_C:
+        ZBSR *VFLT_CMP                  ; CC = GT when the loop is over (var > limit, or limit > var for a negative step)
+        CPSL PSW_RS                      ; (CPSL keeps CC)
+        BCFR,GT DN_GO                    ; not GT: another pass (var = limit: one more)
 DN_POP:
         SUBI,R3 9                        ; back to the frame base: pop it
         STRA,R3 FSP
@@ -915,66 +975,64 @@ PCA_RET:
 ; Out: text written to COUT; IP advanced past statement
 ; Clobbers: R0, R1, R2, EXPH, EXPL, TMPH, TMPL, NEGFLG, LNUMH, LNUML, SC0
 DP_STRING:
-        ZBSR *VINC_IP           ; 2b
+        ZBSR *VINC_IP
 PRTSTR:
-        LODA,R0 *IPH            ; 3b
-        RETC,EQ                 ; 1b: NUL before closing quote -> exit
-        COMI,R0 DQ              ; 2b
-        BCTR,EQ DP_SCLS         ; 2b
-        ZBSR *VCOUT             ; 2b
-        BCTR,UN DP_STRING       ; 2b
+        LODA,R0 *IPH
+        RETC,EQ                 ; NUL before closing quote -> exit
+        COMI,R0 DQ
+        BCTR,EQ DP_SCLS
+        ZBSR *VCOUT
+        BCTR,UN DP_STRING
 
 DP_EXPR:
-        ZBSR *VPARSE_EXPR       ; 2b
-        BSTA,UN PRT_FA          ; 3b
-        db $EC                  ; 1b: COMA,R0 opcode - consumes next 2 bytes (ZBSR *VINC_IP)
+        ZBSR *VPARSE_EXPR
+        BSTA,UN PRT_FA
+        db $EC                  ; COMA,R0 opcode - consumes the next 2 bytes (ZBSR *VINC_IP)
 DP_SCLS:
-        ZBSR *VINC_IP           ; 2b
-DP_SEP:
-        ZBSR *VWSKIP       ; 2b
-        COMI,R0 $3B             ; 2b: semicolon ';'
-        BCFA,EQ PRT_CRLF        ; 3b: branch if NOT ';' (was 3b BCFA)
-        ZBSR *VINC_IP           ; 2b
-        ZBSR *VWSKIP       ; 2b
-        RETC,EQ                 ; 1b: trailing ';' followed by NUL -> exit without CRLF
-        BCTR,UN DP_ITEM         ; 2b
+        ZBSR *VINC_IP           ; step over the closing quote
+        BCTR,UN DP_SEP
 
 DO_PRINT:
-        ZBSR *VWSKIP       ; 2b
-        BCTA,EQ PRT_CRLF        ; 2b: bare PRINT -> print CRLF & return
+        ZBSR *VWSKIP
+        BCTA,EQ PRT_CRLF        ; bare PRINT -> print CRLF & return
 DP_ITEM:
-        COMI,R0 DQ              ; 2b
-        BCTR,EQ DP_STRING       ; 2b
-        
-        BSTR,UN PEEK_C2_ALPHA   ; 2b
-        BCFR,EQ DP_EXPR         ; 2b: 2nd char not alpha -> expr
-        COMI,R2 A'C'            ; 2b
-        BCTR,EQ DP_CK           ; 2b
-        COMI,R2 A'T'            ; 2b
-        BCFR,EQ DP_EXPR         ; 2b
+        COMI,R0 DQ
+        BCTR,EQ DP_STRING
+        BSTR,UN PEEK_C2_ALPHA
+        BCFR,EQ DP_EXPR         ; 2nd char not alpha -> expr
+        COMI,R2 A'C'
+        BCTR,EQ DP_CK
+        COMI,R2 A'T'
+        BCFR,EQ DP_EXPR
 DP_CK:
-        LODI,R1 2               ;CHR$ has 'R' for 3rd letter and TAB has 'B'; anything else is an expression
+        LODI,R1 2               ; CHR$ has 'R' for 3rd letter and TAB has 'B'; anything else is an expression
         LODA,R0 *IPH,R1
-        COMI,R0 A'R'
-        BCTR,EQ DP_KW
+        ANDI,R0 $EF             ; 'R' ($52) and 'B' ($42) differ only in bit 4: both become 'B'
         COMI,R0 A'B'
         BCFR,EQ DP_EXPR
-DP_KW:
-        ZBSR *VEATWORD          ; 2b: consume keyword
-        ZBSR *VPARSE_EXPR       ; 2b: parse (n)
-        BSTA,UN FIX_EXP         ; 3b: EXP = int16(n), truncating
-        LODA,R0 EXPL            ; 3b: load low byte into R0 once for both CHR$ and TAB
-        COMI,R2 A'C'            ; 2b
-        BCTR,EQ DP_C_KW         ; 2b
-        STRZ R1                 ; 1b: 2650 opcode $51 — copies R0 -> R1 & sets CC (EQ if 0)
-        BCTA,EQ DP_SEP          ; 3b: TAB(0) no-op 
+        ZBSR *VEATWORD          ; consume keyword
+        ZBSR *VPARSE_EXPR       ; parse (n)
+        BSTA,UN FIX_EXP         ; EXP = int16(n), truncating
+        LODA,R0 EXPL            ; low byte into R0 once for both CHR$ and TAB
+        COMI,R2 A'C'
+        BCTR,EQ DP_C_KW
+        STRZ R1                 ; copies R0 -> R1 
+        BCTR,EQ DP_SEP          ; TAB(0) no-op
 DP_TAB_LOOP:
-        ZBSR *VPRT_SPACE        ; 2b
-        BDRR,R1 DP_TAB_LOOP     ; 2b
-        BCTA,UN DP_SEP          ; 3b
+        ZBSR *VPRT_SPACE
+        BDRR,R1 DP_TAB_LOOP
+        ; BCTR,UN DP_SEP
+        DB $EC
 DP_C_KW:
-        ZBSR *VCOUT             ; 2b: print R0 directly
-        BCTA,UN DP_SEP          ; 3b
+        ZBSR *VCOUT             ; print R0 directly, then on into DP_SEP
+DP_SEP:
+        ZBSR *VWSKIP
+        COMI,R0 $3B             ; semicolon ';'
+        BCFA,EQ PRT_CRLF        ; not ';' -> CRLF and done
+        ZBSR *VINC_IP
+        ZBSR *VWSKIP
+        RETC,EQ                 ; trailing ';' followed by NUL -> exit without CRLF
+        BCTA,UN DP_ITEM         ; (out of relative range by 2 bytes)
 
 ; =============================================================================
 ;  RND_SHUFFLE -- Advance 16-bit Galois LFSR (Little-Endian) in place
@@ -1129,9 +1187,11 @@ TSL_NUM:
         LODI,R0 (IDX_EXP*16)+IDX_LNUM
         ZBSR *VREG16_TO_REG16             ; LNUMH:LNUML = parsed line number
 TSL_FND:
-        BSTA,UN FIND_LINE                ; [+1] TMP = insertion point (first record
-                                          ; >= LNUM); CC=EQ iff that record IS LNUM
+        BSTA,UN FIND_INS                 ; [+1] TMP = insertion point (first record >= LNUM);
+                                          ; CC=LT: that record is larger, EQ: it IS LNUM or TMP = PE (no record)
         BCFR,EQ TSL_WRITE                 ; no such line: go store the new one
+        ZBSR *VCMP_TMP_PE
+        BCFR,LT TSL_WRITE                 ; TMP = PE: no such line either
         BSTR,UN DEL_REC                   ; remove the old copy, then re-find: the
         BCTR,UN TSL_FND                   ; insertion point is the same address, but
                                           ; TMP was consumed by DEL_REC
@@ -1238,32 +1298,6 @@ OG_CPY:
 OG_FIX:
         LODI,R0 (IDX_EXP*16)+IDX_PE
         ZBRR *VREG16_TO_REG16               ; PE = EXP (tail call)
-
-; =============================================================================
-;  FIND_LINE -- Search for line LNUMH:LNUML in program store
-; Out: TMPH:TMPL = record start if found; CC=EQ found, CC=GT not found.
-; Clobbers: R0, R1, TMPH, TMPL
-FIND_LINE:
-        BSTR,UN FIND_INS                 ; [+1]
-        ; check if at end of program
-        ZBSR *VCMP_TMP_PE
-        BCFR,LT FL_RET_NF                 ; not LT (EQ/GT, at/past end) -> not found
-FL_CHK:
-        LODA,R0 *TMPH
-        SUBA,R0 LNUMH
-        BCTR,EQ FL_CHKLO
-FL_RET_NF:
-        LODI,R0 1                        ; CC=GT: not found
-        RETC,UN
-
-FL_CHKLO:
-        LODI,R1 1                         ; record's lo line-number byte is
-        LODA,R0 *TMPH,R1                  ; at TMP+1 - indirect-indexed peek,
-        SUBA,R0 LNUML
-        BCFR,EQ FL_RET_NF                 ; lo byte mismatch -> not found
-FL_FOUND:
-        EORZ,R0                          ; CC=EQ: found
-        RETC,UN
 
 ; =============================================================================
 ;  ADV_TMP_PAST_REC -- Advance TMPH:TMPL past the current stored line record
@@ -1398,7 +1432,7 @@ RNDF_MIX:
         LODI,R0 (IDX_RND*16)+IDX_EXP
         ZBSR *VREG16_TO_REG16   ; EXPH:EXPL = seed
         PPSL PSW_RS
-        BSTA,UN FLT_FROM_INT    ; FA = float(seed)
+        ZBSR *VFLT_FROM_INT    ; FA = float(seed)
         CPSL PSW_RS
         ZBRR *VPARSER_RET
 
@@ -1411,10 +1445,8 @@ EXPR:
         EORZ,R0
         STRZ,R3                          ; R3 = 0: SW-stack byte count 
         STRA,R0 BANG                      ; relop-invert modifier off
-        BSTA,UN PUSH_LOLOOP                 ; "once the HI-tier chain is fully
-                                            ; exhausted, scan for +-=<> here"   
-        BSTA,UN PUSH_HILOOP                 ; "once the first atom resolves,
-                                            ; check for */  chaining first"
+        BSTA,UN PUSH_LH                     ; LO_LOOP ("once the HI-tier chain is fully exhausted, scan for +-=<> here"),
+                                            ; then HI_LOOP ("once the first atom resolves, check for */ chaining first")
         db $EC                           ; COMA,R0: consume next 2 bytes
         ; drop through
 ; =============================================================================
@@ -1445,7 +1477,7 @@ EA_NP:                                  ; the operand of a function enters here:
         ; 2nd char is a letter. Check char[0] for known functions
         ZBSR *VWSKIP            ; re-peek with R0 = char[0]
         COMI,R0 A'R'
-        BCTA,EQ DO_RND          ; Starts with 'R'? Try RND (absolute: DO_RND is out of BCTR range)
+        BCTR,EQ DO_RND          ; Starts with 'R'? Try RND (absolute: DO_RND is out of BCTR range)
         COMI,R0 A'P'
         BCTR,EQ DO_PI           ; Starts with 'P'? PI
         BCTR,UN FN_DSP          ; every other function name is found by the table scanner below
@@ -1478,7 +1510,7 @@ DO_PI:
 ;   In     : R0 = first letter, IP -> the word, the second character is known to be a letter
 ;   Out    : name found: the word is eaten, the function's continuation address is pushed and the operand is parsed at EA_NP (no '^' check of its own);
 ;            not found: jumps back to END_FUNCS (the word is a variable)
-;   Key    : the FIRST TWO letters (AB ABS, SI SIN, CO COS, AT ATN/ATAN, AS ASIN, AC ACOS, SQ SQR/SQRT, LN, EX EXP, IN INT); the rest of the word is eaten
+;   Key    : the FIRST TWO letters (AB ABS, SI SIN, CO COS, AT ATN/ATAN, AS ASIN, AC ACOS, SQ SQR/SQRT, TA TAN, LN, EX EXP, IN INT); the rest of the word is eaten
 ;   Clobber: R0, R1, DIG, DIG+1 (parse time: free);  R2 / R3 untouched
 ;   RAS    : 1 (EATWORD)
 FN_DSP:
@@ -1517,6 +1549,8 @@ PUSH_LOLOOP:
         LODI,R1 <LO_LOOP
         ZBRR *VPUSH_RET                 ; tail call
 
+PUSH_LH:                                ; both: LO_LOOP first, HI_LOOP on top (EXPR, parenthesis)
+        BSTR,UN PUSH_LOLOOP
 PUSH_HILOOP:
         LODI,R0 >HI_LOOP
         LODI,R1 <HI_LOOP
@@ -1527,8 +1561,7 @@ EA_PAREN:
         LODI,R0 >EP_RET
         LODI,R1 <EP_RET
         ZBSR *VPUSH_RET                     
-        BSTR,UN PUSH_LOLOOP                
-        BSTR,UN PUSH_HILOOP                 
+        BSTR,UN PUSH_LH
         BCTA,UN EXPR_ATOM                   
 
 ; =============================================================================
@@ -1538,7 +1571,7 @@ EA_PAREN:
 ;  (LO_LOOP for + -, HI_LOOP for * /) and returns to PARSER_RET.
 ; In:  FA = right operand, FB = left operand
 ; Out: FA = result (FB destroyed); control resumes via PARSER_RET
-; Errors: overflow ?O, divide by zero ?Z (library exits through VDO_ERROR)
+; Errors: overflow ?O, divide by zero ?Z (library exits through DO_ERROR)
 ; Clobbers: R0, R1, R3 (continuation push), FB and the library scratch
 DO_SUB:                                 ; left - right = FB - FA = (-FA) + FB
         ZBSR *VFLT_NEGATE              ; R0 only: no bank bracket needed
@@ -1568,12 +1601,12 @@ DM_END:
 ;  All six relops are direct: <= is !>, >= is !<, <> is !=.
 ; In:  FA = right operand, FB = left operand
 ; Out: FA = -1.0 / 0.0; BANG cleared; control resumes via PARSER_RET
-; Clobbers: R0, R1, FB (FLT_CMP may swap FA and FB; the result overwrites FA)
+; Clobbers: R0, alternate-bank R1/R2 (the primary R1-R3 are untouched: R2 holds the assignment target, R3 the SW stack count), FB, FDB
+;           (FLT_CMP may swap FA and FB; the result overwrites FA; F_ZERO clears FA+2..FB+0).  RS is set on entry to DOP_x and cleared at its end.
+; RAS    : DOP_TRUE runs from the continuation chain (no caller on the stack) and adds 1 level for the F_ZERO leaf
 FCMPW:
         PPSL PSW_RS
-        ZBSR *VFLT_CMP
-        CPSL PSW_RS                     ; CPSL leaves CC alone
-        RETC,UN
+        ZBRR *VFLT_CMP                  ; tail call: returns to the handler with RS still set (DOP_TRUE clears it; the branches test CC only)
 DO_EQOP:
         BSTR,UN FCMPW
         BCTR,EQ DOP_TRUE
@@ -1597,10 +1630,10 @@ DOP_TRUE:
         STRA,R0 FA                        ; exponent: $81 (-1.0) or $00
         ANDI,R0 $80                       ; the exponent's bit 7 is the sign bit (set for -1.0 only)
         STRA,R0 FA+1
-        EORZ,R0
-        STRA,R0 FA+2
-        STRA,R0 FA+3
+        LODI,R1 2
+        BSTA,UN F_ZERO                    ; FZL loop zeroes FA+2, FA+3, FDB, FB exponent (FB is dead); R0 = 0
         STRA,R0 BANG                      ; BANG = 0 again
+        CPSL PSW_RS                       ; back to the primary bank (R2 / R3 are live there)
         ZBRR *VPARSER_RET
 
 ; =============================================================================
@@ -1696,7 +1729,7 @@ FIX_EXP:
 ; Clobbers: R0, R1, FA, FB and the library scratch (T0 = EXP)
 PRT_INT:
         PPSL PSW_RS
-        BSTA,UN FLT_FROM_INT              ; FA = float(EXP)
+        ZBSR *VFLT_FROM_INT              ; FA = float(EXP)
         ; BCTR,UN PRT_F2
         DB $EC
 PRT_FA:
@@ -1707,16 +1740,43 @@ PRT_F2:
         RETC,UN
 
 ; =============================================================================
-;  DO_LIST -- Print stored BASIC lines (v0.1b: whole program only -
-; Syntax: LIST
-; In:  PROG=program base, PEH:PEL=program end
-; Out: whole program printed
-; Clobbers: R0, IPH, IPL, TMPH, TMPL, EXPH, EXPL
+;  LS_ARG -- DO_LIST's optional line-number argument
+; In:  R0 = default for both bytes of EXP ($00 for the first line, $FF for the last: $FFFF is above every line number); IP -> after the keyword / comma
+; Out: EXP = the decimal number at IP (blanks skipped), else R0 unchanged; IP past the number
+; Clobbers: R0, R1, FA, FB and the library scratch (PF_INT)
+LS_ARG:
+        STRA,R0 EXPH
+        STRA,R0 EXPL
+        ZBSR *VWSKIP
+        ZBSR *VDIGIT_CHECK                ; CC = GT when *IP is not a digit
+        RETC,GT
+        BCTR,UN PF_INT                    ; tail jump: EXP = the line number, returns to DO_LIST
+
+; =============================================================================
+;  DO_LIST -- Print stored BASIC lines
+; Syntax: LIST [first][,last]     LIST = all;  LIST 100 = line 100 to the end;  LIST 100,200 = lines 100..200;  LIST ,200 = up to line 200   (v1.7; the comma is optional)
+;                                 Both limits are decimal literals, not expressions; first > last lists nothing.
+; In:  PROG=program base, PEH:PEL=program end; IP -> after the keyword
+; Out: the selected lines printed, in program order
+; Clobbers: R0, R1, IPH, IPL, TMPH, TMPL, EXPH, EXPL, LNUMH, LNUML, GOTOH, GOTOL, FA, FB (LS_ARG)
 DO_LIST:
         LODA,R0 RXSAVE                    ; 'L' row is shared: LIST's 3rd char is
         COMI,R0 A'T'                      ; 'S', LET's is 'T' - the word is already
         BCTA,EQ SE_NOTKW                  ; eaten, so LET = the bare assignment path
-        ZBSR *VSET_TMP_PROG
+        EORZ,R0
+        BSTR,UN LS_ARG                    ; EXP = first line (0 when absent)
+        LODI,R0 (IDX_EXP*16)+IDX_LNUM
+        ZBSR *VREG16_TO_REG16             ; LNUM = first line
+        ZBSR *VWSKIP
+        COMI,R0 A','
+        BCFR,EQ DLS_LAST
+        ZBSR *VINC_IP                     ; skip the comma
+DLS_LAST:
+        LODI,R0 $FF
+        BSTR,UN LS_ARG                    ; EXP = last line ($FFFF when absent)
+        LODI,R0 (IDX_EXP*16)+IDX_GOTO
+        ZBSR *VREG16_TO_REG16             ; GOTOH:GOTOL = last line (the statement dispatch is over: free)
+        BSTA,UN FIND_INS                  ; TMP = first record >= the first line (or PE)
         db $EC                  ; COMA,R0: consume next 2 bytes
 DLS_NL:
         ZBSR *VINC_TMP                    ; skip over NUL
@@ -1727,7 +1787,7 @@ DLS_LP:
         RETC,GT
         RETC,EQ
 
-        ; Read+print line number, then rest of line verbatim.  Walks TMP
+        ; Read the line number, stop after the last line, print the line number and the rest of the line verbatim.  Walks TMP
         ; directly - PRINT_S16 no longer uses TMPL as scratch, so the old
         ; TMP->IP copy here and IP->TMP copy-back below are both gone.
         LODI,R1 2                         ; read the 2-byte line-number header
@@ -1735,7 +1795,15 @@ DLS_HDR:
         LODA,R0 *TMPH,R1-                 ; R1 2->1: TMP[1]; 1->0: TMP[0]
         STRA,R0 EXPH,R1                   ; EXPH+1 = EXPL
         BRNR,R1 DLS_HDR
-        BSTR,UN PRT_INT
+DLS_CMP:                                  ; line number (EXP) against the last line (GOTO), high byte then low (R1 = 0, 1)
+        LODA,R0 EXPH,R1
+        COMA,R0 GOTOH,R1
+        RETC,GT                           ; beyond the last line: done
+        BCFR,EQ DLS_GO                    ; below it: print
+        EORI,R1 1
+        BCFR,EQ DLS_CMP                   ; high bytes equal: compare the low bytes; equal there too (R1 back to 0): print
+DLS_GO:
+        BSTA,UN PRT_INT
         ZBSR *VPRT_SPACE
 ;
         ZBSR *VINC_TMP           ; Skip 1st byte of line number
@@ -1765,8 +1833,7 @@ INC_ET:
         LODA,R0 IPL,R1          ; load lo byte
         ADDI,R0 1
         STRA,R0 IPL,R1
-        TPSL $01
-        BCTR,LT ET_RET          ; no carry: done
+        BCFR,EQ ET_RET          ; result <> 0: no carry out of the low byte, done
         LODA,R0 IPH,R1          ; carry: increment hi byte
         ADDI,R0 1
 ET_STORE:
@@ -1897,7 +1964,7 @@ INT_RET:
         ZBSR *VFLT_SUB                 ; FA = FA - 1
 INT_Q:
         ZBSR *VFLT_TO_INT              ; T0 = TRUNC(FA) = floor(x)
-        BSTA,UN FLT_FROM_INT            ; FA = float(T0)
+        ZBSR *VFLT_FROM_INT            ; FA = float(T0)
         ZBRR *VFN_END
 
 ; -----------------------------------------------------------------------------
@@ -1942,10 +2009,13 @@ ADDLP:
 
 ; -----------------------------------------------------------------------------
 ; SUB_A_B -- FA mantissa -= FB mantissa (24 bit) with the CALLER's carry-in
-;   In     : FA+1..FA+3, FB+1..FB+3;  C = carry-in from the caller (C=1: no borrow pending)
+; FDSUB   -- the same with carry-in 1 (no borrow pending): FLT_DIV's trial subtract
+;   In     : FA+1..FA+3, FB+1..FB+3;  C = carry-in from the caller (C=1: no borrow pending; FDSUB sets it)
 ;   Out    : FA+1..FA+3 = difference mod 2^24;  C=1 no borrow, C=0 borrow (FA < FB).  WC=0
 ;   Clobber: R0, R1
 ;   RAS    : 0
+FDSUB:
+        PPSL    $01
 SUB_A_B:
         PPSL    $08
         LODI,R1 3
@@ -1979,14 +2049,16 @@ SHR4L:
 
 ; -----------------------------------------------------------------------------
 ; SHL_MANTISSA -- shift FDB:FA+3:FA+2:FA+1 left by one bit, 0 shifted in at FDB bit 0
-;   In     : FA+1..FA+3, FDB
-;   Out    : shifted left;  C = old FA+1 bit 7.  WC=0
+; SHLQ         -- generic: rotate the 4 bytes just below FA+R1 left through carry (R1 = address of the LAST byte + 1, as an offset from FA)
+;   In     : FA+1..FA+3, FDB  (SHLQ: C = bit rotated in at the low byte bit 0;  R1 = 16 rotates FMA..FSB = FA+12..FA+15)
+;   Out    : shifted left;  C = old top bit.  WC=0
 ;   Clobber: R0, R1, R2
 ;   RAS    : 0
 SHL_MANTISSA:
         LODI,R1 5
-        LODI,R2 4
         CPSL    $01
+SHLQ:
+        LODI,R2 4
         PPSL    $08
 SHLL:
         LODA,R0 FA,R1-
@@ -2066,17 +2138,7 @@ FLT_ADD:
         BSTR,UN FSWAP
 ; signs -> FSA / FSB, hidden bits explicit;  R3 = ea - eb;  FER = ea;  FDB = FBG = 0
 FASG:
-        LODI,R1 5                       ; R1 = 5: FB, then 0: FA
-FASL:
-        LODA,R0 FA+1,R1
-        STRZ,R2
-        ANDI,R0 $80
-        STRA,R0 FSA,R1                  ; FSB = FSA+5 (RAM order)
-        LODZ,R2
-        IORI,R0 $80
-        STRA,R0 FA+1,R1
-        SUBI,R1 5
-        BCTR,EQ FASL
+        BSTA,UN HID_SGN
         LODA,R0 FA
         STRA,R0 FER
         SUBA,R0 FB
@@ -2109,26 +2171,17 @@ FAOP:
         BSTA,UN SUB_A_B
         TPSL    $01
         BCTR,EQ FANM2
-; subtract path, C=0 (borrow): FA < FB, so negate FDB:FA+3:FA+2:FA+1 (two's complement), flip the sign FSA;
-; an all-zero mantissa gives zero.  C=1: the difference is already positive (FANM2).
-        PPSL    $09
-        LODI,R1 4
-NEGLP:
-        EORZ,R0
-        SUBA,R0 FA,R1
-        STRA,R0 FA,R1
-        BDRR,R1 NEGLP
-        CPSL    $08
-        IORA,R0 FA+2
-        IORA,R0 FA+3
-        BCTA,EQ FLT_ZERO
-        LODA,R0 FSA
-        EORI,R0 $80
+; borrow (FA < FB).  Only possible with equal exponents (ea > eb leaves FB < 2^23 <= FA), where nothing was shifted and FDB = FBG = 0: put FA
+; back (ADD_A_B), swap the operands and subtract again: FB - FA > 0, sign = the other operand's (the signs differ, so FSA = FSB).
+        ZBSR *VADD_A_B
+        ZBSR *VFSWAP
+        LODA,R0 FSB
         STRA,R0 FSA
+        BSTA,UN FDSUB
         BCTR,UN FANM2
 ; add: a carry out of bit 23 shifts the sum right once and raises the exponent (wrap to 0 -> overflow)
 FASM:
-        BSTA,UN ADD_A_B
+        ZBSR *VADD_A_B
         TPSL    $01
         BCTR,LT FANM2
         BSTA,UN SHR_A
@@ -2139,29 +2192,33 @@ FANM2:
 E_ADD:
 
 ; =============================================================================
-; SECTION SIGN -- common set-up of MUL and DIV
+; SECTION SIGN -- common set-up of ADD, MUL and DIV
 ; =============================================================================
 S_SIGN:
 ; -----------------------------------------------------------------------------
-; CALC_SIGN_EXP -- result exponent, result sign and explicit hidden bits for FLT_MUL / FLT_DIV
-;   In     : R0 = starting exponent (FLT_MUL: FB's;  FLT_DIV: FA's)
-;   Out    : FER = R0;  FSA = sign(FA) xor sign(FB) in bit 7 (other bits 0);
-;            FA+1 and FB+1 bit 7 set: the hidden leading 1 is made explicit and the operands' sign bits are gone
-;   Clobber: R0
-;   RAS    : 0
-;   Note   : SIGN_XOR was inlined here: it had no other caller and its BSTA/RETC pair cost a RAS level on the PARSE path.
-CALC_SIGN_EXP:
-        STRA,R0 FER
-        LODA,R0 FA+1
-        EORA,R0 FB+1
+; HID_SGN -- sign bytes and explicit hidden bits for FLT_ADD / FLT_MUL / FLT_DIV
+;   In     : FA, FB
+;   Out    : FSA = sign of FA, FSB = sign of FB (bit 7, other bits 0);  FA+1 and FB+1 bit 7 set (the hidden leading 1 made explicit, the sign bits gone);
+;            R3 = sign(FA) xor sign(FB) in bit 7 (other bits 0): FLT_MUL / FLT_DIV store it as FSA, the sign of the product / quotient
+;   Clobber: R0, R1, R2, R3, FSA, FSB
+;   RAS    : 0  (a leaf: called ONCE from each of FLT_ADD, FLT_MUL, FLT_DIV.  v1.7 had it under a CALC_SIGN_EXP helper: that nested call put the
+;            FOR-literal path (FLT_PARSE -> MUL_BY_TEN -> FLT_MUL) at hardware depth 8, so the helper is gone and the callers store R3 themselves)
+HID_SGN:
+        EORZ,R0
+        STRZ,R3                         ; R3 = 0: running xor of the two signs
+        LODI,R1 5                       ; R1 = 5: FB, then 0: FA
+HSL:
+        LODA,R0 FA+1,R1
+        STRZ,R2
         ANDI,R0 $80
-        STRA,R0 FSA
-        LODA,R0 FA+1
+        STRA,R0 FSA,R1
+        EORZ,R3
+        STRZ,R3
+        LODZ,R2
         IORI,R0 $80
-        STRA,R0 FA+1
-        LODA,R0 FB+1
-        IORI,R0 $80
-        STRA,R0 FB+1
+        STRA,R0 FA+1,R1
+        SUBI,R1 5
+        BCTR,EQ HSL
         RETC,UN
 E_SIGN:
 
@@ -2205,13 +2262,13 @@ MUL_BY_TEN:
         ZBSR *VFLT_TEN_B
         ; Drop through
 ; -----------------------------------------------------------------------------
-; FLT_MUL -- FA = FA * FB (24-iteration shift-and-add on the 24-bit mantissas)
+; FLT_MUL -- FA = FA * FB (shift-and-add on the 24-bit mantissas: 32 iterations, the first 8 add nothing)
 ;   In     : FA, FB (canonical)
 ;   Out    : FA = product, normalised and rounded.  FA = 0 returns at once;  FB = 0 gives canonical zero (FLT_ZERO);
 ;            exponent underflow flushes to zero.
-;   Clobber: R0-R3;  FB+1 (bit 7 forced to 1, the rest of FB is intact), FMA..FMA+2, FSA, FER, FDB
+;   Clobber: R0-R3;  FB+1 (bit 7 forced to 1, the rest of FB is intact), FMA..FMA+2, FSB, FSA, FER, FDB
 ;   Errors : exponent overflow -> FP_OVF ('O')
-;   RAS    : 1  (CALC_SIGN_EXP, ADD_A_B, SHR_A, SHL_MANTISSA, EXPCHK; NORM_PACK is entered by fall-through)
+;   RAS    : 1  (HID_SGN, ADD_A_B, SHR4, SHR_A, SHL_MANTISSA, EXPCHK; NORM_PACK is entered by fall-through)
 FLT_MUL:
         LODA,R0 FA
         RETC,EQ
@@ -2219,7 +2276,8 @@ FLT_MUL:
         BCFR,EQ FMNZ
         ZBRR *VFLT_ZERO
 FMNZ:
-        BSTR,UN CALC_SIGN_EXP           ; (R0 = exponent of FB: FER is overwritten below)
+        BSTR,UN HID_SGN
+        STRA,R3 FSA                     ; sign of the product
         LODI,R1 3
 FM_CPY:
         LODA,R0 FA,R1
@@ -2228,26 +2286,21 @@ FM_CPY:
         STRA,R0 FA,R1
         BDRR,R1 FM_CPY
         STRA,R0 FDB
-        LODI,R3 24
+        STRA,R0 FSB                     ; FSB = 0: the multiplier is FMA..FSB = M1:M2:M3:0, so its first 8 bits are zeros: 32 iterations
+        LODI,R3 32
 FML:
         CPSL    $01
-        PPSL    $08
-        LODI,R1 $FD
-FMR:
-        LODA,R0 FMA-$FD,R1
-        RRR,R0
-        STRA,R0 FMA-$FD,R1
-        BIRR,R1 FMR
-        CPSL    $08
+        LODI,R1 FMA-1-FA
+        BSTA,UN SHR4                    ; multiplier >> 1, C = the bit shifted out
         TPSL    $01
         BCTR,LT FMS
-        BSTA,UN ADD_A_B
+        ZBSR *VADD_A_B
 FMS:
         BSTA,UN SHR_A
         BDRR,R3 FML
         LODA,R0 FA+1
         BCTR,LT FMNS
-        ZBSR *VSHL_MANT
+        BSTA,UN SHL_MANTISSA
         LODA,R0 FB
         SUBI,R0 1                       ; normalising shift: exponent = ea + (eb-1) - 128
         BCTR,UN FMEX
@@ -2271,24 +2324,22 @@ S_NP:
 ;            FER = biased exponent, FSA = sign in bit 7
 ;   Out    : FA = [E][S|M1][M2][M3], normalised, rounded up when FDB bit 7 is set;  canonical zero when the mantissa is zero or the
 ;            exponent runs out during normalisation (FLT_ZERO is entered by jump)
-;   Clobber: R0, R1, R2;  FA+0..FA+3, FDB, FER
+;   Clobber: R0-R3;  FA+0..FA+3, FDB  (FER is read only)
 ;   Errors : rounding carries out of the top and the exponent wraps to 0 -> FP_OVF ('O')
 ;   RAS    : 1  (SHL_MANTISSA)
 NORM_PACK:
+        LODA,R3 FER                     ; R3 = the exponent from here on (SHL_MANTISSA keeps R3)
 NPL:
         LODA,R0 FA+1
         BCTR,LT NPRND
         BCFR,EQ NPBT
-        LODA,R0 FA+2                    ; FA+1 = 0: an all-zero mantissa is zero at once (else it would shift until FER ran out)
+        LODA,R0 FA+2                    ; FA+1 = 0: an all-zero mantissa is zero at once (else it would shift until the exponent ran out)
         IORA,R0 FA+3
         IORA,R0 FDB
         BCTR,EQ NPZE
 NPBT:
-        ZBSR *VSHL_MANT
-        LODA,R0 FER
-        SUBI,R0 1
-        STRA,R0 FER
-        BCFR,EQ NPL
+        BSTA,UN SHL_MANTISSA
+        BDRR,R3 NPL                     ; exponent -= 1; 0 = underflow
 NPZE:
         ZBRR *VFLT_ZERO
 NPRND:
@@ -2303,10 +2354,10 @@ NPRL:
         BDRR,R1 NPRL
         LODI,R0 $80
         STRA,R0 FA+1
-        BSTR,UN INC_FER
+        BIRR,R3 NPPK                    ; exponent + 1; a wrap to 0 is an overflow
+        BCTA,UN FP_OVF
 NPPK:
-        LODA,R0 FER
-        STRA,R0 FA
+        STRA,R3 FA
         LODA,R0 FA+1
         ANDI,R0 $7F
         IORA,R0 FSA
@@ -2328,119 +2379,70 @@ INC_FER:
 E_NP:
 
 ; =============================================================================
-; SECTION DIV -- DIV_BY_TEN and FLT_DIV
+; SECTION DIV -- FLT_DIV
 ; =============================================================================
 S_DIV:
 ; -----------------------------------------------------------------------------
-; DIV_BY_TEN -- FA = FA / 10 (loads FB = 10.0 with FLT_TEN_B, then falls into FLT_DIV)
-;   In     : FA
-;   Out    : FA = FA / 10;  FB holds 10.0 afterwards (FB+1 bit 7 set when FA <> 0)
-;   Clobber: as FLT_DIV
-;   Errors : as FLT_DIV
-;   RAS    : 1
-DIV_BY_TEN:
-        ZBSR *VFLT_TEN_B
-        ; drop through
-; -----------------------------------------------------------------------------
-; FLT_DIV -- FA = FA / FB (32-iteration restoring division; the dividend is never pre-shifted; FDSUB is the shared R -= D step)
+; FLT_DIV -- FA = FA / FB (restoring division: remainder R = FA mantissa, divisor D = FB mantissa, quotient Q rotated through carry into FMA..FSB)
 ;   In     : FA = dividend, FB = divisor (canonical)
 ;   Out    : FA = quotient, normalised and rounded.  FA = 0 returns at once;  exponent underflow flushes to zero.
-;   Clobber: R0-R3;  FB+1 (bit 7 forced to 1, the rest of FB is intact), FDV..FDV+2, RD..RD+2, FSA, FER, FDB.   
-;            FDE is NOT touched (it is live in FLT_PRINT across DIV_BY_TEN: FER is the scratch here).
+;   Clobber: R0-R3;  FA+1..FA+3, FB+1 (bit 7 forced to 1, the rest of FB is intact), FMA..FMA+2, FSB, FSA, FER, FDB
+;            FDE is NOT touched (it is live in FLT_PRINT across FLT_DIV).
 ;   Errors : FB = 0 -> FP_DZERR ('Z'), tested first even when FA = 0;  exponent overflow -> FP_OVF ('O')
-;   RAS    : 1  (CALC_SIGN_EXP, EXPCHK, SHL_MANTISSA; NORM_PACK is entered by jump)
+;   RAS    : 1  (HID_SGN, SUB_A_B, ADD_A_B, SHL_MANTISSA / SHLQ, EXPCHK: all leaves; NORM_PACK is entered by jump)
+;   Note   : Q is never cleared: the integer bit b0 (R >= D, trial subtract) is rotated in first and 32 (b0 = 1: 31) more bits follow, so all 32
+;            old bits are rotated out.  R = FA mantissa shifts with FDB = 0 below it (SHL_MANTISSA), C = bit 24: R >= D for sure, subtract unconditionally.
 FLT_DIV:
         LODA,R0 FB
-        BCFR,EQ FDBNZ
-        BCTA,UN FP_DZERR
-FDBNZ:
+        BCTA,EQ FP_DZERR
         LODA,R0 FA
         RETC,EQ
-        BSTA,UN CALC_SIGN_EXP           ; (R0 = FA exponent: FER is overwritten below)
-        LODI,R1 3
-FD_CPY:
-        LODA,R0 FB,R1
-        STRA,R0 FDV-1,R1
-        LODA,R0 FA,R1
-        STRA,R0 RD-1,R1
-        BDRR,R1 FD_CPY
-        LODI,R1 $FF
-        LODI,R2 3
-FDC_L:
-        LODA,R0 RD,R1+
-        COMA,R0 FDV,R1
-        BCFR,EQ FDC_D
-        BDRR,R2 FDC_L
-FDC_D:
-        BCTR,LT FDPD            ; ma < mb: quotient starts at 0, 32 fractional bits
-        BSTA,UN FDSUB           ; ma >= mb: R -= D exactly (no shift: the old code halved R and lost its low bit)
-        LODI,R3 31              ; integer bit already in Q (=1), 31 more bits
-        LODI,R0 1
-        BCTR,UN FDQ
-FDPD:
+        BSTA,UN HID_SGN
+        STRA,R3 FSA                     ; sign of the quotient
+        EORZ,R0
+        STRA,R0 FDB                     ; FDB = 0: R is 24 bits wide
+        BSTA,UN FDSUB                   ; trial for the integer bit: R -= D, C=1 no borrow
+        LODI,R3 31                      ; b0 = 1: 31 more bits
+        TPSL    $01
+        BCTR,EQ FDQ1
+        ZBSR *VADD_A_B                 ; borrow: put R back, b0 = 0, 32 more bits
+        CPSL    $01
         LODI,R3 32
-        EORZ,R0
-FDQ:
-        STRA,R0 FDB             ; Q = 0 or 1 in the low byte, rest cleared
-        EORZ,R0
-        STRA,R0 FA+1
-        STRA,R0 FA+2
-        STRA,R0 FA+3
+FDQ1:
+        LODI,R1 16
+        BSTA,UN SHLQ                    ; Q = Q<<1 | b0
         LODA,R0 FB                      ; exponent = ea - eb + 128 (+1 if quotient >= 1): eb + R3 - 32 = eb or eb-1
         ADDZ,R3
         SUBI,R0 32
-        STRA,R0 FER                     ; (FDE is live in PRINT across DIV_BY_TEN: use FER as the scratch)
+        STRA,R0 FER                     ; (FDE is live in PRINT across FLT_DIV: use FER as the scratch)
         LODA,R0 FA
         SUBA,R0 FER
         BSTA,UN EXPCHK                  ; range check after the quotient size is known
         BCTA,EQ FLT_ZERO
         STRA,R0 FER
 FDL:
-        ZBSR *VSHL_MANT
-        LODI,R1 3
+        BSTA,UN SHL_MANTISSA                 ; R <<= 1, C = bit 24
+        TPSL    $01
+        BCTR,EQ FDFORCE                 ; C=1: R >= D: subtract unconditionally
+        BSTA,UN FDSUB                   ; trial: C=1 no borrow = quotient bit 1
+        TPSL    $01
+        BCTR,EQ FDRT
+        ZBSR *VADD_A_B                 ; borrow: put R back, quotient bit 0
         CPSL    $01
-        PPSL    $08
-FDR_L:
-        LODA,R0 RD-1,R1
-        RRL,R0
-        STRA,R0 RD-1,R1
-        BDRR,R1 FDR_L
-        CPSL    $08
-        TPSL    $01
-        BCTR,EQ FDFORCE         ; C=1: R overflowed 24 bits, so R >= D: subtract unconditionally
-        BSTR,UN FDSUB           ; trial: R -= D in place 
-        TPSL    $01
-        BCTR,EQ FDINC           ; no borrow: keep it, Q bit = 1
-        CPSL    $01             ; borrow: put it back, R += D (Q bit stays 0)
-        PPSL    $08
-        LODI,R1 3
-FDK_L:
-        LODA,R0 RD-1,R1
-        ADDA,R0 FDV-1,R1
-        STRA,R0 RD-1,R1
-        BDRR,R1 FDK_L
-        CPSL    $08
-        BCTR,UN FDNX
+        BCTR,UN FDRT
 FDFORCE:
-        BSTR,UN FDSUB
-FDINC:
-        LODA,R0 FDB
-        ADDI,R0 1
-        STRA,R0 FDB
-FDNX:
+        BSTA,UN FDSUB
+        PPSL    $01                     ; quotient bit 1
+FDRT:
+        LODI,R1 16
+        BSTA,UN SHLQ                    ; Q = Q<<1 | bit
         BDRR,R3 FDL
+        LODI,R1 4                       ; Q (FMA..FSB) -> FA+1..FA+3, FDB
+FDCP:
+        LODA,R0 FMA-1,R1
+        STRA,R0 FA,R1
+        BDRR,R1 FDCP
         BCTA,UN NORM_PACK
-; FDSUB -- RD -= FDV (24 bit), carry-in 1.   Out: C=1 no borrow, C=0 borrow.  Clobbers: R0, R1.  RAS 0 (leaf).
-FDSUB:
-        PPSL    $09
-        LODI,R1 3
-FDS_L:
-        LODA,R0 RD-1,R1
-        SUBA,R0 FDV-1,R1
-        STRA,R0 RD-1,R1
-        BDRR,R1 FDS_L
-        CPSL    $08
-        RETC,UN
 E_DIV:
 
 ; =============================================================================
@@ -2504,7 +2506,7 @@ FZL:
 ; FLT_FROM_INT -- FA = (float) the signed 16-bit integer in T0 (T0 = high byte, T0+1 = low byte)
 ;   In     : T0:T0+1 = -32768..32767
 ;   Out    : FA = value (exact: 16 bits fit the 24-bit mantissa); 0 gives canonical zero;  the guard byte FDB is not written
-;   Clobber: R0-R3 (alt R2 = exponent, alt R3 = sign ), T0:T0+1 (negated / normalised)
+;   Clobber: R0-R3 (alt R2 = exponent, R0:R3 = the normalised magnitude), T0:T0+1 (negated when negative)
 ;   RAS    : 1  (NEG16)
 ;   Note   : FLT_FROM_INT loads R1 = 0 (FA), DB $EC skips the next LODI,R1 (skip-2 idiom), FLT_SHARED does the work.
 FLT_FROM_INT:
@@ -2524,32 +2526,29 @@ FLT_SHARED:
         BCTR,EQ F_ZERO
         LODA,R0 T0
         ANDI,R0 $80
-        STRZ,R3                         ; sign bit parked in alt R3 ; STRZ sets CC
+        STRA,R0 FA+1,R1                 ; the sign waits in the result's M1 byte (STRA keeps CC)
         BCTR,EQ F_POS
         BSTR,UN NEG16
 F_POS:
-        LODI,R2 $90                     ; exponent in alt R2 
-F_NORM:
-        LODA,R0 T0
-        BCTR,LT F_PACK
-        LODA,R0 T0+1
-        ADDZ,R0
-        STRA,R0 T0+1
-        LODA,R0 T0
+        LODI,R2 $90                     ; exponent in alt R2
+        LODA,R3 T0+1                    ; the magnitude lives in R0:R3 (hi:lo) while it is normalised
+        LODA,R0 T0                      ; CC = sign of the high byte
         PPSL    $08
-        ADDZ,R0
-        CPSL    $08
-        STRA,R0 T0
+F_NORM:
+        BCTR,LT F_PACK
+        CPSL    $01
+        RRL,R3                          ; 16-bit shift left through the carry
+        RRL,R0
         BDRR,R2 F_NORM                  ; exponent -= 1; never reaches 0 (>= $81 here)
 F_PACK:
+        CPSL    $08
+        ANDI,R0 $7F
+        IORA,R0 FA+1,R1                 ; | sign
+        STRA,R0 FA+1,R1
+        LODZ,R3
+        STRA,R0 FA+2,R1
         LODZ,R2
         STRA,R0 FA,R1
-        LODA,R0 T0
-        ANDI,R0 $7F
-        IORZ,R3
-        STRA,R0 FA+1,R1
-        LODA,R0 T0+1
-        STRA,R0 FA+2,R1
         EORZ,R0
         STRA,R0 FA+3,R1
         RETC,UN
@@ -2558,17 +2557,18 @@ F_PACK:
 ; NEG16 -- T0:T0+1 = -(T0:T0+1) (16-bit two's complement; -32768 stays -32768)
 ;   In     : T0:T0+1
 ;   Out    : T0:T0+1 negated
-;   Clobber: R0
+;   Clobber: R0, R2  (R1 is live in FLT_SHARED: R2 is the byte counter)
 ;   RAS    : 0
+;   Note   : 0 - x byte by byte, low byte first (the pre-decrement-free index R2 = 2, 1 runs T0+1, T0); WC=1 with C=1 makes the first borrow-in 0.
 NEG16:
+        LODI,R2 2
+        PPSL    $09
+NG16L:
         EORZ,R0
-        SUBA,R0 T0+1
-        STRA,R0 T0+1
-        EORZ,R0
-        PPSL    $08
-        SUBA,R0 T0
+        SUBA,R0 T0-1,R2
+        STRA,R0 T0-1,R2
+        BDRR,R2 NG16L
         CPSL    $08
-        STRA,R0 T0
         RETC,UN
 
 ; -----------------------------------------------------------------------------
@@ -2576,9 +2576,10 @@ NEG16:
 ; FLT_FLOOR is an alias for the same entry (it does not floor negative fractions).
 ;   In     : FA
 ;   Out    : T0 = high byte, T0+1 = low byte, -32768..32767
-;   Clobber: R0, R1, R2 , T0:T0+1
+;   Clobber: R0-R3 , T0:T0+1
 ;   Errors : |FA| beyond +32767 / -32768 -> FP_RANGE ('R'); the result never wraps and never saturates (v0.11)
 ;   RAS    : 1  (NEG16)
+;   Note   : the magnitude is kept in R2:R3 (a 16-bit right shift is RRR,R2 / RRR,R3 with the carry cleared each time), R1 = shift count = $90 - E
 FLT_FLOOR:
 FLT_TO_INT:
         EORZ,R0
@@ -2587,35 +2588,30 @@ FLT_TO_INT:
         LODA,R0 FA
         COMI,R0 $81
         RETC,LT
-        SUBI,R0 $80
-        COMI,R0 17
+        LODA,R2 FA+1
+        IORI,R2 $80
+        LODA,R3 FA+2
+        EORI,R0 $FF
+        ADDI,R0 $91                     ; R0 = $90 - E = 16 - (integer bit count)
+        COMI,R0 16
         BCFA,LT FP_RANGE                ; |FA| >= 65536: out of range
-        STRZ,R2                         ; integer-bit count in alt R2 
-        LODA,R0 FA+1
-        IORI,R0 $80
-        STRA,R0 T0
-        LODA,R0 FA+2
-        STRA,R0 T0+1
-        LODI,R0 16
-        SUBZ,R2
-        BCTR,EQ FTIG
         STRZ,R1
+        BCTR,EQ FTIG                    ; no shift (STRZ set CC from the count)
+        PPSL    $08
 FTIS2:
         CPSL    $01
-        PPSL    $08
-        LODA,R0 T0
-        RRR,R0
-        STRA,R0 T0
-        LODA,R0 T0+1
-        RRR,R0
-        STRA,R0 T0+1
-        CPSL    $08
+        RRR,R2
+        RRR,R3
         BDRR,R1 FTIS2
+        CPSL    $08
 FTIG:
+        STRA,R2 T0
+        STRA,R3 T0+1
         LODA,R0 FA+1
+        STRZ,R1                         ; R1 = 0 here: the sign byte is parked in R1 (NEG16 keeps R1)
         BCFR,LT FTIP
         BSTA,UN NEG16                   ; FA < 0: negate the magnitude
-        LODA,R0 FA+1
+        LODZ,R1
 FTIP:
         EORA,R0 T0                      ; the result's bit 15 must equal FA's sign (-32768 is legal, +32768 is not)
         BCTA,LT FP_RANGE
@@ -2626,28 +2622,6 @@ E_CONV:
 ; SECTION PARSE -- PINC and FLT_PARSE
 ; =============================================================================
 S_PARSE:
-; -----------------------------------------------------------------------------
-; PINC -- IP = IP + 1 for alternate-bank code (INC_IP/INC_ET switch banks and return with RS=0, so RS=1 is re-entered here)
-;   In     : RS=1
-;   Out    : IP advanced by 1;  RS=1
-;   Clobber: R0, alt R1
-;   RAS    : 1  (ZBSR *VINC_IP; INC_IP counted as a leaf)
-; -----------------------------------------------------------------------------
-; PUTC -- send R0 to COUT, then re-enter the alternate bank (COUT returns with RS=0 and clobbers alt R1 and R2)
-;   In     : R0 = character;  RS=1
-;   Out    : character sent;  RS=1
-;   Clobber: R0, alt R1, alt R2
-;   RAS    : 2  (ZBSR *VCOUT; fpdepth.py allows COUT one more level of its own)
-PUTC:
-        ZBSR    *VCOUT
-;        PPSL    $10
-;        RETC,UN
-        DB $EC
-PINC:
-        ZBSR    *VINC_IP
-        PPSL    $10
-        RETC,UN
-
 ; -----------------------------------------------------------------------------
 ; FLT_PARSE -- parse digits[.digits][e[+-]digits] at *IP into FA and advance IP past it  (v1.2: one digit loop and one scale step)
 ; Digits on either side of the '.' go through the same loop: FA = FA*10 + d.  D (PSAVE) turns 1 at the first '.', and every digit then
@@ -2660,11 +2634,11 @@ PINC:
 ;   In     : RS=1 (caller did PPSL $10), IP -> first character (via IPH:IPL, high byte first)
 ;   Out    : FA = value (no digits gives 0);  IP -> first character after the number;  RS=0 (CPSL $10 inside, then RETC,UN)
 ;   Entry  : by tail jump from PARSE_FACTOR (PPSL $10 / BCTA,UN FLT_PARSE): no RAS level is used at entry
-;   Clobber: R0-R3;  FA, FB, FBG, FDB, FSA, FSB, FER, FMA, FDV, RD, T0, FPN, PSAVE, ZSLOT (= DIG..DIG+3)
+;   Clobber: R0-R3;  FA, FB, FBG, FDB, FSA, FSB, FER, FMA, T0, FPN, PSAVE, ZSLOT (= DIG..DIG+3)
 ;   Errors : value too large -> FP_OVF ('O');  K < -38 (10^-K overflows) -> FP_OVF;  too small flushes to 0
 ;   Syntax : a second '.' ends the number (as before: the caller then reports its syntax error);  'e' not followed by a digit is eaten
 ;            (1e = 1, 1e+ = 1);  more than 2 exponent digits wrap modulo 256;  an upper-case E is not an exponent
-;   RAS    : 2  (PINC -> INC_IP;  MUL_BY_TEN;  FLT_ADD -> FSWAP;  FLT_DIV -> CALC_SIGN_EXP;  ST_Z / LD_Z, INC_IP and DIGIT_CHECK are leaves)
+;   RAS    : 2  (PINC -> INC_IP;  MUL_BY_TEN;  FLT_ADD -> FSWAP;  FLT_DIV -> HID_SGN;  ST_Z / LD_Z, INC_IP and DIGIT_CHECK are leaves)
 FLT_PARSE:
         ZBSR *VFLT_ZERO                 ; FA = 0, R0 = 0
         STRA,R0 FPN                     ; K = 0
@@ -2687,38 +2661,59 @@ FPX:
         COMI,R0 '.'-'0'
         BCFR,EQ FPE
         LODA,R0 PSAVE
-        BCFR,EQ FPS                     ; a second '.': the number ends here
+        BCFR,EQ FPE                     ; a second '.': the number ends here (R0 = 1 is not 'e'-'0': FPE then branches on to FPS)
         LODI,R0 1
         STRA,R0 PSAVE
         BSTR,UN PINC
         BCTR,UN FPL
+; -----------------------------------------------------------------------------
+; PINC -- IP = IP + 1 for alternate-bank code (INC_IP/INC_ET switch banks and return with RS=0, so RS=1 is re-entered here)
+;   In     : RS=1
+;   Out    : IP advanced by 1;  RS=1
+;   Clobber: R0, alt R1
+;   RAS    : 1  (ZBSR *VINC_IP; INC_IP counted as a leaf)
+; -----------------------------------------------------------------------------
+; PUTC -- send R0 to COUT, then re-enter the alternate bank (COUT returns with RS=0 and clobbers alt R1 and R2)
+;   In     : R0 = character;  RS=1
+;   Out    : character sent;  RS=1
+;   Clobber: R0, alt R1, alt R2
+;   RAS    : 2  (ZBSR *VCOUT; fpdepth.py allows COUT one more level of its own)
+PUTC:
+        ZBSR    *VCOUT
+;        PPSL    $10
+;        RETC,UN
+        DB $EC
+PINC:
+        ZBSR    *VINC_IP
+        PPSL    $10
+        RETC,UN
+; (PUTC / PINC live here, in the middle of FLT_PARSE, so that every PINC call below is a 2-byte BSTR; FLT_PRINT reaches PUTC through VPUTC)
 FPE:
         COMI,R0 'e'-'0'                 ; (R0 = char - '0' from DIGIT_CHECK)
         BCFR,EQ FPS
         EORZ,R0
         STRZ,R2                         ; R2 = e = 0
         STRZ,R3                         ; R3 = sign mask = 0
-        BSTA,UN PINC                    ; eat the 'e'
+        BSTR,UN PINC                    ; eat the 'e'
         ZBSR *VDIGIT_CHECK
         COMI,R0 '+'-'0'
         BCTR,EQ $+8                     ; '+': skip the '-' test, eat it
         COMI,R0 '-'-'0'
         BCFR,EQ FPEL
         LODI,R3 $FF                     ; '-'
-        BSTA,UN PINC                    ; eat the sign
+        BSTR,UN PINC                    ; eat the sign
 FPEL:
         ZBSR *VDIGIT_CHECK
         BCTR,GT FPEK
         STRZ,R1                         ; R1 = d
-        LODZ,R2                         ; e = e*10 + d  (R2 and R3 survive PINC and DIGIT_CHECK)
-        ADDZ,R0
-        STRZ,R2
+        LODZ,R2                         ; e = (e*5)*2 + d  (R2 and R3 survive PINC and DIGIT_CHECK)
         ADDZ,R0
         ADDZ,R0
         ADDZ,R2
+        ADDZ,R0
         ADDZ,R1
         STRZ,R2
-        BSTA,UN PINC
+        BSTR,UN PINC
         BCTR,UN FPEL
 FPEK:
         LODZ,R2                         ; K += (e xor mask) - mask
@@ -2766,7 +2761,7 @@ S_PRINT:
 ;   In     : FA (canonical);  RS=1
 ;   Out    : characters through PUTC / COUT:  "0" for zero;  "-" first for a negative value;  |x| < 1 prints as "0." + leading zeros + digits.
 ;            FA is DESTROYED 
-;   Clobber: R0-R3;  FA (see Out), FB, FBG, FDB, FSA, FSB, FER, FMA, FDV, RD, T0, FDE, FPLIM, FPY, DIGI, DIG..DIG+6
+;   Clobber: R0-R3;  FA (see Out), FB, FBG, FDB, FSA, FSB, FER, FMA, T0, FDE, FPLIM, FPY, DIGI, DIG..DIG+6
 ;   Errors : none expected for a canonical FA: it is scaled into [1,10) before the MUL / DIV / FIX steps, so they cannot overflow or leave range
 ;   RAS    : 3  (FLT_SUB -> FLT_ADD -> FSWAP, or PUTC -> COUT -> its inner level)
 FLT_PRINT:
@@ -2787,11 +2782,13 @@ FPPS:
         STRA,R0 FDE
 FPDN:
         ZBSR *VFLT_TEN_B
-        ZBSR *VFLT_CMP
+        ZBSR *VFLT_CMP                  ; FA > 0 and FB > 0: no FSWAP, FB stays 10.0
         BCTR,LT FPUP
-        BSTA,UN DIV_BY_TEN
+        ZBSR *VFLT_DIV                  ; FA = FA / 10
         LODI,R0 1
-        BSTR,UN FDEADD
+FPAD:
+        ADDA,R0 FDE                     ; FDE += R0 (1 or $FF), then rescan
+        STRA,R0 FDE
         BCTR,UN FPDN
 FPUP:
         LODA,R0 FA
@@ -2799,13 +2796,7 @@ FPUP:
         BCFR,LT FPSC
         ZBSR *VMUL_BY_TEN
         LODI,R0 $FF
-        BSTR,UN FDEADD
-        BCTR,UN FPUP
-; FDEADD -- FDE += R0 (signed byte: 1 or $FF).  Clobbers R0.  RAS 0 (leaf).
-FDEADD:
-        ADDA,R0 FDE
-        STRA,R0 FDE
-        RETC,UN
+        BCTR,UN FPAD
 FPSC:
         EORZ,R0
         STRA,R0 DIGI
@@ -2816,48 +2807,38 @@ FPDIG:
         LODA,R1 DIGI
         STRA,R0 DIG-1,R1+               ; pre-increment: stores at DIG + DIGI
         STRA,R1 DIGI
-        ZBSR *VFROM_INT_B               ; FB = float(digit)
-        ZBSR *VFLT_SUB
-        LODA,R0 FA+1
-        BCFR,LT FPCL
-        ZBSR *VFLT_ZERO
-FPCL:
-        ZBSR *VMUL_BY_TEN
-        LODA,R1 DIGI
         COMI,R1 7
-        BCFR,EQ FPDIG
+        BCTR,EQ FPRD                    ; 7th digit stored: the remainder is not needed
+        ZBSR *VFROM_INT_B               ; FB = float(digit)
+        ZBSR *VFLT_SUB                  ; FA = FA - digit: exact and never negative (the digit is TRUNC(FA)), so no sign check
+        ZBSR *VMUL_BY_TEN
+        BCTR,UN FPDIG
 FPRD:
-        LODA,R0 DIG+6
+        LODA,R0 DIG,R1-                 ; R1 = 7 -> 6;  R0 = DIG[6], the guard digit
         COMI,R0 '5'
-        BCTR,LT FPNRD
-        LODI,R1 6
-FPRU:
-        LODA,R0 DIG-1,R1
-        ADDI,R0 1
-        STRA,R0 DIG-1,R1
-        COMI,R0 ':'
-        BCTR,LT FPNRD
-        LODI,R0 '0'
-        STRA,R0 DIG-1,R1
-        BDRR,R1 FPRU
-        LODI,R0 '1'
-        STRA,R0 DIG
-        LODI,R0 1
-        BSTA,UN FDEADD
-FPNRD:
-        LODI,R1 6
-FPST:
-        LODA,R0 DIG-1,R1
-        COMI,R0 '0'
-        BCFR,EQ FPSTD
-        BDRR,R1 FPST
-FPSTD:
-        STRA,R1 FPLIM                   ; FPLIM = significant digits (1..6)
-; Output as one loop over the decimal position P (R3, held +64 like FDE): from P0 = max(FDE,0) down to Pmin = min(FDE-FPLIM+1,0).
-; The digit at P is DIG[FDE-P] (a '0' when that index is outside 0..5); '.' goes in front of P = -1.
+        BCTR,LT FPTR
+        LODI,R0 '9'                     ; round up: skip the 9s from the right, add 1 to the first other digit
+        LODI,R2 1
+        BCTR,UN FPSCN
+FPTR:
+        LODI,R0 '0'                     ; truncate: skip the 0s from the right, add 0
+        LODI,R2 0
+FPSCN:
+        COMA,R0 DIG,R1-                 ; pre-decrement: R1 = index of the digit compared
+        BCFR,EQ FPOK
+        BRNR,R1 FPSCN
+        ZBSR *VFLT_TEN_B                ; DIG[0..5] all 9s and rounding up: restart with FA = 10 (= 1.0 and FDE + 1)
+        ZBSR *VFSWAP
+        BCTA,UN FPDN
+FPOK:
+        LODA,R0 DIG,R1
+        ADDZ,R2
+        STRA,R0 DIG,R1
+        STRA,R1 FPLIM                   ; FPLIM = index of the last significant digit (0..5); digits after it print as '0'
+; Output as one loop over the decimal position P (R3, held +64 like FDE): from P0 = max(FDE,0) down to Pmin = min(FDE-FPLIM,0).
+; The digit at P is DIG[FDE-P] (a '0' when that index is outside 0..FPLIM); '.' goes in front of P = -1.
         LODA,R0 FDE
         SUBA,R0 FPLIM
-        ADDI,R0 1
         COMI,R0 64
         BCTR,LT FPMN
         LODI,R0 64
@@ -2877,10 +2858,10 @@ FPOL:
 FPDG:
         LODA,R0 FDE
         SUBZ,R3
-        STRZ,R1                         ; R1 = FDE - P (unsigned: a negative index is >= 6)
+        STRZ,R1                         ; R1 = FDE - P (unsigned: a negative index is > FPLIM)
         LODI,R0 '0'
-        COMI,R1 6
-        BCFR,LT FPPC
+        COMA,R1 FPLIM
+        BCTR,GT FPPC
         LODA,R0 DIG,R1
 FPPC:
         ZBSR *VPUTC
@@ -2901,12 +2882,13 @@ E_PRINT:
 ; (flat): a helper that itself called HORNER_ODD would make 8.
 ;
 ; Algorithms (the 65C02 miniBASIC ones, with the 2650 differences noted):
-;   SIN/COS  y = |x|*2/PI, q = TRUNC(y), f = y-q, n = (q+offset) AND 3 (SIN 0, SIN of x<0: 2, COS 1), t = f or 1-f (n odd), r = t*P(t*t) =
-;            sin(PI*t/2), negate when n AND 2.  |x| above about 51471 gives ?R.
+;   SIN/COS  K = TRUNC(|x|/2PI), r = |x| - K*D1 - K*D2 (2PI = D1 + D2; SC_RED does one subtraction), y = r*2/PI, q = TRUNC(y), f = y-q, n = (q+offset) AND 3
+;            (SIN 0, SIN of x<0: 2, COS 1), t = f or 1-f (n odd), r = t*P(t*t) = sin(PI*t/2) clamped to 1, negate when n AND 2.  |x| >= 205887 gives ?R (K > 32767).
+;   TAN      SIN/COS: TAN_RET (X = x, SIN stage), TAN_2 (X = sin, COS stage), TAN_3 (sin / cos); COS = 0 gives ?Z.
 ;   ATN      t = |x| (or 1/|x| when |x| > 1), r = t*P(t*t), result PI/2 - r when reduced, sign of x restored.
-;   ASIN     asin(x) = atan(x/sqrt(1-x*x)) with 1-x*x taken as (1-x)(1+x) (exact near |x| = 1);  |x| >= 1 saturates to +-PI/2 as in the 65C02.
+;   ASIN     asin(x) = atan(x/sqrt(1-x*x)) with 1-x*x taken as (1-x)(1+x) (exact near |x| = 1);  |x| = 1 gives +-PI/2, |x| > 1 makes 1-x*x negative: SQR gives ?R.
 ;   ACOS     PI/2 - ASIN(x).
-;   SQR      EXP(0.5*LN(x)); x = 0 gives 0, x < 0 is clamped to 0 as in the 65C02 (no complex numbers, no error).
+;   SQR      EXP(0.5*LN(x)); x = 0 gives 0, x < 0 gives ?R (v1.7: the 65C02 clamps it to 0).
 ;   LN       x = m*2^E, m moved into [1/sqrt2, sqrt2) so that LN(1) is exactly 0;  z = (m-1)/(m+1);  ln m = z*Q(z*z);  result E*ln2 + ln m.  x <= 0 gives ?R.
 ;   EXP      k = TRUNC(x*log2e) (must fit a signed byte), r = x - k*ln2, exp(r) = P(r) (Horner), exponent += k.  Result overflow gives ?O, underflow 0.
 ;
@@ -2917,33 +2899,51 @@ E_PRINT:
 ; =============================================================================
 S_TRIG:
 ; -----------------------------------------------------------------------------
+; SC_RED -- one step of the SIN / COS argument reduction (Cody-Waite): ZSLOT = ZSLOT - K * (the next stream entry D)
+;   In     : ZSLOT = a, TSLOT = K (float), HPTR -> stream-1 at D, RS = 1
+;   Out    : FA = ZSLOT = a - K*D;  HPTR += 4
+;   Clobber: R0-R3 (alt), FA, FB, FDB, HPTR and the library scratch
+;   RAS    : 1 here + FLT_MUL / FLT_ADD and their inner call (base + 3 from the stage)
+SC_RED:
+        BSTA,UN LD_T            ; FB = K
+        ZBSR *VFSWAP            ; FA = K
+        ZBSR *VLD_B_PTR        ; FB = D
+        ZBSR *VFLT_MUL          ; FA = K*D
+        ZBSR *VFLT_NEGATE       ; FA = -K*D
+        BSTA,UN LD_Z            ; FB = a
+        ZBSR *VFLT_ADD          ; FA = a - K*D
+        BCTA,UN ST_Z            ; ZSLOT = FA (tail call: returns to the stage)
+; -----------------------------------------------------------------------------
 ; SIN_RET / COS_RET -- continuations: FA = x.  Flat stage: quadrant offset, stream SCT, then the whole SIN / COS body in the alternate bank.
 ;   In     : FA = x
-;   Out    : FA = SIN(x) / COS(x); RS = 0; ends in PARSER_RET (FN_END)
+;   Out    : FA = SIN(x) / COS(x), -1 <= FA <= 1; RS = 0; ends in PARSER_RET (FN_END)
 ;   Clobber: R0-R3 (both banks), FA, FB, FBG, FDB, T0, TS, QF, HPTR, HCNT and the library scratch;  R2/R3 of bank 0 are untouched
-;   Errors : |x| >= about 51471 -> ?R (FLT_TO_INT)
-;   RAS    : base + 4
+;   Errors : |x| >= 205887 -> ?R (FLT_TO_INT on K = TRUNC(|x|/2PI))
+;   RAS    : base + 4 (HORNER_ODD path; the SC_RED reduction is base + 3)
 SIN_RET:
         LODA,R0 FA+1
-        BCTR,LT SC_NEG          ; sign bit set: x < 0
-        EORZ,R0                 ; offset 0
-        BCTR,UN SC_GO
-SC_NEG:
-        LODI,R0 2               ; offset 2: SIN(-x) = -SIN(x) is n + 2
-;        BCTR,UN SC_GO
-        DB $EC
+        RRL,R0
+        RRL,R0
+        ANDI,R0 2               ; offset 2 when x < 0 (sign bit 7 -> bit 1): SIN(-x) = -SIN(x) is n + 2; else 0
+        DB $EC                  ; skips COS_RET's LODI
 COS_RET:
         LODI,R0 1               ; offset 1: COS(x) = SIN(x + PI/2); the sign of x does not matter
 SC_GO:
         STRA,R0 QF
         LODI,R0 >(SCT-1)
         ZBSR *VSETP
-        LODI,R0 5               ; number of coefficients in SCT
-        STRA,R0 HCNT
         PPSL PSW_RS
         BSTA,UN FLT_ABS         ; FA = |x|
+        BSTA,UN ST_Z            ; ZSLOT = |x|
+        ZBSR *VLD_B_PTR        ; FB = 1/(2PI)
+        ZBSR *VFLT_MUL          ; FA = |x| / 2PI
+        ZBSR *VFLT_TO_INT      ; T0:T0+1 = K = TRUNC(|x| / 2PI) (|x| >= 205887: ?R)
+        ZBSR *VFLT_FROM_INT    ; FA = K
+        BSTA,UN ST_T            ; TSLOT = K
+        BSTR,UN SC_RED          ; ZSLOT = |x| - K*D1 (exact)
+        BSTR,UN SC_RED          ; ZSLOT = FA = r = |x| - K*D1 - K*D2, about 0 <= r < 2PI (K may be one off: r then strays slightly outside, harmless)
         ZBSR *VLD_B_PTR        ; FB = 2/PI
-        ZBSR *VFLT_MUL          ; FA = y = |x| * 2/PI
+        ZBSR *VFLT_MUL          ; FA = y = r * 2/PI
         ZBSR *VFLT_TO_INT      ; T0:T0+1 = q = TRUNC(y); FA = y is left alone
         LODA,R0 QF
         ADDA,R0 T0+1            ; offset + low byte of q
@@ -2953,12 +2953,19 @@ SC_GO:
         ZBSR *VFLT_SUB         ; FA = f = y - q, 0 <= f < 1
         ZBSR *VLD_B_PTR        ; FB = 1.0 (always loaded: it keeps HPTR in step)
         LODA,R0 QF
-        ANDI,R0 1
-        BCTR,EQ SC_P            ; n even: t = f
+        RRR,R0                  ; bit 0 of n -> bit 7: LT when n is odd
+        BCFR,LT SC_P            ; n even: t = f
         ZBSR *VFLT_NEGATE
         ZBSR *VFLT_ADD          ; n odd: t = 1 - f  (FA = -f + FB)
 SC_P:
+        LODI,R0 5               ; number of coefficients in SCT
         BSTA,UN HORNER_ODD      ; FA = sin(PI*t/2)
+        LODA,R0 FA
+        COMI,R0 $81
+        BCTR,LT SC_Q            ; |r| < 1
+        LODI,R1 1
+        BSTA,UN F_ZERO          ; the polynomial can overshoot by an ulp (COS(0) = 1.0000001): FA = 1.0 ($81 00 00 00), so |SIN|, |COS| <= 1 and ASIN / SQR(1-S*S) stay in range
+SC_Q:
         LODA,R0 QF
         ANDI,R0 2
         BCTA,EQ FN_END
@@ -2991,16 +2998,14 @@ ATN_BODY:
         ZBSR *VFLT_DIV         ; FA = 1/a, 0 < 1/a < 1
 AT_NR:
         LODI,R0 8               ; number of coefficients in ATT
-        STRA,R0 HCNT
         BSTA,UN HORNER_ODD      ; FA = atan(t)
         LODA,R0 QF
-        ANDI,R0 1
-        BCTR,EQ AT_S
+        RRR,R0                  ; reduction flag (bit 0) -> bit 7
+        BCFR,LT AT_S
         BSTR,UN PIO2_SUB        ; reduced: FA = PI/2 - atan(1/a)
 AT_S:
         LODA,R0 QF
-        ANDI,R0 $80
-        BCFR,EQ SC_NG           ; x < 0: FA = -FA, as the end of SIN
+        BCTR,LT SC_NG           ; sign (bit 7) set, x < 0: FA = -FA, as the end of SIN
         ZBRR *VFN_END
 ; -----------------------------------------------------------------------------
 ; PIO2_B / PIO2_SUB -- the PI/2 constant is SIN's c0 (the last entry of SCT), not the entry after ATT, so it is fetched with SETP.
@@ -3052,7 +3057,7 @@ ACS_RET:
 ; -----------------------------------------------------------------------------
 ; ASN_RET -- ASIN(x), stage 1: FA = (1-x)(1+x), then SQR (a chain) and on to ASN_2
 ;   In     : FA = x
-;   Out    : continues in SQR_RET with FA = 1 - x*x (negative for |x| > 1: SQR clamps it to 0), ASN_2 pushed
+;   Out    : continues in SQR_RET with FA = 1 - x*x (negative for |x| > 1: SQR_RET gives ?R), ASN_2 pushed
 ;   Clobber: as SIN_RET;  XSLOT = x, TSLOT = x-1
 ;   RAS    : base + 3
 ASN_RET:
@@ -3079,18 +3084,16 @@ ASN_RET:
 ;        BCTR,UN SQR_RET
         ; drop through
 ; -----------------------------------------------------------------------------
-; SQR_RET / SQR_2 -- SQR(x) = EXP(0.5 * LN(x)).  x = 0 gives 0; x < 0 is clamped to 0 (as the 65C02).
+; SQR_RET / SQR_2 -- SQR(x) = EXP(0.5 * LN(x)).  x = 0 gives 0; x < 0 gives ?R (FP_RANGE).
 ;   In     : FA = x
 ;   Out    : FA = sqrt(x)
 SQR_RET:
-        LODA,R0 FA
-        BCFR,EQ SQ_NZ           ; x <> 0
-        ZBRR *VPARSER_RET       ; x = 0: FA = 0 already
-SQ_NZ:
         LODA,R0 FA+1
-        BCFR,LT SQ_POS
+        BCTA,LT FP_RANGE        ; x < 0: ?R (ASIN / ACOS of |x| > 1 arrive here with 1 - x*x < 0)
+        LODA,R0 FA
+        BCFR,EQ SQ_POS          ; x <> 0
         PPSL PSW_RS
-        ZBSR *VFLT_ZERO         ; x < 0: FA = 0
+        ZBSR *VFLT_ZERO         ; x = 0: FA = 0
         ZBRR *VFN_END
 SQ_POS:
         LODI,R0 >SQR_2
@@ -3102,54 +3105,43 @@ SQ_POS:
 ; LN_RET -- LN(x)
 ;   In     : FA = x
 ;   Out    : FA = ln(x);  x <= 0 gives ?R
-;   Clobber: as SIN_RET;  EK = E, ZSLOT = m then ln m, TSLOT = m-1
+;   Clobber: as SIN_RET;  T0+1 = E, ZSLOT = m then ln m, TSLOT = m+1
 ;   RAS    : base + 4
 LN_RET:
         LODA,R0 FA
         BCTA,EQ FP_RANGE        ; x = 0
         LODA,R0 FA+1
         BCTA,LT FP_RANGE        ; x < 0
-        LODA,R0 FA
-        SUBI,R0 $80
-        STRA,R0 EK              ; E = exponent - 128: x = m * 2^E with m in [0.5,1)
-        LODA,R0 FA+1
+        LODI,R1 $81             ; m * 2, in [1, 1.41): new exponent byte $81
         COMI,R0 $35             ; m < 1/sqrt2 ?  (mantissa byte below $35)
-        BCFR,LT LN_M
-        LODA,R0 EK
-        SUBI,R0 1
-        STRA,R0 EK              ; E - 1
-        LODI,R0 $81             ; m * 2, in [1, 1.41)
-;        BCTR,UN LN_S
-        DB $EC
-LN_M:
-        LODI,R0 $80
+        BCTR,LT LN_S
+        BDRR,R1 LN_S            ; m in [0.707, 1): new exponent byte $80 (the decrement is the point: the branch is to the next instruction)
 LN_S:
-        STRA,R0 FA              ; FA = m in [0.707, 1.414)
+        PPSL    $09             ; WC = 1, C = 1: a 16-bit subtract with no borrow pending
+        LODA,R0 FA
+        SUBZ,R1                 ; E = old exponent - new exponent byte: x = m * 2^E
+        STRA,R0 T0+1
+        EORZ,R0
+        SUBI,R0 0               ; 0 - borrow: the high byte, $FF when E < 0 (no FP routine used here touches T0:T0+1)
+        STRA,R0 T0
+        CPSL    $08
+        STRA,R1 FA              ; FA = m in [0.707, 1.414)
         LODI,R0 >(LNT-1)
         ZBSR *VSETP
         PPSL PSW_RS
         BSTA,UN ST_Z            ; X = m
         ZBSR *VLD_B_PTR        ; FB = 1.0
-        ZBSR *VFLT_SUB         ; FA = m - 1
-        BSTA,UN ST_T            ; T = m - 1
+        ZBSR *VFLT_ADD          ; FA = m + 1
+        BSTA,UN ST_T            ; T = m + 1
         BSTA,UN LD_Z            ; FB = m
         ZBSR *VFSWAP            ; FA = m
         ZBSR *VLD_B_PTR        ; FB = 1.0 (second entry)
-        ZBSR *VFLT_ADD          ; FA = m + 1
-        BSTA,UN LD_T            ; FB = m - 1
-        ZBSR *VFSWAP            ; FA = m - 1, FB = m + 1
+        ZBSR *VFLT_SUB         ; FA = m - 1
+        BSTA,UN LD_T            ; FB = m + 1
         ZBSR *VFLT_DIV         ; FA = z = (m-1)/(m+1)
         LODI,R0 4               ; number of coefficients in LNT
-        STRA,R0 HCNT
         BSTA,UN HORNER_ODD      ; FA = ln m
         BSTA,UN ST_Z            ; X = ln m
-        LODA,R0 EK
-        STRA,R0 T0+1
-        ANDI,R0 $80
-        BCTR,EQ LN_EP
-        LODI,R0 $FF
-LN_EP:
-        STRA,R0 T0              ; T0:T0+1 = E, sign extended
         BSTR,UN CILN2           ; FA = E * ln2 (ln2 is the entry after the coefficients)
         BSTA,UN LD_Z            ; FB = ln m
         ZBSR *VFLT_ADD          ; FA = E*ln2 + ln m
@@ -3159,7 +3151,7 @@ LN_EP:
 ; CILN2 -- FA = float(T0:T0+1) * ln2 (ln2 = the next stream entry).  Shared by LN (E) and EXP (k).
 ;   RAS    : 1 (+ FROM_INT's NEG16 / FLT_MUL's inner call)
 CILN2:
-        BSTA,UN FLT_FROM_INT
+        ZBSR *VFLT_FROM_INT
         ZBSR *VLD_B_PTR
         ZBRR *VFLT_MUL
 
@@ -3173,7 +3165,7 @@ SQR_2:
 ; -----------------------------------------------------------------------------
 ; EXP_RET -- EXP(x)
 ;   In     : FA = x
-;   Out    : FA = exp(x);  k = TRUNC(x*log2e) outside -128..127: above gives ?O, below gives 0;  |x*log2e| >= 32768 gives ?R (FLT_TO_INT)
+;   Out    : FA = exp(x);  |x*log2e| >= 128 (k outside a signed byte): positive gives ?O, negative gives 0, for any size of x;  the result may still overflow (?O) or underflow (0)
 ;   Clobber: as SIN_RET;  EK = k, ZSLOT = x
 ;   RAS    : base + 3
 EXP_RET:
@@ -3182,40 +3174,32 @@ EXP_RET:
         PPSL PSW_RS
         BSTA,UN ST_Z            ; X = x
         ZBSR *VLD_B_PTR        ; FB = log2e
-        ZBSR *VFLT_MUL          ; FA = x * log2e
-        ZBSR *VFLT_TO_INT      ; T0:T0+1 = k
+        ZBSR *VFLT_MUL          ; FA = y = x * log2e
+        LODA,R0 FA
+        COMI,R0 $88             ; |y| >= 128: k does not fit a signed byte (and FLT_TO_INT would raise ?R)
+        BCFR,LT EX_BIG
+        ZBSR *VFLT_TO_INT      ; T0:T0+1 = k (T0 = sign extension)
         LODA,R0 T0+1
         STRA,R0 EK
-        RRL,R0                  ; bit 7 -> bit 0
-        ANDI,R0 1
-        ADDA,R0 T0              ; T0 + bit 7 of the low byte: 0 when k fits a signed byte
-        BCFR,EQ EX_BIG
         BSTR,UN CILN2           ; FA = k * ln2
         BSTA,UN LD_Z            ; FB = x
         ZBSR *VFSWAP            ; FA = x, FB = k*ln2
         ZBSR *VFLT_SUB         ; FA = r = x - k*ln2
         LODI,R0 8               ; number of coefficients in EXPT
-        STRA,R0 HCNT
         BSTA,UN HORNER_EVAL     ; FA = exp(r), 0.5 < exp(r) < 2
-        LODA,R0 FA
-        ADDA,R0 EK              ; exponent + k
-        STRA,R0 FA
-        TPSL $01
-        BCTR,EQ EX_C            ; carry out
-        LODA,R0 EK              ; no carry: fine for k >= 0, exponent < 0 for k < 0
-        BCTR,LT EX_ZERO
-        ZBRR *VFN_END
-EX_C:
         LODA,R0 EK
-        BCFR,LT FP_OVF          ; carry with k >= 0: exponent > 255
-        LODA,R0 FA
-        BCFA,EQ FN_END          ; k < 0: exponent byte <> 0 (a signed test would reject exponents >= $80)
+        EORI,R0 $80             ; k + 128: the biased exponent EXPCHK expects (as FLT_MUL's eb)
+        ADDA,R0 FA              ; + the exponent of exp(r)
+        BSTA,UN EXPCHK          ; R0 = exponent + k, 0 (EQ) on underflow, overflow = ?O
+        BCTR,EQ EX_ZERO
+        STRA,R0 FA
+        ZBRR *VFN_END
 EX_ZERO:
         ZBSR *VFLT_ZERO         ; underflow: 0
         ZBRR *VFN_END
 EX_BIG:
-        LODA,R0 T0
-        BCTR,LT EX_ZERO         ; k < -128: 0
+        LODA,R0 FA+1
+        BCTR,LT EX_ZERO         ; y <= -128: underflow, 0
  ;       BCTA,UN FP_OVF          ; k > 127: ?O
         ; drop through
 ; -----------------------------------------------------------------------------
@@ -3224,7 +3208,7 @@ EX_BIG:
 ; FP_RANGE -- error exit 'R' (FIX out of range).  Entered by jump from FLT_TO_INT; never returns.
 ; FP_OVF and FP_DZERR share the tail through the skip-2 idiom DB $EC (ISA self-test T19): it swallows the
 ; following 2-byte LODI,R0, so each entry loads its own letter and runs into the common CPSL $10 / ZBRR.
-;   Out    : R0 = 'O', RS=0, then ZBRR *VDO_ERROR
+;   Out    : R0 = 'O', RS=0, then BCTA,UN DO_ERROR
 ;   Clobber: CC
 ;   RAS    : 0 (no call is made; the pending return addresses are abandoned)
 FP_OVF:
@@ -3236,7 +3220,7 @@ FP_DZERR:
 FP_RANGE:
         LODI,R0 'R'
         CPSL    $10
-        ZBRR    *VDO_ERROR
+        BCTA,UN DO_ERROR
 E_ERR:
 
 ; -----------------------------------------------------------------------------
@@ -3273,25 +3257,28 @@ LFB_L:
 
 ; -----------------------------------------------------------------------------
 ; HORNER_ODD -- FA = t * P(t*t) with P from the coefficient stream (highest power first)
-;   In     : FA = t, HPTR -> stream-1, HCNT = number of coefficients (>= 1), RS = 1
+;   In     : FA = t, HPTR -> stream-1, R0 = number of coefficients (>= 1; stored to HCNT here), RS = 1
 ;   Out    : FA = t * P(t*t); HPTR advanced past the coefficients;  HCNT = 0
 ;   Clobber: R0-R3, FA, FB, TS (t in TSLOT, z in ZSLOT), HPTR, HCNT, and the FLT_MUL / FLT_ADD scratch
 ;   RAS    : 2 here (HORNER_EVAL) + FLT_MUL / FLT_ADD and their inner call
 HORNER_ODD:
+        STRA,R0 HCNT            ; HCNT = R0 = number of coefficients
         BSTR,UN ST_T            ; TS[t] = t
         BSTR,UN LD_T            ; FB = t
         ZBSR *VFLT_MUL          ; FA = z = t*t
-        BSTR,UN HORNER_EVAL     ; FA = P(z)
+        BSTR,UN HE_B            ; FA = P(z)  (HCNT is already set)
         BSTR,UN LD_T            ; FB = t
         ZBRR *VFLT_MUL          ; FA = P(z) * t (tail call)
 
 ; -----------------------------------------------------------------------------
 ; HORNER_EVAL -- FA = P(z), P from the coefficient stream (highest power first), by Horner's rule
-;   In     : FA = z, HPTR -> stream-1, HCNT = number of coefficients (>= 1), RS = 1
+;   In     : FA = z, HPTR -> stream-1, R0 = number of coefficients (>= 1; stored to HCNT here), RS = 1
 ;   Out    : FA = P(z); HPTR advanced past the coefficients;  HCNT = 0
 ;   Clobber: R0-R3, FA, FB, TS (z in ZSLOT), HPTR, HCNT, and the FLT_MUL / FLT_ADD scratch
 ;   RAS    : 1 here + FLT_MUL / FLT_ADD and their inner call
 HORNER_EVAL:
+        STRA,R0 HCNT            ; HCNT = R0 = number of coefficients
+HE_B:
         BSTR,UN ST_Z            ; TS[z] = z
         BSTR,UN LD_B_PTR        ; FB = first (highest) coefficient
         ZBSR *VFSWAP            ; FA = S = c(n-1), FB = z
@@ -3324,12 +3311,48 @@ LBP_L:
         RETC,UN
 
 ; -----------------------------------------------------------------------------
+; TAN_RET / TAN_2 / TAN_3 -- TAN(x) = SIN(x) / COS(x), a chain of three stages (the hardware return stack never nests).
+;   TAN_RET : XSLOT = x, pushes TAN_3 then TAN_2, runs SIN_RET.   TAN_2 : FA = sin: XSLOT = sin, FA = x, runs COS_RET.   TAN_3 : FA = cos: FA = sin / cos.
+;   In     : FA = x
+;   Out    : FA = tan(x)
+;   Errors : |x| >= 205887 -> ?R (SIN / COS);  COS = 0 -> ?Z (FLT_DIV; the float nearest PI/2 has COS = 0 here);  a quotient above 1.7E38 -> ?O (FLT_DIV)
+;   Clobber: as SIN_RET, plus XSLOT
+;   RAS    : base + 4 (SIN / COS stage; the stages themselves only call the ST_FA / LD_FB leaves)
+TAN_RET:
+        PPSL PSW_RS
+        LODI,R2 XSLOT
+        BSTA,UN ST_FA           ; X = x
+        CPSL PSW_RS             ; PUSH_RET works in bank 0 (R3 = the SW stack count)
+        LODI,R0 >TAN_3
+        LODI,R1 <TAN_3
+        ZBSR *VPUSH_RET
+        LODI,R0 >TAN_2
+        LODI,R1 <TAN_2
+        ZBSR *VPUSH_RET
+        BCTA,UN SIN_RET         ; FA = sin(x), then TAN_2
+TAN_2:
+        PPSL PSW_RS
+        LODI,R2 XSLOT
+        BSTA,UN LD_FB           ; FB = x
+        LODI,R2 XSLOT
+        BSTA,UN ST_FA           ; X = sin(x)
+        ZBSR *VFSWAP            ; FA = x
+        BCTA,UN COS_RET         ; FA = cos(x), then TAN_3
+TAN_3:
+        PPSL PSW_RS
+        LODI,R2 XSLOT
+        BSTA,UN LD_FB           ; FB = sin(x)
+        ZBSR *VFSWAP            ; FA = sin, FB = cos
+        ZBSR *VFLT_DIV          ; FA = sin / cos
+        ZBRR *VFN_END
+
+; -----------------------------------------------------------------------------
 ; DO_POW -- operator '^':  x^y   (entered through JMP_VEC from OPS_HIT_RET: FB = x, FA = y)
 ;   Method : y an integer 0..255: FA = 1, then FA = FA * x, y times (exact whenever the products are; x may be zero or negative; x^0 = 1).
 ;            Any other y: x^y = EXP(y * LN(x)) as a chain of stages (LN stage, POW_2 = multiply by y, EXP stage); needs x > 0.
 ;   Out    : FA = x^y; control resumes through FN_END / the next continuation (PARSER_RET)
 ;   Errors : ?O overflow (multiply or EXP);  ?R from LN when x <= 0 and y is not an integer 0..255
-;   Clobber: R0-R3, FA, FB, T0, HCNT, TS (TSLOT = x, XSLOT = y) and the FP library scratch
+;   Clobber: R0-R3, FA, FB, T0 (T0+1 = the repeat count), TS (TSLOT = x, XSLOT = y) and the FP library scratch
 ;   RAS    : base + 2 on the integer path; base + 4 on the chain (as every function stage)
 DO_POW:
         PPSL PSW_RS
@@ -3342,19 +3365,17 @@ DO_POW:
         ZBSR *VFLT_TO_INT              ; T0:T0+1 = TRUNC(y); FA = y is left alone
         LODA,R0 T0
         BCFR,EQ POW_EL                  ; y < 0
-        LODA,R0 T0+1
-        STRA,R0 HCNT                    ; HCNT = n = TRUNC(y)
-        ZBSR *VFROM_INT_B               ; FB = float(n)
+        ZBSR *VFROM_INT_B               ; FB = float(n); T0+1 = n = TRUNC(y) survives (FLT_FROM_INT only changes T0:T0+1 of a negative)
         ZBSR *VFLT_CMP
         BCFR,EQ POW_EL                  ; y has a fraction
         ZBSR *VFLT_ZERO
         LODI,R0 $81
         STRA,R0 FA                      ; FA = 1.0
 POW_LP:
-        LODA,R0 HCNT
+        LODA,R0 T0+1
         BCTA,EQ FN_END                  ; n = 0 left: done
         SUBI,R0 1
-        STRA,R0 HCNT
+        STRA,R0 T0+1
         BSTA,UN LD_T                    ; FB = x
         ZBSR *VFLT_MUL                  ; FA = FA * x
         BCTR,UN POW_LP
@@ -3460,12 +3481,11 @@ PUSH_RET:
         COMI,R3 SWCAP_LIMIT                  ; R3 = byte count = index of the first free byte (COM=1: unsigned)
         BCTR,LT PR_ROOM
         LODI,R0 ERR_EXPR
-        ZBRR *VDO_ERROR                     ; tail call and bail (R3 is reset by the next EXPR)
+        BCTA,UN DO_ERROR                     ; tail call and bail (R3 is reset by the next EXPR)
 PR_ROOM:
         STRA,R0 SWBASE-1,R3+                ; push lo the pre-increment lands on SWBASE + old count
         LODZ,R1                              ; R0 = R1 (hi byte)
         STRA,R0 SWBASE-1,R3+                ; push hi (R3 ends = the new byte count)
-        RETC,UN
         RETC,UN
 
 ; -----------------------------------------------------------------------------
@@ -3503,14 +3523,55 @@ SET_TMP_PROG:
 ;   Clobber: R0
 SETP:
         STRA,R0 HPTR+1
-        LODI,R0 <SCT
+        EORZ,R0                 ; the streams sit in page 0 (build guard at E_TBL): <SCT = 0
         STRA,R0 HPTR
         RETC,UN
 
 
-; #############################################################################
-;  TABLES 
-; #############################################################################
+; =============================================================================
+;  GETLINE -- Read a line from input into IBUF; also points IP at it
+;  Editing (v1.7): BS ($08) or DEL ($7F) erases the last character (echoed as BS, space, BS) and is ignored at the start of the line; the line holds at
+;  most 63 characters (IBUF is 64 bytes, the last is the NUL), further characters are ignored (no echo) until CR.  Any other control code up to CR (LF, TAB, ...) still
+;  ends the line, as before.
+; In:  nothing
+; Out: IBUF = NUL-terminated input line, 0..63 characters; IPH:IPL = IBUF (both callers used
+;      to re-point IP via a separate SET_IP_IBUF call right after this -
+;      folded in here instead). 
+; Clobbers: R0, R1 (R1 = index of the last character stored, $FF when empty: the pre-increment convention)
+GETLINE:
+        LODI,R0 <IBUF
+        STRA,R0 IPH
+        LODI,R0 >IBUF
+        STRA,R0 IPL
+        LODI,R1 $FF                      ; R1 = empty-buffer sentinel (pre-inc convention)
+GL_LP:
+        BSTA,UN PRE_CHIN                 ; [+1] blocking read (stirs the RND LFSR first)
+        COMI,R0 $7F
+        BCTR,EQ GL_BS                    ; DEL
+        COMI,R0 8
+        BCTR,EQ GL_BS                    ; BS
+        COMI,R0 CR+1
+        BCTR,LT GL_EOL                  ; everything less than CR
+        COMI,R1 62                       ; 63 characters held: ignore the rest
+        BCTR,EQ GL_LP
+        STRA,R0 IBUF,R1+                 ; R1++ (pre-inc); IBUF[R1]=char
+        ZBSR *VCOUT  
+        BCTR,UN GL_LP
+GL_BS:
+        COMI,R1 $FF                      ; empty line: nothing to erase
+        BCTR,EQ GL_LP
+        SUBI,R1 1
+        LODI,R0 8
+        ZBSR *VCOUT                      ; BS, space, BS (COUT clobbers R0, not R1)
+        ZBSR *VPRT_SPACE
+        LODI,R0 8
+        ZBSR *VCOUT
+        BCTR,UN GL_LP
+GL_EOL:
+        EORZ,R0
+        STRA,R0 IBUF,R1+                 ; R1++ (pre-inc, one past last char); NUL-terminate
+        BCTA,UN PRT_CRLF                ; tail call
+
 FNK:
         DB A'A',A'B'
         DB A'S',A'I'
@@ -3519,6 +3580,7 @@ FNK:
         DB A'A',A'S'
         DB A'A',A'C'
         DB A'S',A'Q'
+        DB A'T',A'A'
         DB A'L',A'N'
         DB A'E',A'X'
         DB A'I',A'N'
@@ -3531,12 +3593,13 @@ FNA:
         DB <ASN_RET,>ASN_RET
         DB <ACS_RET,>ACS_RET
         DB <SQR_RET,>SQR_RET
+        DB <TAN_RET,>TAN_RET
         DB <LN_RET,>LN_RET
         DB <EXP_RET,>EXP_RET
         DB <INT_RET,>INT_RET
 
 BANNER:
-        DB CR, LF, "miniBASIC2650 1.6", CR, LF,"Bytes Free:", NUL        
+        DB CR, LF, "miniBASIC2650 1.7", CR, LF,"Bytes Free:", NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -3569,60 +3632,6 @@ TOK_CHARS:
                                           ; this re-dispatches the statement after it
         DB NUL
 
-
-; Streams (4 bytes per entry, MBF4 [E][S|M1][M2][M3]); all in ONE page, checked at assembly time by the RES guard at E_TBL (the tables float: no ORG pin).
-; tools/gen_coeffs.py makes every entry.
-; SCT : SIN / COS:  2/PI, 1.0, c4..c0 of sin(PI*t/2) = t * (c0 + c1 t^2 + ... + c4 t^8)
-SCT:
-        DB $80,$22,$F9,$83          ; 2/PI = 0.6366197467
-        DB $81,$00,$00,$00          ; 1.0 = 1
-        DB $74,$1F,$CE,$19          ; c4 = 0.00015240199
-        DB $79,$99,$37,$F9          ; c3 = -0.00467586191
-        DB $7D,$23,$35,$25          ; c2 = 0.0796912089
-        DB $80,$A5,$5D,$E7          ; c1 = -0.645964086
-PIO2:
-        DB $81,$49,$0F,$DB          ; c0 = 1.570796371
-; ONES + ATT : ASIN reads ONES and the first entry of ATT (1.0, 1.0); ATN reads ATT (PIO2 = SIN's c0 is fetched with SETP, PIO2_B):  1.0, c7..c0 of atan(t) = t * P(t^2)
-;ONES:
-;        DB $81,$00,$00,$00          ; 1.0 = 1
-ATT:
-        DB $81,$00,$00,$00          ; 1.0 = 1
-        DB $79,$87,$4E,$26          ; c7 = -0.00412918907
-        DB $7B,$35,$86,$4C          ; c6 = 0.0221587643
-        DB $7C,$E6,$E9,$FA          ; c5 = -0.0563754812
-        DB $7D,$46,$38,$30          ; c4 = 0.0967868567
-        DB $7E,$8E,$94,$B7          ; c3 = -0.139239177
-        DB $7E,$4C,$49,$71          ; c2 = 0.199498907
-        DB $7F,$AA,$A6,$90          ; c1 = -0.333302021
-        DB $80,$7F,$FF,$F7          ; c0 = 0.999999464
-;PIO2:
-;        DB $81,$49,$0F,$DB          ; PI/2 = 1.570796371
-; EXPT : EXP:  log2e, ln2, c7..c0 of exp(r) = c0 + c1 r + ... + c7 r^7
-EXPT:
-        DB $81,$38,$AA,$3B          ; LOG2E = 1.442695022
-        DB $80,$31,$72,$18          ; LN2 = 0.6931471825
-        DB $74,$5B,$35,$23          ; c7 = 0.000209052625
-        DB $77,$38,$8C,$00          ; c6 = 0.00140798092
-        DB $7A,$08,$6A,$DC          ; c5 = 0.00832625851
-        DB $7C,$2A,$A7,$07          ; c4 = 0.0416631959
-        DB $7E,$2A,$AA,$FD          ; c3 = 0.166667894
-        DB $80,$00,$00,$00          ; c2 = 0.5
-;        DB $81,$00,$00,$00          ; c1 = 1
-;        DB $81,$00,$00,$00          ; c0 = 1
-
-; LNT : LN:  1.0, 1.0, q3..q0 of ln(m) = z * (q0 + q1 z^2 + q2 z^4 + q3 z^6), then ln2
-LNT:
-ONES:
-        DB $81,$00,$00,$00          ; 1.0 = 1
-        DB $81,$00,$00,$00          ; 1.0 = 1
-        DB $7F,$18,$17,$3D          ; c3 = 0.297052294
-        DB $7F,$4C,$BA,$40          ; c2 = 0.399858475
-        DB $80,$2A,$AA,$AD          ; c1 = 0.666666806
-        DB $82,$00,$00,$00          ; c0 = 2
-        DB $80,$31,$72,$18          ; LN2 = 0.6931471825
-
-E_TBL:
-        RES (<SCT)-(<(E_TBL-1))         ; build guard: a negative count is an ERROR unless SCT..E_TBL-1 lie in ONE page (SETP puts SCT's page in HPTR for every stream)
 
 ROMEND: 
 
@@ -3698,10 +3707,8 @@ FB      RES     4               ; FLT_B [E][S|M1][M2][M3]: right operand (FB = F
 FBG     RES     1               ; FB+4: guard byte below FB's mantissa
 FSA     RES     1               ; result sign (bit 7); FA's sign inside FLT_ADD
 FER     RES     1               ; working result exponent
-FMA     RES     3               ; MUL multiplicand copy (hi,mid,lo); also the DIV divisor FDV (MUL and DIV never overlap); 3 bytes here fill FSA..FSB
-FDV     EQU     FMA             ; DIV divisor (hi,mid,lo)
-FSB     RES     1               ; FB's sign (bit 7), FLT_ADD only.  MUST be FSA+5 (FLT_ADD's sign loop indexes FSA by 0 / 5)
-RD      RES     3               ; DIV remainder (hi,mid,lo)
+FMA     RES     3               ; MUL multiplier copy (hi,mid,lo; FSB below it is its 4th byte); DIV: the quotient FMA..FSB;  3 bytes here fill FSA..FSB
+FSB     RES     1               ; FB's sign (bit 7), FLT_ADD only.  MUST be FSA+5 (FLT_ADD's sign loop indexes FSA by 0 / 5);  MUL: 4th multiplier byte;  DIV: quotient low byte
 DIG     RES     8               ; PRINT digit buffer, DIG..DIG+6 used (the 65C02 used IBUF; here a private buffer)
 PSAVE   RES     4               ; FLT_PARSE: byte 0 = D, 1 once a '.' has been seen (each digit then counts K down);  bytes 1..3 are free (XSLOT)
 ; The function routines borrow RAM that is free while a function is evaluated.  FLT_PRINT fills DIG only after the expression has
@@ -3716,8 +3723,8 @@ HPTR    RES     2               ; coefficient-stream pointer, high byte first, p
 HCNT    RES     1               ; Horner: coefficients still to apply
 EK      RES     1               ; LN: E (exponent - 128);  EXP: k
 ; PRINT and PARSE scratch share the function-stage scratch above: a stage never runs inside FLT_PRINT or FLT_PARSE, nor they inside a stage
-FDE     EQU QF          ; PRINT decimal exponent (live across MUL_BY_TEN, DIV_BY_TEN, FLT_TO_INT)
-FPLIM   EQU HCNT        ; PRINT: number of significant digits after trimming trailing zeros
+FDE     EQU QF          ; PRINT decimal exponent (live across MUL_BY_TEN, FLT_DIV, FLT_TO_INT)
+FPLIM   EQU HCNT        ; PRINT: index of the last significant digit in DIG (0..5)
 FPY     EQU EK          ; PRINT: index of the next digit in DIG
 DIGI    EQU HPTR        ; PRINT: digits extracted so far (0..7)
 FPN     EQU HPTR+1      ; PARSE: K, the decimal exponent adjust (minus the fraction digits, plus the exponent), a signed byte
@@ -3741,7 +3748,7 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;                 expression), E notation and PI (588); 590 jumps to 660
 ;  Lines 660-732: Hypnotic Eye (ported from minibasic65c02): 61 x 19 character ripple, SIN damped by EXP(-5e-1*LN(D)^2): SQR, SIN, EXP, LN, ^ on a
 ;                 function result, E notation (5e-2, 5e-1); the centre is skipped, LN(0) is ?R
-;  Lines 800-896: Spiral Vortex (ported from minibasic65c02): 61 x 27 pixel scan, ATN(Y/X) (|Y/X| > 1 uses the reduced path), SIN, COS (TAN = SIN/COS),
+;  Lines 800-896: Spiral Vortex (ported from minibasic65c02): 61 x 27 pixel scan, ATN(Y/X) (|Y/X| > 1 uses the reduced path), SIN, COS, TAN (line 844),
 ;                 ACOS and ASIN of a value near 1, SQR, PI; TAB(C-L) skips the columns outside the vortex; 896 jumps to 300
 ;  Lines 300-650: Mandelbrot set, floating point: 44 columns x 21 rows, escape count in a GOSUB'd FOR loop (levels: 2 loops + 1 inside the sub)
 ;
@@ -3749,7 +3756,9 @@ T0      EQU EXPH            ; FLT_TO_INT result / FLT_FROM_INT input = EXPH:EXPL
 ;     PRINT 1/0           ?Z   divide by zero (inside a running program: ?Z@line)
 ;     PRINT 100000*100000*100000*100000*100000*100000*100000*100000   ?O   overflow (result beyond about 1.7E38)
 ;     PRINT TAB(40000)    ?R   integer use out of range (|x| >= 32768: TAB(, CHR$(, GOTO/GOSUB target, line number)
-;     PRINT SIN(60000)    ?R   SIN/COS argument beyond about +-51471 (|x|*2/PI >= 32768)
+;     PRINT SIN(1e6)      ?R   SIN/COS/TAN argument beyond about +-205887 (|x|/2PI >= 32768)
+;     PRINT TAN(1.5707964) ?Z  COS is exactly 0 there (TAN = SIN/COS)
+;     PRINT ASIN(2)       ?R   ASIN / ACOS of |x| > 1 (and SQR(-1): ?R, a domain error)
 ;     PRINT LN(0)         ?R   LN of zero or of a negative number
 ;     PRINT EXP(89)       ?O   EXP result beyond about 1.7E38 (so is EXP(1000); EXP of a large negative number gives 0)
 ;     PRINT 2^128         ?O   power beyond about 1.7E38;   PRINT (-2)^0.5   ?R   non-integer power of a negative base (LN)
@@ -3865,7 +3874,7 @@ PROG:
         DB 2,58,"PRINT ",DQ,"--- ATN ASIN ACOS SQR LN EXP ---",DQ,$00 ; 570  other functions
         DB 2,60,"PRINT ",DQ,"4*ATN(1)=",DQ,";4*ATN(1);",DQ," ASIN(.5)=",DQ,";ASIN(0.5)",$00 ; 572 3.14159  0.523599
         DB 2,62,"PRINT ",DQ,"SQR(2)=",DQ,";SQR(2);",DQ," LN(10)=",DQ,";LN(10);",DQ," EXP(1)=",DQ,";EXP(1)",$00 ; 574 1.41421  2.30259  2.71828
-        DB 2,64,"PRINT ",DQ,"SIN(ASIN(.3))=",DQ,";SIN(ASIN(0.3))",$00 ; 576 0.3, functions nest
+        DB 2,64,"PRINT ",DQ,"SIN(ASIN(.3))=",DQ,";SIN(ASIN(0.3));",DQ," TAN(1)=",DQ,";TAN(1)",$00 ; 576 0.3, functions nest;  TAN(1) = 1.55741
         DB 2,66,"PRINT ",DQ,"2^10=",DQ,";2^10;",DQ," 2^0.5=",DQ,";2^0.5;",DQ," 2^-2=",DQ,";2^-2",$00 ; 578 1024  1.41421  0.25
         DB 2,68,"PRINT ",DQ,"2^3^2=",DQ,";2^3^2;",DQ," -2^2=",DQ,";-2^2;",DQ," 10^0.3=",DQ,";10^0.3",$00 ; 580 512 (right assoc.)  -4  1.99526
         DB 2,70,"PRINT ",DQ,"INT(2.7)=",DQ,";INT(2.7);",DQ," INT(-2.7)=",DQ,";INT(-2.7)",$00 ; 582 2  -3 (floor, not truncation)
@@ -3901,7 +3910,7 @@ PROG:
         DB 2,212,"NEXT C",$00        ; 724
         DB 2,216,"PRINT",$00        ; 728
         DB 2,220,"NEXT R",$00        ; 732
-        ; ---- Spiral Vortex (65C02 showcase): ATN, SIN/COS (TAN = SIN/COS), ACOS, ASIN, SQR, PI; TAB(C-L) skips the columns outside D>1.2 ----
+        ; ---- Spiral Vortex (65C02 showcase): ATN, SIN/COS, TAN, ACOS, ASIN, SQR, PI; TAB(C-L) skips the columns outside D>1.2 ----
         DB 3,32,"PRINT ",DQ,"=== SPIRAL VORTEX: ATN ASIN ACOS PI ===",DQ,$00        ; 800
         DB 3,36,"FOR R=0 TO 26",$00        ; 804
         DB 3,40,"L=0",$00        ; 808
@@ -3913,7 +3922,7 @@ PROG:
         DB 3,64,"T=PI/2",$00        ; 832
         DB 3,68,"IF X!=0 T=ATN(Y/X)",$00        ; 836
         DB 3,72,"W=SIN(6*D-3*T)",$00        ; 840
-        DB 3,76,"U=SIN(W/2)/COS(W/2)",$00        ; 844
+        DB 3,76,"U=TAN(W/2)",$00        ; 844
         DB 3,80,"P=COS(U)",$00        ; 848
         DB 3,84,"Z=ABS(ACOS(P)-ASIN(P))/PI",$00        ; 852
         DB 3,88,"S=32",$00        ; 856
