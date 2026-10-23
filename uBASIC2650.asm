@@ -1,24 +1,20 @@
 ; =============================================================================
-; uBASIC2650 v2.14  --  Integer Tiny BASIC for the Signetics 2650
+; uBASIC2650 v2.15  --  Integer Tiny BASIC for the Signetics 2650
 ; Copyright (c) 2026 Vincent Crabtree, licensed under the MIT License, see LICENSE
 ;
 ; Note: standalone build - I/O is bit-banged in software, no PIPBUG ROM or
 ; UART/ACIA hardware required.
 ;
 ;   CPU    : Signetics 2650
-;   ROM    : <2 KB target, $0000 upward (currently 1784 bytes, ROMEND $06F8)
+;   ROM    : <2 KB target, $0000 upward (currently 1772 bytes, ROMEND $06EC)
 ;   RAM    : ~213 bytes, $1000 upward (half an 8 KB page above the code)
 ;   I/O    : CHIN/COUT, bit-banged software serial via PSU/PSL flag bits.
 ;            Addresses float per build - read them from the .LST (see BUILD)
 ;   NMI/IRQ: Not used
 ;
 ; USAGE
-;   Burn the image at $0000 (fits a 2716); RAM starts at $1000. Reset enters at
-;   $0000. The banner and "Free:<bytes>" print, then the ">" prompt. Type a
-;   statement to run it at once, or start a line with a number (0-32767) to store
-;   it in the program; a number alone deletes that line. RUN executes the stored
-;   program, LIST prints it, NEW clears it. A demo program is preloaded: RUN it,
-;   or NEW first. Serial is 110 baud, bit-banged on SENSE (in) / FLAG (out).
+;   A demo program is preloaded: RUN it, or NEW first. 
+;   Serial is 110 baud, bit-banged on SENSE (in) / FLAG (out).
 ;   Errors print "?n" (plus "@line" while running): 0 syntax, 2 divide by zero,
 ;   3 out of memory/stack, 4 bad variable, 8 expression too complex.
 ;
@@ -77,13 +73,9 @@
 ;   - STEP 0 loops forever (var never passes the limit) - no check for it.
 ;   - Leaving a loop early (GOTO / GOSUB target outside it) not permitted.
 ;
-; RUN-STATE LIMITATIONS (v2.14)
-;   - LIST inside a running program prints the listing and then ends the run:
-;     the program counter (SWSTK) is the listing cursor, so it is left at the
-;     end of the program.
-;   - GOSUB/FOR state does not survive past the line that created it: the
-;     prompt clears the GOSUB and FOR stacks before every line, so an immediate
-;     "FOR ..." then a later "NEXT" at the prompt gives ?3 (nothing to NEXT).
+; RUN-STATE LIMITATIONS (v2.15)
+;   - LIST inside a running program prints the listing and then ends the run
+;   - GOSUB/FOR from command prompt is nonsensical.
 ;   - Unary plus is not accepted ("+5" is a syntax error); unary minus is.
 ;
 ; STATEMENT DISPATCH matches ONLY the first character of a line.
@@ -108,7 +100,7 @@
 ;   gcc -Wall -O2 -o asm2650 asm2650.c
 ;   gcc -O2 -DGAMER -o pipbug_wrap pipbug_wrap.c
 ;
-;   ./asm2650 --warn=all uBASIC2650.asm uBASIC2650.hex
+;   ./asm2650 --warn=ALL uBASIC2650.asm uBASIC2650.hex
 ;   grep -n "^CHIN \|^COUT \|^ROMEND " .\uBASIC2650.LST
 ;   ./pipbug_wrap --entry 0 --chin 0x<addr> --cout 0x<addr> uBASIC2650.hex
 ;
@@ -150,27 +142,34 @@
 ; VERSION HISTORY 
 ; =============================================================================
 ;
-; v2.14 (Oct 2026) - Golf ported from pBASIC2650 v0.35. ROMEND $06F8 (1784 bytes)
-;   - BUG FIX: PRINT_S16 called COUT with WC=1, COUT's RRR would rotate through
-;     carry, but Simulator intercepted COUT would not error. WC now cleared before.
+; v2.15 (Oct 2026) - ROMEND $06EC (1772 bytes)
+;   - FIX: GOTO from prompt runs the program from that line.
+;   - A blank line (or all spaces) and an empty IF body no longer print ?4
+;   - As per pBASIC6502 v2.1, RUNFLG deleted: END jump to REPL, prog edn & NEW 
+;     exit via  DR_LP's PC >= PE test
+;   - INC_ET: BCFR,EQ straight after the ADDI/STRA replaces TPSL $01 / BCTR,LT
+;   - CHIN: dead LODI,R0 $80 before SPSU removed 
+;
+; v2.14 (Oct 2026) -pBASIC2650 v0.35 ports, $06F8 (1784 bytes)
+;   - BUG FIX: PRINT_S16 called COUT with WC=1 (COUT's RRR would rotate through
+;     carry); WC is now cleared before the first COUT. The simulator intercepts
+;     COUT so it could not show this.
 ;   - PRINT_S16: WC/carry set once per column (PPSL $09), digit counted with BIRR,
 ;     leading-zero flag is the OR of the digit counts (-4).
-;   - Program counter is now SWSTK (was TMP, copied to/from SWSTK every
-;     line): DO_RUN/DO_GOTO/FIND_LINE/ADV_PC_PAST_REC/DEL_REC/OPEN_GAP/DO_LIST
-;     all walk SWSTK directly. INC_TMP/CMP_TMP_PE/SET_TMP_PROG/ADV_TMP_PAST_REC
-;     renamed INC_PC/CMP_PC_PE/SET_PC_PROG/ADV_PC_PAST_REC.
+;   - Program Counter is now SWSTK: DO_RUN/DO_GOTO/FIND_LINE/ADV_PC_PAST_REC/
+;     DEL_REC/OPEN_GAP/DO_LISTall walk SWSTK directly
 ;   - REPL now calls CLR_RUNFLG before every line (MAIN and DO_ERROR no longer do):
-;     run state, GOSUB and FOR stacks are always empty at the prompt
+;     run state, GOSUB and FOR stacks are always empty at the prompt 
 ;   - OPS_HIT_COM pushes [R1][EXPL][EXPH] with a BRNR loop; OPS_HIT_RET pops in
-;     the matching order (-2). DO_NEW copies PROG to PE via SWSTK/REG16
+;     the matching order (-2). DO_NEW copies PROG to PE via SWSTK/REG16 (-4).
 ;   - ABS_X (EXP or TMP via R1, falls into NEG_SHARED) + MD_PREP replace ABS_TMP,
-;     NEG_TMP and the old ABS_EXP/MD_PREP pair (-6). WSKIP ends in IORZ,R0
-;   - PEEK_C2_ALPHA tests bit 6 (ANDI $40) instead of a range compare
-;   - Unary plus (EA_POS) removed - it was never documented 
+;     NEG_TMP and the old ABS_EXP/MD_PREP pair (-6). WSKIP ends in IORZ,R0.
+;   - PEEK_C2_ALPHA tests bit 6 (ANDI $40) instead of a range compare .
+;   - Unary plus (EA_POS) removed - it was never documented
 ;
-; v2.13 (Oct 2026) - Golf pass. ROMEND $0722 (1826 bytes)
+; v2.13 (Oct 2026) - Golf pass, ROMEND $0722 (1826 bytes)
 ;   - FIND_LINE/FIND_INS merged: the CC of the compare that stops the walk is the
-;     found flag, so the second look at the record is gone
+;     found flag, so the second look at the record is gone (-26).
 ;   - SW stack now holds "bytes used" in R3 and uses pre-increment/pre-decrement
 ;     indexed stores/loads (PUSH_RET, SWRETURN, OPS_HIT_*); DO_GOSUB/DO_RETURN and
 ;     the FOR frame push/pop do the same.
@@ -251,7 +250,7 @@
 ;   - IBUF moved to $1010 so GETLINE now sets IPH:IPL with one LODI.
 ;   - MUL16's multiply loop and PU16's x10 shareMULT_LOOP leaf sub. PU16_DIG
 ;     doesnt need EXP16_TO_TMP so deleted.
-;   - 
+;
 ; v2.5 (Sep 2026) - Added niladic RND to the expression parser.
 ;   - EXPR_ATOM: added 'R'-then-alpha check - cant use PEEK_C2_ALPHA due to R2
 ;   - Golf pass, all over.
@@ -259,7 +258,7 @@
 ;   - Stored-program end of line terminatorchanged to NUL from CR, matches what
 ;     STMT_EXEC/EXPR/EATWORD/etc need so DO_RUN executes straight out of PROG. 
 ;     Updated Showcase's terminator lines to match.
-;   - ROMEND: $07AF -> $0797 (1943 bytes)
+;
 ; v2.4 (Sep 2026) - Added GOSUB/RETURN; golf pass; showcase exercises both.
 ;   - GOSUB/RETURN: TOK_CHARS only matches 1st ketter, so GOTO/GOSUB share a
 ;     row (as do RUN/RETURN) 
@@ -319,6 +318,8 @@ PE_RAS_LIMIT    EQU 7
 PSW_RS          EQU     $10
 PSW_WC          EQU     $08             ; WC (With Carry) bit in PSL (bit 3)
 PSW_FLAG        EQU     $40
+PSU_II          EQU     $20             ; PSU interrupt-inhibit bit: unused here, so it doubles as the "running" flag
+PSU_RESET       EQU     $27             ; PSU SP field + II: CPSU at REPL entry clears RAS depth and the run flag
 
 ; REG16_TO_REG16 register indices (idx*2 = byte offset from IPH; see the
 ; "Ordered group" RAM comment). v2.11.
@@ -403,7 +404,7 @@ MAIN:
 
         PPSL $02                ; COM=1 (unsigned compare mode) for the entire
 
-        ; RUNFLG/GSSP/FSP are cleared by REPL (CLR_RUNFLG) before every line.
+        ; The run state (PSU II) and the GOSUB/FOR stacks are cleared by REPL before every line.
         ; For a ROM build with no preloaded program, call DO_NEW here instead.
 
         ; print sign-on banner
@@ -417,11 +418,16 @@ MAIN:
 
 ; =============================================================================
 ;  REPL -- Main read-eval-print loop
+;  Entered by fall-through from MAIN, by END (statement table), and by DO_ERROR and
+;  DR_LP at the end of a run.  CPSU PSU_RESET clears the RAS depth and the run flag
+;  (PSU II); the GOSUB and FOR stacks are emptied here too.
 ; =============================================================================
 REPL:
         CPSL PSW_RS + 5             ; primary reg bank; clear C/OVF/RS -
-        CPSU $07                    ; clear PSU SP field (bits 2:0 = HW RAS depth)
-        BSTA,UN CLR_RUNFLG          ; not running, GOSUB/FOR stacks empty
+        CPSU PSU_RESET              ; clear PSU SP field (RAS depth) and II (= not running)
+        EORZ,R0
+        STRA,R0 GSSP                ; GOSUB stack empty at every prompt
+        STRA,R0 FSP                 ; ... and the FOR stack
         LODI,R0 '>'                    ; print prompt only used here
         ZBSR *VCOUT  
         ZBSR *VPRT_SPACE  
@@ -441,7 +447,7 @@ JSYNERR:
 ; =============================================================================
 ;  DO_ERROR -- Print error, clear run state, return to REPL
 ; Entry: R0 = error code character ('0'..'8').
-; Clears RUNFLG, SWSP, FORSP. Prints "?n" or "?n@line" if running.
+; Prints "?n" or "?n@line" if running (PSU II set by DO_RUN; REPL clears it).
 ; Tail-jumps to REPL (clears full hardware RAS).
 ; In:  R0 = error code
 ; Out: jumps to REPL
@@ -451,8 +457,8 @@ DO_ERROR:
         BSTR,UN PRT_QUEST               ; Print Question mark
         LODZ,R1
         ZBSR *VCOUT                     ; print error code
-        LODA,R0 RUNFLG                  ; OPT-10: SC1=RUNFLG, 0->EQ, 1->GT
-        BCTR,EQ DE_NL                   ; not running, no line number
+        TPSU PSU_II                     ; EQ iff running (II set), LT at the prompt
+        BCTR,LT DE_NL                   ; not running, no line number
         LODI,R0 '@'                     
         ZBSR *VCOUT                     ; Print at line
         LODI,R0 (IDX_CUR*16)+IDX_EXP
@@ -613,6 +619,7 @@ DO_IF:
 ; RAS depth: 1 from REPL, 3 from DO_IF's true path (which jumps here).
 STMT_EXEC:
         ZBSR *VWSKIP
+        RETC,EQ                   ; blank line (NUL after the spaces): nothing to do
         BSTR,UN PEEK_C2_ALPHA     ; R2 is 1st char
         BCTR,EQ SE_NOTKW          ; 2nd char is NOT a letter -> handle as var/expr
         LODI,R1 2                 ; peek 3rd char - disambiguates GOTO/GOSUB
@@ -755,10 +762,13 @@ DO_GO:
 ;      this line" (DR_LP sets it before every STMT_EXEC dispatch - see
 ;      DR_CD), i.e. exactly the return point GOSUB needs to save.
 ; Out: GSSTK[GSSP]=SWSTK, GSSP+=2, then behaves exactly like GOTO to
-;      redirect SWSTK at the target line.
+;      redirect SWSTK at the target line.  Typed at the prompt (II clear): returns
+;      at once, doing nothing.
 ; Error: GSSP=GSSTKLIM (stack full) -> ERR_OOM
 ; Clobbers: R0, R1, GSSP, GSSTK (plus everything DO_GOTO clobbers)
 DO_GOSUB:
+        TPSU PSU_II
+        RETC,LT                           ; typed at the prompt: no-op (a prompt GOSUB has no return point)
         LODA,R1 GSSP
         COMI,R1 GSSTKLIM
         BCFR,LT DGS_OFLOW                 ; GSSP >= limit: stack full
@@ -772,17 +782,18 @@ DO_GOSUB:
 ;  DO_GOTO -- Computed GOTO
 ; Syntax: GOTO expr
 ; In:  IP -> first char after GOTO keyword
-; Out: if running, SWSTK = found record pointer (DR_CD resumes from there
-;      unconditionally - see DR_CD); if not running (typed at the prompt,
-;      outside RUN), a safe no-op, same as before.
-; Clobbers: R0, EXPH, EXPL, LNUMH, LNUML, TMPH, TMPL, SWSTK (only if running)
+; Out: SWSTK = found record pointer (or the next higher line / PE). If running,
+;      returns and DR_LP resumes from SWSTK; if typed at the prompt, jumps to DR_GO
+;      and runs the program from there (returns to REPL when it ends).
+; Clobbers: R0, EXPH, EXPL, LNUMH, LNUML, TMPH, TMPL, SWSTK
 DO_GOTO:
         ZBSR *VPARSE_EXPR                 ; [+1] EXPR_ATOM WSKIPs itself
-        LODA,R0 RUNFLG
-        RETC,EQ                           ; not running: safe no-op
         LODI,R0 (IDX_EXP*16)+IDX_LNUM
         ZBSR *VREG16_TO_REG16              ; LNUMH:LNUML = EXPH:EXPL (target line)
-        BCTA,UN FIND_LINE                  ; SWSTK = found record (tail call)
+        BSTA,UN FIND_LINE                  ; [+1] SWSTK = found record (or the next higher line / PE)
+        TPSU PSU_II
+        RETC,EQ                           ; running: DR_LP resumes from SWSTK
+        BCTR,UN DR_GO                     ; typed at the prompt: start a run from that line
 
 ; =============================================================================
 ;  DO_RETURN -- Return from subroutine.  Reached only from DO_RU.
@@ -812,29 +823,21 @@ DO_RU:
         ; fall through: not RETURN -> plain RUN
 ; =============================================================================
 ;  DO_RUN -- Execute stored program
-; Syntax: RUN
+; Syntax: RUN   (DR_GO is also entered by a GOTO typed at the prompt, with SWSTK set)
 ; In:  PROG=program base, PEH:PEL=program end
 ; Out: runs until END, error, or exhausted; returns to REPL
 ; Clobbers: all
 ; =============================================================================
 DO_RUN:
-        STRA,R3 RUNFLG                    ; R3 = 3rd keyword char ('N'): any nonzero = running
         ZBSR *VSET_PC_PROG
+DR_GO:
+        PPSU PSU_II                       ; running = PSU II set; REPL clears it
 DR_LP:
-        LODA,R0 RUNFLG
-        RETC,EQ
         ; end of program? SWSTK (the program counter) >= PEH:PEL
         ZBSR *VCMP_PC_PE
 
-        BCFR,LT CLR_RUNFLG                ; not LT (GT or EQ): PC>=PE, end
-                                          ; of program - clear RUNFLG and
-                                          ; return via CLR_RUNFLG's own
-                                          ; RETC,UN. Bug fix: previously
-                                          ; "BCTR,GT CLR_RUNFLG / RETC,EQ"
-                                          ; left RUNFLG=1 on a clean end
-                                          ; (TMP==PE exactly), so the next
-                                          ; error typed at the prompt wrongly
-                                          ; printed a stale "@line" suffix.
+        RETC,GT                           ; PC >= PE (GT or EQ): end of program, return
+        RETC,EQ                           ; to REPL, which clears II (run state) and the stacks
 
         ; save current line number for error reporting.  Indexed read only -
         ; SWSTK itself stays at the record's header start, which is exactly
@@ -864,28 +867,17 @@ DR_HDR:
         BCTR,UN DR_LP                    ; resume from SWSTK unconditionally
 
 ; =============================================================================
-;  DO_NEW -- Reset PE and IP
+;  DO_NEW -- Reset PE and PC to PROG (empties the program)
 ; Syntax: NEW
 ; In:  nothing
+; Out: PEH:PEL = SWSTK = PROG; returns to the caller (REPL, or DR_LP, which then ends
+;      the run because PC >= PE).  The GOSUB/FOR stacks are emptied by REPL.
+; Clobbers: R0, R1
 DO_NEW:
         ; PEH:PEL = PROG (via the PC: 6 bytes vs 10 for direct stores)
         ZBSR *VSET_PC_PROG
         LODI,R0 (IDX_SWSTK*16)+IDX_PE
-        ZBSR *VREG16_TO_REG16
-        ; fall through
-; =============================================================================
-;  DO_END -- Stop execution and clear all run state
-; Syntax: END  (also called by DO_NEW, DO_ERROR, RESET)
-; In:  nothing
-; Out: RUNFLG=0
-; Clobbers: R0
-;DO_END:
-CLR_RUNFLG:
-        EORZ,R0
-        STRA,R0 RUNFLG
-        STRA,R0 GSSP        ; GOSUB stack empty at every RUNFLG-clear point
-        STRA,R0 FSP         ; ... and the FOR stack
-        RETC,UN
+        ZBRR *VREG16_TO_REG16             ; tail call. Inside a RUN, PC = PE = PROG now, so DR_LP ends the run
 
 ; =============================================================================
 ;  DO_N / DO_NEXT -- 'N' row: NEW's 3rd char is 'W', NEXT's is 'X'.
@@ -1123,7 +1115,7 @@ PRE_CHIN:
         BSTR,UN RND_SHUFFLE 
 CHIN:
         PPSL PSW_RS
-        LODI,R0 $80
+;        LODI,R0 $80    ; dead: SPSU overwrites R0 before it is read
 ;        WRTC,R0        ; make space for shuffle
         LODI,R1 0
         LODI,R2 8
@@ -1146,7 +1138,6 @@ BCHI:
         LODZ,R1
         CPSL PSW_RS + PSW_WC
         RETC,UN
-
 ;  DLAY / DLY -- one 110-baud bit time (DLY enters part-way, for half-bit use)
 ; In:  nothing     Out: nothing     Clobbers: R0
 DLAY:
@@ -1797,7 +1788,7 @@ MU_DONE:
 
 
 ; =============================================================================
-;  DO_LIST -- Print stored BASIC lines 
+;  DO_LIST -- Print stored BASIC lines (v0.1b: whole program only -
 ; Syntax: LIST
 ; In:  PROG=program base, PEH:PEL=program end
 ; Out: whole program printed
@@ -1910,9 +1901,8 @@ INC_ET:
         STRZ R1                 ; R1 = offset
         LODA,R0 IPL,R1          ; load lo byte
         ADDI,R0 1
-        STRA,R0 IPL,R1
-        TPSL $01
-        BCTR,LT ET_RET          ; no carry: done
+        STRA,R0 IPL,R1          ; (STRA leaves CC alone)
+        BCFR,EQ ET_RET          ; ADDI result != 0: no carry out of the low byte, done
         LODA,R0 IPH,R1          ; carry: increment hi byte
         ADDI,R0 1
 ET_STORE:
@@ -2001,7 +1991,7 @@ P10_LO:
         db $01, $0A, $64, $E8, $10
 
 BANNER:
-        DB CR, LF, "uBASIC 2.14", CR, LF, "Free:",NUL        
+        DB CR, LF, "uBASIC 2.15", CR, LF, "Free:",NUL        
 
 ; -- Combined operator + statement dispatch table
 ; Format: [char][hi][lo], stride 3, NUL-terminated.
@@ -2021,7 +2011,7 @@ TOK_CHARS:
         DB "<", <DO_LTOP,   >DO_LTOP      ; < (LO tier, offset 15; relop)
         DB ">", <DO_GTOP,   >DO_GTOP      ; > (LO tier, offset 18; relop)
 ;        DB "A", <DO_ASK,    >DO_ASK       ; ASK
-        DB "E", <CLR_RUNFLG,>CLR_RUNFLG   ; END
+        DB "E", <REPL,>REPL               ; END: straight to the prompt (REPL clears RAS, run state, stacks)
         DB "G", <DO_GO,     >DO_GO        ; GOTO / GOSUB
         DB "I", <DO_IF,     >DO_IF        ; IF / INPUT
         DB "L", <DO_LIST,   >DO_LIST      ; LIST
@@ -2180,7 +2170,6 @@ TEMPRETH RES 1      ; SWRETURN scratch: popped continuation addr hi (was PDEPTH 
 TEMPRETL RES 1      ; SWRETURN scratch: popped continuation addr lo
 
 ;  --- Flags & Stuff --- 
-RUNFLG  RES 1       ; 0=immediate, nonzero=running (DO_RUN stores the 3rd keyword char)
 NEGFLG  RES 1       ; Sign flag
 BANG    RES 1       ; '!' relop-invert modifier: $00 clear, $FF armed -
 GSSTK   RES 8       ; GOSUB return-address stack, 4 levels x [hi][lo]
