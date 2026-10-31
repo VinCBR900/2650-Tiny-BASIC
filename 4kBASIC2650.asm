@@ -190,9 +190,7 @@
 ; CHANGE HISTORY
 ;
 ; V5.11 (2026-11) - ~25% speed increase - ROMEND $0E5D  (3677 of 4096)   
-;   - RAM -56 bytes (more program space): IBUF and TOKBUF merged into one 136-byte LBUF and
-;     TOKENIZE_LINE now tokenizes in place (read pointer IP in IBUF, write index R3 into
-;     TOKBUF = LBUF, trailing the reader).  See RAM OVERLAYS for details.
+;   - RAM -56 bytes (more program space): IBUF and TOKBUF merged, See RAM OVERLAYS.
 ;   - EAM_ATOM_C: a variable/constant atom in a RUNning program is read inline and control jumps
 ;     straight to the continuation (parked in TEMPRET), so no push/pop; other atoms and typed text
 ;     push and take EAM_ATOM as before.  EAM_HI_C: skip the * / % frame when none follows.
@@ -206,12 +204,9 @@
 ;   - +2 vectors (VEAM_ATOM_C, VEAM_HI_C); showcase re-encoded (14 records).  Max HW RAS still 7.
 ;   - NOT,XOR,AND loop golf as infrequntly called - inline if doing Bitcoin in BASIC...
 ;
-; V5.10 (2026-10) - ROMEND $0EEF -> $0DA6 (-329).  Smaller; speed cost ~+24 instructions
-;   per ABS-type call, ~+37 per 2-arg call; -14 per plain statement.
+; V5.10 (2026-10) - ROMEND $0EEF -> $0DA6 (-329).  Smaller
 ;   - Token class in the top bits (statement / niladic / 1-arg / 2-arg function): O(1)
 ;     dispatch, one VEC table, one [text][NUL][token] row format (KW_TAB..FUNC_TAB).
-;     Token values are assembler-derived from VEC order; function order is now grouped
-;     by argument count.
 ;   - Function calls moved off the HW RAS onto the SW stack (FUNC_BODY, FB_A, FB_B,
 ;     FB_CALL); POKE and LIST use the same chain.  PUSH_RET guards the SW stack (ERR_NEST).
 ;     SW_SIZE 32 -> 64.  The PARSE_EXPR entry guard and the FT_* save area are gone.
@@ -220,7 +215,6 @@
 ;   - FIXED: a function token in statement position hung; it is now an ordinary error.
 ;   - RAM -80 bytes (more program space): the SW stack and the GOTO cache overlay TOKBUF;
 ;     SAVE, POWCNT, TEMPRET, R2SAVE and TSL_BLEN share bytes with idle scratch.
-;   - Banner shows V5.10.
 ;
 ; V5.9 (2026-10)
 ;   - DO_IF: PARSE_RELOP removed, relop parse and signed compare inlined (RAS -1).
@@ -1648,7 +1642,7 @@ TL_HV_NONE:
 ;      keyword emits 1 byte for >= 2 chars, a variable/string/REM/punctuation byte is 1:1,
 ;      only a constant expands (1 digit: +2, 2 digits or '$'+1 hex: +1), by at most 62
 ;      bytes in all; IBUF starts 72 bytes into LBUF (see RAM OVERLAYS).
-; Clobbers: R0, R1, R3, IP, EXP, TK, SC0, R3SAVE.  TMP is preserved (TRY_STORE_LINE keeps
+; Clobbers: R0, R1, R3, IP, EXP, TK, SC0.  TMP is preserved (TRY_STORE_LINE keeps
 ;   its insertion point there); R2 is preserved.
 ; Note: TL_DONE has no RETC: it falls into TRY_STORE_LINE, whose digit test fails on the
 ;   NUL at IP and returns.  Keep TRY_STORE_LINE directly after TL_DONE.
@@ -1755,7 +1749,7 @@ HEX_PEEK:
 ;  (shared: TL_MAYBEHEX and, via PF_NUM, direct-entry expressions)
 ; In:  IPH:IPL -> '$' followed by >= 1 hex digit (caller checked via HEX_PEEK)
 ; Out: EXPH:EXPL = value (16-bit, wraps mod 65536); IP -> first non-hex char
-; Clobbers: R0, R1, SC0, EXPH, EXPL, TKH, TKL, R3SAVE.  R3 preserved.
+; Clobbers: R0, R1, SC0, EXPH, EXPL, TKH, TKL.  R3 preserved.
 ; RAS: +2 (TL_MULADD nests its helpers). Tail-jump it (BCTA,UN) from
 ;   PARSE_FACTOR, never BSTA it, or the worst case reaches depth 8.
 PARSE_HEX:
@@ -1776,37 +1770,80 @@ TL_DOLLAR_PLAIN:
         BCTA,UN TL_COPY1
 
 ; =============================================================================
-;  TL_MULADD -- EXP = EXP*<multiplier> + SC0, by repeated addition.  Shared by the
-;  tokenizer's decimal (x10) and hex (x16) accumulation and by PARSE_U16.
-; In:  R0 = multiplier (10 or 16); SC0 = digit to add; EXPH:EXPL = value;
-;      R3 = caller's index (TOKBUF write index in the tokenizer)
-; Out: EXPH:EXPL = EXPH:EXPL * R0 + SC0; R3 unchanged (kept in R3SAVE)
-; Clobbers: R0, R1, TKH, TKL, R3SAVE
-TL_MULADD:
-        STRA,R3 R3SAVE                       ; preserve caller's R3
-        STRZ,R3                              
-        LODI,R0 (IDX_EXP*16)+IDX_TK          ; TK = EXP (value before scaling)
-        ZBSR *VREG16_TO_REG16
-        EORZ,R0
+;  TL_MA_DBL -- EXP *= 2 (doubles the 16-bit accumulator in place)
+;  Drops into ADD_CORE with offset EXPH-IPH, so ADD_CORE's "pair at IPH+off"
+;  resolves to EXP itself: EXP += EXP.  No extra RAS level versus calling
+;  ADD_CORE directly. 
+; In:  EXPH:EXPL = value
+; Out: EXPH:EXPL doubled
+; Clobbers: R0, R1.  RAS: +1 at the caller.
+TL_MA_DBL:
+        LODI,R0 EXPH-IPH
+        ; drop through
+; =============================================================================
+;  ADD_CORE -- shared 16-bit indexed add: EXPH:EXPL += the pair at IPH+R0 (hi byte).
+;  Serves TL_MULADD/TL_MA_DBL (and thereby PARSE_U16's x10/x16) and DO_NEXT.
+; In:  R0 = hi-byte offset of the pair from IPH (TMPH-IPH, TKH-IPH, EXPH-IPH,
+;      VARS-IPH+2n); WC=0.  
+; Out: EXPH:EXPL += *(IPH+off):*(IPL+off); WC=0
+; Clobbers: R0, R1.  Leaf.
+ADD_CORE:
+        STRZ,R1
+        LODA,R0 EXPL
+        ADDA,R0 IPL,R1
+        STRA,R0 EXPL
+        PPSL PSW_WC                        ; WC=1: the high byte takes the carry
+        LODA,R0 EXPH
+        ADDA,R0 IPH,R1
         STRA,R0 EXPH
-        LODA,R0 SC0
-        STRA,R0 EXPL                         ; EXP = digit: the adds below accumulate into it,
-                                             ;   giving digit + mult*value with no final add
-TL_MULADD_LP:
+        CPSL PSW_WC
+        RETC,UN
+
+; =============================================================================
+;  TL_MULADD -- EXP = EXP*<multiplier> + SC0.  Shared by the tokenizer's decimal
+;  (x10) and hex (x16) accumulation and by PARSE_U16.  Shift-and-add instead of
+;  repeated addition: x16 is a free 4-bit shift (no add at all); x10 = x8+x2, so
+;  the x2 partial product is stashed in TK after the first doubling and added
+;  back once the shift reaches x8.  
+; In:  R0 = multiplier (10 or 16); SC0 = digit to add; EXPH:EXPL = value
+; Out: EXPH:EXPL = EXPH:EXPL * R0 + SC0
+; Clobbers: R0, R1, TKH, TKL.  R3 untouched (no caller-index save needed: none
+;      of ADD_CORE / REG16_TO_REG16 / TL_MA_DBL touch it).
+TL_MULADD:
+        COMI,R0 16
+        BCTR,EQ TL_MA_HEX                    ; x16: no partial product to stash
+        BSTR,UN TL_MA_DBL                    ; EXP *= 2
+        LODI,R0 (IDX_EXP*16)+IDX_TK
+        ZBSR *VREG16_TO_REG16                ; TK = EXP*2 (stash the x2 partial product)
+        BSTR,UN TL_MA_DBL                    ; EXP *= 2  -> x4
+        BSTR,UN TL_MA_DBL                    ; EXP *= 2  -> x8
         LODI,R0 TKH-IPH
-        BSTA,UN ADD_CORE                     ; EXP += TK
-        BDRR,R3 TL_MULADD_LP
-        LODA,R3 R3SAVE                       ; restore caller's R3
+        BSTR,UN ADD_CORE                     ; EXP += TK  -> x8+x2 = x10
+        BCTR,UN TL_MA_DIGIT
+TL_MA_HEX:
+        BSTR,UN TL_MA_DBL                    ; EXP *= 2
+        BSTR,UN TL_MA_DBL                    ; EXP *= 4
+        BSTR,UN TL_MA_DBL                    ; EXP *= 8
+        BSTR,UN TL_MA_DBL                    ; EXP *= 16
+TL_MA_DIGIT:
+        LODA,R0 EXPL
+        ADDA,R0 SC0
+        STRA,R0 EXPL
+        TPSL $01                              ; carry out of the lo byte?
+        RETC,LT                               ;   no: done
+        LODA,R0 EXPH
+        ADDI,R0 1
+        STRA,R0 EXPH
         RETC,UN
 TL_DONE:
         EORZ,R0
         STRA,R0 TOKBUF,R3+                        ; NUL-terminate
-     
+     ; drop through
 ; =============================================================================
 ;  TRY_STORE_LINE -- Store or delete a numbered line if IP starts with a digit
 ; In:  IPH:IPL -> input buffer
 ; Out: CC=GT if line stored/deleted; CC=EQ if not a numbered line
-; Clobbers: R0-R3, EXP, LNUM, IP, TMP, PE, TK, SC0, R3SAVE
+; Clobbers: R0-R3, EXP, LNUM, IP, TMP, PE, TK, SC0
 ; Error: ERR_OOM if the line does not fit (store unchanged)
 TRY_STORE_LINE:
         ZBSR *VDIGIT_CHECK
@@ -2088,8 +2125,8 @@ EA_TOKEN:
 ;                 return the result like any atom (PARSER_RET)
 ;  The handlers are plain subroutines (RETC).  R2 (an assignment's variable offset) and
 ;  R3 (the SW stack pointer) are saved around the call in R2SAVE/R3SAVE, so a handler may
-;  clobber them -- but must not use TL_MULADD, PARSE_U16 or MATCH_ROW: they share R3SAVE
-;  and TK (R2SAVE overlays TKH).  None does.
+;  clobber them -- but must not use TL_MULADD, PARSE_U16 or MATCH_ROW: they share TK
+;  (R2SAVE overlays TKH).  
 ;  POKE and LIST run through the same code: DO_POKE/DO_LIST start a frame at the bottom
 ;  of an empty stack with the internal tokens TOK_POKEOP/TOK_LISTOP, enter at FB_PARSE
 ;  (no '('), and the final PARSER_RET sees R3=$FF and RETCs straight to the dispatcher.
@@ -2255,24 +2292,6 @@ ADD16_SAVE_EXP:
         CPSL PSW_WC
         SUBI,R3 1
         BCTA,UN EAM_LO_LOOP
-
-; =============================================================================
-;  ADD_CORE -- shared 16-bit indexed add: EXPH:EXPL += the pair at IPH+R0 (hi byte).
-;  Serves TL_MULADD (and thereby PARSE_U16's x10) and DO_NEXT.
-; In:  R0 = hi-byte offset of the pair from IPH (TMPH-IPH, TKH-IPH, VARS-IPH+2n); WC=0
-; Out: EXPH:EXPL += *(IPH+off):*(IPL+off); WC=0
-; Clobbers: R0, R1.  Leaf.
-ADD_CORE:
-        STRZ,R1
-        LODA,R0 EXPL
-        ADDA,R0 IPL,R1
-        STRA,R0 EXPL
-        PPSL PSW_WC                        ; WC=1: the high byte takes the carry
-        LODA,R0 EXPH
-        ADDA,R0 IPH,R1
-        STRA,R0 EXPH
-        CPSL PSW_WC
-        RETC,UN
 
 ; =============================================================================
 ;  EAM_ATOM_C -- parse one atom; push the continuation only if the atom is not plain.
@@ -2485,7 +2504,7 @@ SWRETURN:
 ; decimal goes to PARSE_S16 and typed '$'+hex digit to PARSE_HEX.
 ; In:  IPH:IPL -> first char of factor
 ; Out: EXPH:EXPL = value
-; Clobbers: R0, R1, SC0 (+ TKH, TKL, R3SAVE on the hex path). R2, R3 preserved.
+; Clobbers: R0, R1, SC0 (+ TKH, TKL on the hex path). R2, R3 preserved.
 PARSE_FACTOR:
         LODA,R0 *IPH
         COMI,R0 TOK_DEC                  ; tokenized decimal constant?
@@ -2524,7 +2543,7 @@ PF_LOADVAR:
 ;  PARSE_S16 -- Parse signed decimal integer
 ; In:  IPH:IPL -> first char (optional '-' then digits)
 ; Out: EXPH:EXPL = signed 16-bit value
-; Clobbers: R0, R1, NEGFLG (0 = negate), SC0, EXP, TK, R3SAVE (falls into PARSE_U16)
+; Clobbers: R0, R1, NEGFLG (0 = negate), SC0, EXP, TK (falls into PARSE_U16)
 PARSE_S16:
         LODA,R0 *IPH
         EORI,R0 A'-'                     ; R0 = 0 iff a minus sign
@@ -2540,7 +2559,7 @@ PS16_UN:
 ; No separate entry: PARSE_S16 falls into it.  Jumps to JSYNERR if no digit follows.
 ; In:  IPH:IPL -> first digit char
 ; Out: EXPH:EXPL = value
-; Clobbers: R0, R1, SC0, EXPH, EXPL, TKH, TKL (R3 preserved via R3SAVE in TL_MULADD)
+; Clobbers: R0, R1, SC0, EXPH, EXPL, TKH, TKL (R3 untouched)
 ;PARSE_U16:
         ZBSR *VCLR_EXP
         ZBSR *VDIGIT_CHECK
@@ -3659,8 +3678,8 @@ TEMPRETH EQU GOTOH   ; SW return address hi; overlays GOTOH (both are jump tramp
 TEMPRETL EQU GOTOL   ; SW return address lo; overlays GOTOL
 
 ;  --- Flags & Stuff --- 
-R3SAVE  RES 1       ; R3 across TL_MULADD and FB_CALL's handler
-R2SAVE  EQU TKH      ; FB_CALL: R2 (an assignment's VARS offset) across the handler; overlays TKH
+R3SAVE  RES TKL     ; R3 across FB_CALL's handler 
+R2SAVE  EQU TKH     ; FB_CALL: R2 (an assignment's VARS offset) across the handler; overlays TKH
 NEGFLG  RES 1       ; Sign flag
 FORSP   RES 1       ; FOR stack pointer (bytes used, 0=empty; frame offsets 0/7/14/21)
 SWSP    RES 1       ; GOSUB stack pointer (bytes used, 0=empty)
