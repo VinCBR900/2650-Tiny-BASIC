@@ -203,6 +203,14 @@
 ;     reserved; letters right after it are swallowed (IF A THENPRINT worked by accident, now ?4).
 ;   - +2 vectors (VEAM_ATOM_C, VEAM_HI_C); showcase re-encoded (14 records).  Max HW RAS still 7.
 ;   - NOT,XOR,AND loop golf as infrequntly called - inline if doing Bitcoin in BASIC...
+;   - TL_MULADD: repeated add loop replaced with shift-and-add.  
+;   - Hand-golf pass: TL_MA_DBL/ADD_CORE reordered so TL_MA_DBL falls into ADD_CORE. DO_IF's relop
+;     table (DIF_RELOP_LT/EQ/GT, DIF_RAW/LSYNERR) relocated to drop through / $EC skip.
+;     DO_RUN's GCACHE invalidation (2 explicit STRA pairs) replaced with a BDRR,R1 loop.
+;     EAM_ATOM_C's IP-wrap-then-jump-to-TEMPRETH sequence de-duplicated as EAC_JMP, shared between
+;     the variable and constant paths.  NEG_AT_RET/POS_AT_RET de-duplicated: NEG_AT_RET reaches
+;     POS_AT_RET's own ZBSR *VCHECK_POW / BCTR,UN PARSER_RET via a db $EC skip.  DIV16's zero
+;     check performed via IORA,R0 EXPH. DEL_REC's DEL_END and OPEN_GAP's OG_FIX merged.
 ;
 ; V5.10 (2026-10) - ROMEND $0EEF -> $0DA6 (-329).  Smaller
 ;   - Token class in the top bits (statement / niladic / 1-arg / 2-arg function): O(1)
@@ -1482,11 +1490,7 @@ DN_BODY:
 ; (set by DR_EXEC) unless GOTO/GOSUB/RETURN/NEXT rewrote it.
 DO_RUN:
         LODI,R0 $FF              ; invalidate the GOTO cache (sentinel;
-;        STRA,R0 GCACHE           ;   no real line number is $FFFF)
-;        STRA,R0 GCACHE+1
-;        STRA,R0 GCACHE+4
-;        STRA,R0 GCACHE+5
-        LODI,R1 8
+        LODI,R1 7
 DR_CLR:
         STRA,R0 GCACHE,R1           ;   no real line number is $FFFF)
         BDRR,R1 DR_CLR
