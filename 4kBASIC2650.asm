@@ -1,5 +1,5 @@
 ; 4kBASIC2650.asm       Fast 4k Tiny BASIC interpreter for Signetics 2650
-; Version: V5.11
+; Version: V5.12
 ; By Vincent Crabtree, 2026.  MIT License
 ; Date:    Nov 2026
 ;
@@ -16,9 +16,6 @@
 ;
 ;   grep -n "^CHIN \|^COUT \|^ROMEND " .\4kBASIC2650.LST
 ;   ./pipbug_wrap --entry 0 --chin 0x<addr> --cout 0x<addr> 4kBASIC2650.hex
-;
-; Regression: tools/check_all.sh.  Nesting limits: tools/nestprobe.py.
-; RAS depth:  tools/rasdepth.sh.
 ;
 ; =============================================================================
 ; LANGUAGE REFERENCE (for users)
@@ -189,28 +186,38 @@
 ; =============================================================================
 ; CHANGE HISTORY
 ;
-; V5.11 (2026-11) - ~25% speed increase - ROMEND $0E55  (3669 bytes)   
+; V5.12 (2026-11) - ROMEND $0ED2 -> $0F0E (+60).  SPEED (typed Mandelbrot RUN -7.9% cycles)
+;   - 37 hot ZBSR/ZBRR *Vxxx sites are now direct BSTA/BCTA/BSTR/BCTR (-2 machine cycles each);
+;     every direct branch that could have been a ZBxR is tagged "speed: direct".
+;   - EAM0_RET / EAM_P_RET: one peek after an atom skips CHECK_POW, EAM_HI_C and EAM_LO_LOOP
+;     when nothing arithmetic follows (NUL, relops, tokens).
+;   - EAM_ATOM_C: tokens first, then A-Z, blanks last; EAC_VAR/EAC_INCIP branch straight to the
+;     continuation.  DIF_RELOP_GT inlines its IP increment; DIF_EW is skipped with a DB $EC.
+;   - FIXED: a stored-text atom starting '=' '>' '?' '@' was read as a constant (printed 252/-1019).
+;   - FIXED: CHECK_POW exponent counter used LT as borrow: 2^129 never returned.  -4 bytes.
+;   - FIXED: COUT never sent a 0 data bit (CPSU fell into PPSU).  CHIN samples SENSE through
+;     carry (WC=1, RRL/RRR): -5 bytes.  Not testable in pipbug_wrap (CHIN/COUT are hooked).
+;   - Max HW RAS still 7 (instrumented simulator, 0 overflows).
+;
+; V5.11 (2026-11) - ~25% speed increase - ROMEND $0ED2  (3794 bytes)
 ;   - RAM 56 bytes more program space: IBUF and TOKBUF merged, See RAM OVERLAYS.
-;   - EAM_ATOM_C: a variable/constant atom in a RUNning program is read inline and control jumps
-;     straight to the continuation (parked in TEMPRET), so no push/pop; other atoms and typed text
-;     push and take EAM_ATOM as before.  EAM_HI_C: skip the * / % frame when none follows.
-;   - Inline blank test (LODA/COMI/BCFR) before WSKIP at the 4 hot sites; variables advance IP
-;     inline; ADD16_SAVE_EXP adds straight from the SW stack (no POP_SAVE_TO_TMP/ADD_CORE).
+;   - EAM_ATOM_C: a plain atom (variable/constant) in a RUNning program is read inline and jumps
+;     to the continuation parked in TEMPRET: no push/pop.  EAM_HI_C skips the * / % frame when
+;     no operator follows.  +2 vectors (VEAM_ATOM_C, VEAM_HI_C).
+;   - Inline blank test before WSKIP at the 4 hot sites; ADD16_SAVE_EXP adds from the SW stack.
 ;   - DR_EXEC reads line#/len with *TMPH,R1+ and forms IP and SWSTK directly (-23 instr/stmt).
-;     TMP stays at the current record during a statement; no handler reads it on entry.
-;   - THEN is statement token $90 (KW_TAB row, VS_THEN -> JSYNERR): 3 bytes/IF smaller, DO_IF
-;     takes it with one INC_IP; typed text keeps the raw T/H/EATWORD path.  Behaviour: THEN is
-;     reserved; letters right after it are swallowed (IF A THENPRINT worked by accident, now ?4).
-;   - +2 vectors (VEAM_ATOM_C, VEAM_HI_C); showcase re-encoded (14 records).  Max HW RAS still 7.
-;   - NOT,XOR,AND loop golf as infrequntly called - inline if doing Bitcoin in BASIC...
-;   - TL_MULADD: repeated add loop replaced with shift-and-add.  
-;   - Hand-golf pass: TL_MA_DBL/ADD_CORE reordered so TL_MA_DBL falls into ADD_CORE. DO_IF's relop
-;     table (DIF_RELOP_LT/EQ/GT, DIF_RAW/LSYNERR) relocated to drop through / $EC skip.
-;     DO_RUN's GCACHE invalidation (2 explicit STRA pairs) replaced with a BDRR,R1 loop.
-;     EAM_ATOM_C's IP-wrap-then-jump-to-TEMPRETH sequence de-duplicated as EAC_JMP, shared between
-;     the variable and constant paths.  NEG_AT_RET/POS_AT_RET de-duplicated: NEG_AT_RET reaches
-;     POS_AT_RET's own ZBSR *VCHECK_POW / BCTR,UN PARSER_RET via a db $EC skip.  DIV16's zero
-;     check performed via IORA,R0 EXPH. DEL_REC's DEL_END and OPEN_GAP's OG_FIX merged.
+;   - THEN is statement token $90 (-3 bytes/IF); typed text keeps the raw T/H/EATWORD path.
+;     THEN is now reserved: IF A THENPRINT is ?4.
+;   - TOK_BYTE ($FC): constants 0-255 tokenize as 2 bytes; hex stays TOK_HEX.  EAC_BYTE,
+;     PF_BYTE and DLS_BYTEFMT added.  Showcase re-encoded (14 records).
+;   - TL_MULADD shift-and-add: ~2.3x (decimal) / ~3.7x (hex) faster per digit.
+;   - INC_IP inlined at its 5 hottest sites (86.6% of calls); IP_HIBUMP is the shared wrap tail.
+;   - EAC_BYTE/EAC_CONST share EAC_INCIP; EAC_VAR stays specialised (all-shared measured ~1% slower).
+;   - Hand-golf (-40 bytes): TL_MA_DBL falls into ADD_CORE; DO_IF relop table hoisted (db $EC
+;     skip); NEG_AT_RET/POS_AT_RET and DEL_END/OG_FIX merged; DIV16 zero test is one IORA;
+;     DO_RUN clears GCACHE with a BDRR loop (writes GCACHE+0..+8; +8 is IBUF[0], harmless).
+;   - DR_LP: RETC,EQ -> BCTA,EQ REPL.  NOT/XOR/AND loops golfed (rarely called).
+;   - Max HW RAS 7.  Regression byte-identical to the previous version.
 ;
 ; V5.10 (2026-10) - ROMEND $0EEF -> $0DA6 (-329).  Smaller
 ;   - Token class in the top bits (statement / niladic / 1-arg / 2-arg function): O(1)
@@ -231,8 +238,8 @@
 ;   - FIXED LIST-01: "LIST start,end" ignored the range and listed the whole program.
 ;
 ; V5.7 (2026-10) - ROMEND $0E39 -> $0EBE (+133).  SPEED.
-;   - Length-prefixed line records [lineH][lineL][len][body...][NUL]: ADV_TMP_PAST_REC
-;     is O(1).
+;   - Added lingth to BASIC lines [lineH][lineL][len][body...][NUL]
+;     ADV_TMP_PAST_REC is O(1).
 ;   - DR_EXEC register-pair copies inlined.
 ;   - 2-slot backward GOTO/GOSUB line cache (GCACHE), reset by RUN.
 ;   - Cache-miss slot update is a 0<->4 toggle (-9 bytes).
@@ -253,10 +260,8 @@
 ;   - PRINT_S16 per-column rewrite; ADD_CORE, DIGIT_CHECK, SET_TMP, CMP_LNUM_EXP shared.
 ;   - SWSTK is the program counter (GOTO/GOSUB/RETURN/NEXT write it); GOTOFLG, DR_GOTO
 ;     and DO_GOSUB's duplicate tail gone.
-;   - LET merged into SE_NOTKW; DO_NEW via TMP/REG16; blank line / empty THEN body no
-;     longer print ?4.
-;   - FIXED: IF and NEXT compared wrongly when operands differed by >= 128 (IF 200>10
-;     was false).
+;   - LET merged into SE_NOTKW; DO_NEW via TMP/REG16
+;   - FIXED: IF and NEXT wrong when operands differed by >= 128
 ;   - FIXED: the 4th FOR frame overran FORBASE into IBUF.
 ;   - FIXED: RUNFLG stayed set after a program ran off its end (stale "@line").
 ;   - FIXED: MAIN's variable clear skipped VARS+0.
@@ -516,7 +521,8 @@ DQ      EQU     $22
 ;       100xxxxx  statement                 $80-$9F   VEC index = token AND $1F
 ;       101xxxxx  function, no arguments    $A0-$BF   (no '(' ')': PRINT TOP+1)
 ;       110xxxxx  function, 1 argument      $C0-$DF   '(' expr ')'
-;       111xxxxx  function, 2 arguments     $E0-$FC   '(' expr ',' expr [')']
+;       111xxxxx  function, 2 arguments     $E0-$FB   '(' expr ',' expr [')']
+;       $FC TOK_BYTE                        followed by 1 payload byte (0-255, hi implied 0)
 ;       $FD TOK_HEX, $FE TOK_DEC            each followed by 2 payload bytes (hi, lo)
 ;  The three function classes share ONE index space: VEC index = NSTMT + (token AND $1F),
 ;  so the low 5 bits of a function token are unique across all of them (max 32 functions,
@@ -538,11 +544,12 @@ TOK_STMT_BASE   EQU $80         ; statement tokens
 TOK_FUNC_BASE   EQU $A0         ; function tokens: niladic $A0, 1-arg $C0, 2-arg $E0
 TOK_ARG1_BASE   EQU $C0         ; first token with an argument list ('(' required)
 TOK_ARG2_BASE   EQU $E0         ; first token with two arguments ("a,b")
+TOK_BYTE        EQU $FC         ; [TOK_BYTE][lo] -- decimal constant, value 0-255 (hi byte implied 0)
 TOK_HEX         EQU $FD         ; [TOK_HEX][hi][lo] -- 16-bit hex constant
 TOK_DEC         EQU $FE         ; [TOK_DEC][hi][lo] -- 16-bit decimal constant
 NSTMT           EQU (VEC_FN-VEC)/2   ; statement rows; VEC[NSTMT..] are the functions
 
-; ---- BEGIN keyword tokens (assembler-derived from VEC order; tools/tokmap.py prints them) ----
+; ---- BEGIN keyword tokens (assembler-derived from VEC order) ----
 TOK_END         EQU TOK_STMT_BASE+(VS_END-VEC)/2
 TOK_FOR         EQU TOK_STMT_BASE+(VS_FOR-VEC)/2
 TOK_FREE        EQU TOK_STMT_BASE+(VS_FREE-VEC)/2
@@ -575,7 +582,6 @@ TOK_LISTOP      EQU TOK_ARG2_BASE+(VF_LISTOP-VEC_FN)/2  ;   through the function
 ; ---- END keyword tokens ----
 ;  ERROR Defines
 ERR_SYN         EQU '0'                 ; syntax (generic)
-; ERR_UND_LINE    EQU '1'         ; unused
 ERR_DIV_ZERO    EQU '2'                 ; divide by zero
 ERR_OOM         EQU '3'                 ; program store full, or GOSUB stack full
 ERR_VAR         EQU '4'                 ; variable letter not A-Z
@@ -784,7 +790,11 @@ DIF_RELOP_EQ:
         db $EC                  ; COMA,R0: skip next 2 bytes 
 DIF_RELOP_GT:
         IORI,R1 4
-        ZBSR *VINC_IP  
+        LODA,R0 IPL                       ; IP += 1, inlined (was ZBSR *VINC_IP: 12.1% of
+        ADDI,R0 1                         ;   all INC_IP calls traced to this one site)
+        STRA,R0 IPL
+        BCFR,EQ DIF_RELOP_LP              ; no wrap (255/256): straight back to the loop head
+        BSTA,UN IP_HIBUMP                 ; rare (1/256): shared tail, direct call (far: BSTA)
         BCTR,UN DIF_RELOP_LP
 
 DIF_RAW:
@@ -793,41 +803,43 @@ DIF_RAW:
         ZBSR *VINC_IP                     ; [+1] past the T (clobbers R0)
         LODA,R0 *IPH                      ; re-peek
         COMI,R0 A'H'                      ; must be 'H' (EATWORD below eats it)
-        BCTR,EQ DIF_EW
+        BCTA,EQ DIF_EW
 LSYNERR:        
         ZBRR *VJSYNERR         
 DO_IF:
-        ZBSR *VPARSE_EXPR                 ; [+1]
+        BSTA,UN PARSE_EXPR                 ; [+1]  [speed: direct, not *VPARSE_EXPR]
         LODA,R0 EXPH                      ; LNUMH:LNUML = EXPH:EXPL (save left operand)
         STRA,R0 LNUMH
         LODA,R0 EXPL
         STRA,R0 LNUML
         ; parse the relop into RELOP's bitmask
-        ZBSR *VWSKIP                      ; [+1]
+        BSTA,UN WSKIP                      ; [+1]  [speed: direct, not *VWSKIP]
         EORZ,R0
         STRZ,R1                          ; R1 = 0 (mask accumulator)
 DIF_RELOP_LP:
         LODA,R0 *IPH
         COMI,R0 A'<'
-        BCTR,EQ DIF_RELOP_LT
+        BCTA,EQ DIF_RELOP_LT
         COMI,R0 A'='
-        BCTR,EQ DIF_RELOP_EQ
+        BCTA,EQ DIF_RELOP_EQ
         COMI,R0 A'>'
-        BCTR,EQ DIF_RELOP_GT
+        BCTA,EQ DIF_RELOP_GT
         LODZ,R1
         BCTR,EQ LSYNERR                  ; mask still empty: no relop seen at all
         STRA,R0 RELOP
-;        BCTR,UN DIF_RELOP_DONE
 DIF_RELOP_DONE:
-        ZBSR *VPARSE_EXPR                 ; [+1]
+        BSTA,UN PARSE_EXPR                 ; [+1]  [speed: direct, not *VPARSE_EXPR]
 
         ; consume THEN keyword (touches IP and R0 only: LNUM/EXP stay intact for the compare)
-        ZBSR *VWSKIP                      ; [+1] R0 = first non-space char (peek)
+        BSTA,UN WSKIP                      ; [+1] R0 = first non-space char (peek)  [speed: direct, not *VWSKIP]
         COMI,R0 TOK_THEN                  ; stored line: one token
-        BCFR,EQ DIF_RAW
-        ZBSR *VINC_IP                     ; [+1] consume it
-;        BCTR,UN DIF_CMP
-        DB $EC
+        BCFA,EQ DIF_RAW
+        LODA,R0 IPL                       ; IP += 1, inlined (was ZBSR *VINC_IP: 9.9% of
+        ADDI,R0 1                         ;   all INC_IP calls traced to this one site)
+        STRA,R0 IPL
+        BCFR,EQ DIF_CMP                   ; no wrap (255/256): straight to the compare
+        BSTA,UN IP_HIBUMP                 ; rare (1/256): shared tail, direct call (far: BSTA)
+        DB $EC                            ; COMA,R0: skip DIF_EW's EATWORD call
 DIF_EW:
         ZBSR *VEATWORD                    ; [+1]
 DIF_CMP:
@@ -836,8 +848,7 @@ DIF_CMP:
         CPSL $02                         ; COM=0: signed compare of the high bytes
         COMA,R0 EXPH
         PPSL $02                         ; COM=1 again (the global invariant); CC untouched
-        BCTR,GT DIF_RESULT
-        BCTR,LT DIF_RESULT
+        BCFR,EQ DIF_RESULT               ; high bytes differ (GT or LT): result known
         LODA,R0 LNUML
         COMA,R0 EXPL                     ; low bytes: unsigned (COM=1)
 DIF_RESULT:
@@ -861,7 +872,7 @@ DIF_IS_EQ:
 ;      STMT_EXEC's caller (REPL or DR_EXEC)
 ; Clobbers: R0 (+ the handler's)
 STMT_EXEC:
-        ZBSR *VWSKIP
+        BSTA,UN WSKIP                     ; [speed: direct, not *VWSKIP]
         RETC,EQ                           ; blank line / empty THEN body (NUL): nothing to do
                                           ; R0 = first char still, from the WSKIP above
         ; drop through
@@ -882,8 +893,13 @@ MATCH_KW:
         SUBI,R0 TOK_STMT_BASE             ; R0 = token - $80
         COMI,R0 $20                       ; unsigned (COM=1): anything below $80 wrapped high
         BCFR,LT SE_SLOW                   ; not a statement token: raw text
-        STRZ,R1                           ; keep the index across INC_IP
-        ZBSR *VINC_IP                     ; [+1] consume the 1-byte token
+        STRZ,R1                           ; keep the index across the inline increment
+        LODA,R0 IPL                       ; IP += 1, inlined (was ZBSR *VINC_IP: 13.2% of
+        ADDI,R0 1                         ;   all INC_IP calls traced to this one site)
+        STRA,R0 IPL
+        BCFR,EQ MK_NOWRAP
+        BSTA,UN IP_HIBUMP                 ; rare (1/256): shared tail, direct call (far: BSTA)
+MK_NOWRAP:
         LODZ,R1                           ; R0 = statement index 0..$1F
 SE_IDX:
         ADDZ,R0                           ; 2 bytes per VEC row
@@ -915,7 +931,6 @@ SE_SLOW:
         BCTR,LT SE_IDX                    ; a statement word
         LODI,R0 (IDX_EXP*16)+IDX_IP       ; a function word in statement position: MATCH_ROW
         ZBSR *VREG16_TO_REG16             ;   left EXP = the word's start; un-consume it
-;        BCTR,UN SE_NOTKW                  ;   and take the miss path
         ; drop through
 ; =============================================================================
 ;  SE_NOTKW -- Variable assignment: bare "V = expr" (reached when the statement is
@@ -928,11 +943,11 @@ SE_SLOW:
 ; Note: DO_INPUT jumps to DL_STORE with R2 = VARS byte offset (see PARSE_VAR_SAVE).
 SE_NOTKW:
         BSTR,UN PARSE_VAR_SAVE            ; validates A-Z, R2 = VARS byte offset
-        ZBSR *VWSKIP
+        BSTA,UN WSKIP                     ; [speed: direct, not *VWSKIP]
         COMI,R0 A'='
         BCFA,EQ JSYNERR
-        ZBSR *VINC_IP
-        ZBSR *VPARSE_EXPR                 ; [+1]
+        BSTA,UN INC_IP                    ; [speed: direct, not *VINC_IP]
+        BSTA,UN PARSE_EXPR                 ; [+1]  [speed: direct, not *VPARSE_EXPR]
         ; drop through
 ;  DL_STORE -- store EXPH:EXPL into a variable (shared: SE_NOTKW = LET/bare assign,
 ;  DO_INPUT, DO_FOR)
@@ -1002,13 +1017,13 @@ DO_INPUT:
 ; Range test relies on the global COM=1 (unsigned) set in MAIN: any char below
 ; 'A' wraps to a large unsigned value, so one compare catches both ends.
 PARSE_VAR_SAVE:
-        ZBSR *VWSKIP  
+        BSTA,UN WSKIP                     ; [speed: direct, not *VWSKIP]
         SUBI,R0 A'A'                     ; 'A'-'Z' -> 0-25
         COMI,R0 A'Z'-A'A'
         BCTA,GT JERRVAR                  ; out of range (either end) -- tail jump, no return
         ADDZ,R0                          ; R0 = index*2 (16-bit word stride)
         STRZ,R2                          ; R2 = byte offset, consumed by DL_STORE
-        ZBRR *VINC_IP           ; tail call  
+        BCTA,UN INC_IP           ; tail call  [speed: direct, not *VINC_IP]
 
 ; =============================================================================
 ;  DO_GOSUB -- Subroutine call
@@ -1046,10 +1061,10 @@ DGS_STORE:
 ; Notes: while running, a target above the current line is searched from SWSTK (the next
 ;   record); otherwise from PROG, after a 2-slot cache (GCACHE) of recent targets.
 DO_GOTO:
-        ZBSR *VWSKIP  
-        ZBSR *VPARSE_EXPR                 ; [+1]
+        BSTA,UN WSKIP                     ; [speed: direct, not *VWSKIP]
+        BSTA,UN PARSE_EXPR                 ; [+1]  [speed: direct, not *VPARSE_EXPR]
 DG_GO:                                    ; DO_GOSUB joins here with EXP = target line
-        ZBSR *VEXP_TO_LNUM
+        BSTA,UN EXP_TO_LNUM               ; [speed: direct, not *VEXP_TO_LNUM]
         ; running: SWSTK = record after the current line, so a target above the current
         ; line is at or after SWSTK (records are sorted): search from there.  Backward
         ; jumps and self-loops search from the top.
@@ -1064,7 +1079,7 @@ DG_GO:                                    ; DO_GOSUB joins here with EXP = targe
         BCFR,GT DG_TOP                    ; target <= current line
 DG_FWD:
         LODI,R0 (IDX_SWSTK*16)+IDX_TMP
-        ZBSR *VREG16_TO_REG16             ; TMP = SWSTK
+        BSTA,UN REG16_TO_REG16             ; TMP = SWSTK  [speed: direct, not *VREG16_TO_REG16]
         BSTA,UN FIND_LINE_FWD             ; [+1] TMP = target record
         BCTA,UN DG_SET
 
@@ -1077,7 +1092,6 @@ DG_TOP:
         DB $EC
 DGC_NEXT:
         ADDI,R1 4
-;        BCTR,UN DGC_LP
 DGC_LP:
         COMI,R1 8
         BCTR,EQ DGC_MISS
@@ -1110,7 +1124,7 @@ DGC_MISS:
         STRA,R0 GC_NEXT
 DG_SET:
         LODI,R0 (IDX_TMP*16)+IDX_SWSTK
-        ZBRR *VREG16_TO_REG16             ; SWSTK = TMP (tail call)
+        BCTA,UN REG16_TO_REG16             ; SWSTK = TMP (tail call)  [speed: direct, not *VREG16_TO_REG16]
 
 ; =============================================================================
 ;  DO_RETURN -- Return from subroutine
@@ -1178,27 +1192,27 @@ RND_SKIP:
 ; =============================================================================
 ;  PRE_CHIN / CHIN -- read one character from the serial input (blocking)
 ; In:  WC=0
-; Out: R0 = character (bit 7 clear).  RS=WC=0 on exit.
+; Out: R0 = character (bit 7 clear).  RS=WC=0 on exit; C is not preserved.
 ; Clobbers: R0, R1 (via RND_SHUFFLE), alternate-bank R1-R2, RNDSEED
 ; Notes: PRE_CHIN steps RND_SHUFFLE once and falls into CHIN, which loops back to
-;   PRE_CHIN until the start bit arrives.
+;   PRE_CHIN until the start bit arrives.  WC=1 inside CHIN: each sample is SPSU (SENSE =
+;   bit 7), RRL,R0 (SENSE -> C), RRR,R1 (C -> bit 7 of the data byte), so R1 needs no
+;   initialisation (8 shifts replace it).  RAS: +1 (RND_SHUFFLE and DLAY/DLY are leaf
+;   calls, never nested).
 PRE_CHIN:
         BSTR,UN RND_SHUFFLE
 CHIN:
-        PPSL PSW_RS
-        LODI,R1 0
+        PPSL PSW_RS + PSW_WC             ; alternate bank, WC=1 (carry chains the sample into R1)
         LODI,R2 8
         SPSU
-        BCTR,LT PRE_CHIN
+        BCTR,LT PRE_CHIN                 ; SENSE=1: line idle, keep waiting
         EORZ,R0
-        BSTR,UN DLY
+        BSTR,UN DLY                      ; half a bit time: centre of the start bit
 BCHI:
         BSTR,UN DLAY
         SPSU
-        ANDI,R0 $80
-        RRR,R1
-        IORZ,R1
-        STRZ,R1
+        RRL,R0                           ; SENSE (bit 7) -> C
+        RRR,R1                           ; C -> bit 7 of R1; earlier bits move down
         BDRR,R2 BCHI
         BSTR,UN DLAY
         ANDI,R1 $7f
@@ -1226,6 +1240,8 @@ DLY:
 ; In:  R0 = character; WC=0
 ; Out: character sent; FLAG left set (idle).  RS=0.
 ; Clobbers: R0, alternate-bank R1-R2 (primary R1-R3 preserved)
+; Notes: the two leading DLAYs are the previous character's stop bits.  A 1 bit presets FLAG;
+;   a 0 bit clears it and DB $EC (COMA) skips the PPSU (an indexed read of $1640+R0: CC only).
 COUT:
         PPSL PSW_RS
         PPSU PSW_FLAG
@@ -1236,11 +1252,12 @@ COUT:
         CPSU PSW_FLAG
 ACOU:
         BSTR,UN DLAY
-        RRR,R2
+        RRR,R2                           ; WC=0: bit 0 -> bit 7, CC=LT iff the bit is 1
         BCTR,LT ONE
-        CPSU PSW_FLAG
+        CPSU PSW_FLAG                    ; 0 bit: FLAG low ...
+        DB $EC                           ; ... COMA skips the PPSU below
 ONE:
-        PPSU PSW_FLAG
+        PPSU PSW_FLAG                    ; 1 bit: FLAG high
         BDRR,R1 ACOU
         BSTR,UN DLAY
         PPSU PSW_FLAG
@@ -1489,10 +1506,10 @@ DN_BODY:
 ; After STMT_EXEC, SWSTK always holds the next record to run: the following line
 ; (set by DR_EXEC) unless GOTO/GOSUB/RETURN/NEXT rewrote it.
 DO_RUN:
-        LODI,R0 $FF              ; invalidate the GOTO cache (sentinel;
-        LODI,R1 7
+        LODI,R0 $FF              ; invalidate the GOTO cache: line $FFFF (no real line has it)
+        LODI,R1 8
 DR_CLR:
-        STRA,R0 GCACHE,R1           ;   no real line number is $FFFF)
+        STRA,R0 GCACHE,R1        ; GCACHE+8..+1 = $FF
         BDRR,R1 DR_CLR
 
         EORZ,R0
@@ -1502,9 +1519,10 @@ DR_CLR:
         ZBSR *VSET_TMP_PROG
 DR_LP:
         LODA,R0 RUNFLG
-        RETC,EQ
+        BCTA,EQ REPL                      ; RUNFLG is global: 0 at any depth unwinds everything.
+                                          ;   REPL resets the RAS (CPSU $07) regardless.
         ; end of program? TMPH:TMPL >= PEH:PEL
-        ZBSR *VCMP_TMP_PE
+        BSTA,UN CMP_TMP_PE                ; [speed: direct, not *VCMP_TMP_PE]
         BCFA,LT DR_STOP                  ; TMP >= PE (GT or EQ): end of program, clear RUNFLG
 DR_EXEC:
         ; Setup straight from the record at TMP: CUR = line number; IP = TMP+3 (body);
@@ -1722,10 +1740,18 @@ TL_DEC_LP:
         BSTA,UN TL_MULADD                    ; EXP = EXP*10 + SC0
         BCTR,UN TL_DEC_LP
 TL_DEC_DONE:
+        LODA,R0 EXPH
+        BCTR,EQ TL_DEC_BYTE                   ; hi byte 0: value fits 0-255, use the 2-byte form
         LODI,R0 TOK_DEC
 TL_EMIT_CONST:                                ; shared by TL_DEC_DONE, TL_MAYBEHEX
         STRA,R0 TOKBUF,R3+                    ;   In: R0 = TOK_DEC or TOK_HEX
         LODA,R0 EXPH
+        STRA,R0 TOKBUF,R3+
+        LODA,R0 EXPL
+        STRA,R0 TOKBUF,R3+
+        BCTA,UN TL_LP
+TL_DEC_BYTE:
+        LODI,R0 TOK_BYTE
         STRA,R0 TOKBUF,R3+
         LODA,R0 EXPL
         STRA,R0 TOKBUF,R3+
@@ -1948,7 +1974,7 @@ OG_ADD:
         COMI,R0 <PROGLIM+1
         BCFA,LT JERROOM                  ; new PE is past PROGLIM: out of memory
 OG_LP:
-        BSTR,UN CMP_TMP_PE
+        BSTR,UN CMP_TMP_PE                ; [speed: direct, not *VCMP_TMP_PE]
         BCFR,LT OG_FIX                   ; PE has walked down to TMP: done
         ; PE-- (16-bit)
         LODA,R0 PEL
@@ -2016,7 +2042,7 @@ FIND_LINE:
         BSTR,UN FIND_INS                 ; [+1]
 FL_TAIL:
         ; check if at end of program
-        BSTR,UN CMP_TMP_PE                ; [+1]
+        BSTR,UN CMP_TMP_PE                ; [+1]  [speed: direct, not *VCMP_TMP_PE]
         BCFR,LT FL_RET_NF                 ; not LT (GT or EQ): at/past end
 FL_CHK:
         LODA,R0 *TMPH
@@ -2045,7 +2071,7 @@ FL_FOUND:
 FIND_INS:
         ZBSR *VSET_TMP_PROG
 FI_LP:
-        ZBSR *VCMP_TMP_PE
+        BSTA,UN CMP_TMP_PE                ; [speed: direct, not *VCMP_TMP_PE]
         RETC,GT
         RETC,EQ
         LODA,R0 LNUMH
@@ -2082,7 +2108,7 @@ EAM_ATOM:
         COMI,R0 A'('
         BCTA,EQ EAM_PAREN
         SUBI,R0 TOK_FUNC_BASE
-        COMI,R0 TOK_HEX-TOK_FUNC_BASE     ; $A0-$FC: a function token, classified by its bits
+        COMI,R0 TOK_BYTE-TOK_FUNC_BASE    ; $A0-$FB: a function token, classified by its bits
         BCTR,LT EA_TOKEN
         LODA,R0 RUNFLG
         BCFR,EQ EA_PLAIN                  ; running: stored text is tokenized, no raw words
@@ -2161,11 +2187,11 @@ FB_2ARG:
         ZBSR *VWSKIP
         COMI,R0 A','
         BCFA,EQ JSYNERR
-        BSTA,UN PUSH_EXP                  ; push a (EXP); consumes the ','
+        BSTA,UN PUSH_EXP                  ; push a (EXP); consumes the ','  [speed: direct, not *VPUSH_EXP]
         LODI,R0 >FB_B
         LODI,R1 <FB_B
         ZBSR *VPUSH_RET
-        BCTR,UN EXPR_AM                   ; EXP = b, then SWRETURN -> FB_B
+        BCTA,UN EXPR_AM                   ; EXP = b, then SWRETURN -> FB_B
 FB_B:
         ZBSR *VWSKIP
         COMI,R0 A')'
@@ -2188,32 +2214,27 @@ FB_CALL:
         ZBRR *VPARSER_RET
 
 ; =============================================================================
-;  PARSE_EXPR -- expression evaluator (recursive descent on the SW stack)
-; Handles: literals, variables (A-Z), unary +/-, parens, functions, ^ then */% then +/-.
-; In:  IPH:IPL -> expression string
-; Out: EXPH:EXPL = 16-bit signed result; IP past the expression
-; Clobbers: R0, R1, R3 ($FF on exit), TMP, EXP, NEGFLG, SC0, SC1, TK, GOTOH:GOTOL, R3SAVE
-;   (SAVE, POWCNT, TEMPRET and R2SAVE overlay these; R2 preserved)
-; Errors: ERR_NEST (SW stack full), ERR_SYN, ERR_DIV_ZERO, ERR_OV
-; Notes: the only HW-RAS entry into the expression machinery (+1 level whatever the
-;   nesting): it empties the SW stack (R3=$FF) and falls into EXPR_AM.  Everything nests on
-;   the SW stack and unwinds through PARSER_RET, whose last step (R3=$FF) is the RETC back
-;   to the caller.
-PARSE_EXPR:
-        LODI,R3 $FF                       ; SW stack empty
-        ; drop through
-;  EXPR_AM -- parse an expression on the live SW stack (parentheses, function arguments)
-; In:  IP -> expression; R3 = SW stack pointer, the caller's continuation already pushed
-; Out: EXPH:EXPL = value; returns via PARSER_RET to that continuation
-EXPR_AM:
-        LODI,R0 >EAM0_RET
-        LODI,R1 <EAM0_RET
-        ZBRR *VEAM_ATOM_C
+;  EAM0_RET -- continuation after the first atom of an expression (set up by EXPR_AM)
+;  Fast filter: the char after the atom is peeked once.  NUL, or any char >= '0' other than
+;  '^' (relops, tokens, ...), cannot continue an arithmetic expression, so control goes
+;  straight to PARSER_RET instead of through CHECK_POW, EAM_HI_C and EAM_LO_LOOP, each of
+;  which would only fall through.  A blank or one of ( ) * + , - / % ^ takes the full path.
+; In:  IP -> text after the atom; EXP = atom value; R3 = SW stack pointer
+; Out: EXP = value, returns via PARSER_RET (full path: via EAM_HI_C / EAM_LO_LOOP)
+; Clobbers: R0 (full path: also R1, TEMPRET, and what CHECK_POW / EAM_HI_C clobber)
 EAM0_RET:
-        ZBSR *VCHECK_POW
+        LODA,R0 *IPH                      ; fast filter: what follows the first atom?
+        BCTA,EQ PARSER_RET                ; NUL: expression complete
+        COMI,R0 A'0'
+        BCTR,LT EAM0_OPS                  ; blank ( ) * + , - / % ...: full operator path
+        COMI,R0 A'^'
+        BCFA,EQ PARSER_RET                ; relop / token / ...: no arithmetic operator follows
+EAM0_OPS:
+        BSTA,UN CHECK_POW                 ; [speed: direct, not *VCHECK_POW]
         LODI,R0 >EAM_HI0_RET
         LODI,R1 <EAM_HI0_RET
-        ZBRR *VEAM_HI_C
+        BCTA,UN EAM_HI_C                  ; [speed: direct, not *VEAM_HI_C]
+
 EAM_HI0_RET:
 ; EAM_LO_LOOP handles + - ; EAM_HI handles * / %.  A left operand is saved with PUSH_EXP and
 ; a continuation with PUSH_RET (both on the SW stack), so a same-precedence operator at a
@@ -2228,30 +2249,25 @@ ELL_NB:
         BCTR,EQ EAM_PLUS
         COMI,R0 A'-'
         BCTR,EQ EAM_MINUS
-        ZBRR *VPARSER_RET
+        BCTA,UN PARSER_RET                ; [speed: direct, not *VPARSER_RET]
+
 EAM_PLUS:
-        BSTR,UN PUSH_EXP
+        BSTR,UN PUSH_EXP                  ; [speed: direct, not *VPUSH_EXP]
         LODI,R0 >EAM_P_RET
         LODI,R1 <EAM_P_RET
-        ZBRR *VEAM_ATOM_C
-EAM_P_RET:
-        ZBSR *VCHECK_POW
-        LODI,R0 >ADD16_SAVE_EXP 
-        LODI,R1 <ADD16_SAVE_EXP 
-        ZBRR *VEAM_HI_C
+        BCTA,UN EAM_ATOM_C                ; [speed: direct, not *VEAM_ATOM_C]
+
 EAM_MINUS:
-        BSTR,UN PUSH_EXP
+        BSTR,UN PUSH_EXP                  ; [speed: direct, not *VPUSH_EXP]
         LODI,R0 >EAM_M_RET
         LODI,R1 <EAM_M_RET
-        ZBRR *VEAM_ATOM_C
+        BCTA,UN EAM_ATOM_C                ; [speed: direct, not *VEAM_ATOM_C]
+
 EAM_M_RET:
-        ZBSR *VCHECK_POW
+        BSTA,UN CHECK_POW                 ; [speed: direct, not *VCHECK_POW]
         LODI,R0 >EAM_MH_RET
         LODI,R1 <EAM_MH_RET
-        ZBRR *VEAM_HI_C
-EAM_MH_RET:
-        BSTA,UN NEG_EXP_BODY              ; EXP = -EXP
-        BCTR,UN ADD16_SAVE_EXP            ; EXP = SAVE + (-EXP) = SAVE - EXP
+        BCTA,UN EAM_HI_C                  ; [speed: direct, not *VEAM_HI_C]
 
 ; =============================================================================
 ;  PUSH_EXP -- push EXPH:EXPL onto SWBASE (lo,hi) and consume the operator
@@ -2264,7 +2280,12 @@ PUSH_EXP:
         STRA,R0 SWBASE,R3+
         LODA,R0 EXPH
         STRA,R0 SWBASE,R3+
-        ZBRR *VINC_IP
+        LODA,R0 IPL                       ; IP += 1, inlined (was ZBRR *VINC_IP: 23.9% of all
+        ADDI,R0 1                         ;   INC_IP calls traced to this one site)
+        STRA,R0 IPL
+        RETC,GT                           ; no wrap (IPL 1..127): return
+        RETC,LT                           ; no wrap (IPL 128..255): return
+        BCTA,UN IP_HIBUMP                 ; rare (1/256): tail-jump, its RETC,UN is ours too
 
 ; =============================================================================
 ;  PUSH_RET -- push a 16-bit literal return address onto SWBASE
@@ -2280,6 +2301,9 @@ PUSH_RET:
         RETC,LT                           ;   two PUSH_RETs is 2 bytes, SW_SIZE-SW_LIMIT leaves room)
         BCTA,UN JERRNEST
 
+EAM_MH_RET:
+        BSTA,UN NEG_EXP_BODY              ; EXP = -EXP
+        ; drop through
 ; =============================================================================
 ;  ADD16_SAVE_EXP -- EXP = left + EXP (16-bit); resumes EAM_LO_LOOP
 ;  Shared tail for EAM_PLUS and EAM_MINUS (EAM_MINUS negates EXP first).  Adds straight
@@ -2300,6 +2324,28 @@ ADD16_SAVE_EXP:
         BCTA,UN EAM_LO_LOOP
 
 ; =============================================================================
+;  PARSE_EXPR -- expression evaluator (recursive descent on the SW stack)
+; Handles: literals, variables (A-Z), unary +/-, parens, functions, ^ then */% then +/-.
+; In:  IPH:IPL -> expression string
+; Out: EXPH:EXPL = 16-bit signed result; IP past the expression
+; Clobbers: R0, R1, R3 ($FF on exit), TMP, EXP, NEGFLG, SC0, SC1, TK, GOTOH:GOTOL, R3SAVE
+;   (SAVE, POWCNT, TEMPRET and R2SAVE overlay these; R2 preserved)
+; Errors: ERR_NEST (SW stack full), ERR_SYN, ERR_DIV_ZERO, ERR_OV
+; Notes: the only HW-RAS entry into the expression machinery (+1 level whatever the
+;   nesting): it empties the SW stack (R3=$FF) and falls into EXPR_AM.  Everything nests on
+;   the SW stack and unwinds through PARSER_RET, whose last step (R3=$FF) is the RETC back
+;   to the caller.
+PARSE_EXPR:
+        LODI,R3 $FF                       ; SW stack empty
+        ; drop through
+;  EXPR_AM -- parse an expression on the live SW stack (parentheses, function arguments)
+; In:  IP -> expression; R3 = SW stack pointer, the caller's continuation already pushed
+; Out: EXPH:EXPL = value; returns via PARSER_RET to that continuation
+EXPR_AM:
+        LODI,R0 >EAM0_RET
+        LODI,R1 <EAM0_RET
+        ; drop through
+; =============================================================================
 ;  EAM_ATOM_C -- parse one atom; push the continuation only if the atom is not plain.
 ;  A plain atom (variable A-Z, constant token) in a RUNning program is read inline and
 ;  control jumps straight to the continuation: no push, no pop.  Typed text and every other
@@ -2313,22 +2359,28 @@ EAM_ATOM_C:
         LODA,R0 RUNFLG
         BCTR,EQ EAC_SLOW                  ; typed text: may be a word
         LODA,R0 *IPH
-        COMI,R0 SP
-        BCFR,EQ EAC_NB
-        ZBSR *VWSKIP                      ; blanks (rare)
-EAC_NB:
-        COMI,R0 TOK_DEC
-        BCTR,EQ EAC_CONST
-        COMI,R0 TOK_HEX
-        BCTR,EQ EAC_CONST
+EAC_CH:                                   ; R0 = the char, CC = its sign (LODA's, or IORZ's below)
+        BCTR,LT EAC_TOK                   ; bit7 set: TOK_BYTE/TOK_HEX/TOK_DEC -- go identify which
         SUBI,R0 A'A'                      ; COM=1: one unsigned test for A-Z
         COMI,R0 A'Z'-A'A'
-        BCFR,GT EAC_VAR
+        BCFR,GT EAC_VAR                   ; A-Z: R0 = index 0..25
+        COMI,R0 SP-A'A'                   ; a blank?  (R0 is still char-'A', mod 256)
+        BCFR,EQ EAC_SLOW                  ; no: '(' '-' '+' or garbage -- generic path
+        BSTA,UN WSKIP                     ; blanks (rare): R0 = next non-blank char  [speed: direct, not *VWSKIP]
+        IORZ,R0                           ; CC from R0's sign (WSKIP's CC is NUL/not-NUL)
+        BCTR,UN EAC_CH
+EAC_TOK:
+        COMI,R0 TOK_BYTE                  ; Checked most- to least-common: BYTE, then DEC-or-HEX.
+        BCTR,EQ EAC_BYTE
+        COMI,R0 TOK_DEC-1                 ; TOK_HEX = TOK_DEC-1 exactly, so R0 >= TOK_DEC-1
+        BCFR,LT EAC_CONST                 ;   (unsigned) catches both TOK_HEX(EQ) and TOK_DEC(GT).
+
 EAC_SLOW:
         LODA,R0 TEMPRETL
         LODA,R1 TEMPRETH
         ZBSR *VPUSH_RET
         ZBRR *VEAM_ATOM
+
 EAC_VAR:
         ADDZ,R0                           ; VARS offset = index*2
         STRZ,R1
@@ -2336,33 +2388,58 @@ EAC_VAR:
         STRA,R0 EXPH
         LODA,R0 VARS+1,R1
         STRA,R0 EXPL
-        LODA,R0 IPL                       ; IP += 1 inline
-        ADDI,R0 1
-        STRA,R0 IPL
-        BCFR,EQ EAC_GO                    ; no wrap
-        BCTR,UN EAC_JMP
-;        LODA,R0 IPH
-;        ADDI,R0 1
-;        STRA,R0 IPH
-;        BCTA,UN *TEMPRETH
-EAC_CONST:
-        LODI,R1 0                         ; payload at IP+1 (hi), IP+2 (lo)
-        LODA,R0 *IPH,R1+
+        LODA,R0 IPL                       ; IP += 1, inlined (speed): a +1 always wraps to exactly 0,
+        ADDI,R0 1                         ;   so one BCFA,EQ replaces EAC_INCIP's LODI+ADDZ+COMZ
+        STRA,R0 IPL                       ;   (variables are the hottest of the three atom kinds)
+        BCFA,EQ *TEMPRETH                 ; no wrap: straight to the continuation
+        BCTR,UN EAC_JMP                   ; wrap (1/256): IPH += 1 below
+
+EAC_BYTE:
+        EORZ,R0                           ; hi byte always 0 (tokenizer guarantees 0-255)
+        STRZ,R1
         STRA,R0 EXPH
         LODA,R0 *IPH,R1+
+        LODI,R1 2                         ; IP increment amount, for EAC_INCIP's generic tail
+        BCTR,UN EAC_INCIP
+
+EAC_CONST:
+        LODI,R1 1                         ; payload at IP+1 (hi), IP+2 (lo)
+        LODA,R0 *IPH,R1                   ; pre-increment
+        STRA,R0 EXPH
+        LODA,R0 *IPH,R1+
+        LODI,R1 3                         ; IP increment amount (falls through to EAC_INCIP)
+EAC_INCIP:                                ; shared tail: EXPL=R0, IP+=R1, wrapped iff sum<R1
         STRA,R0 EXPL
-        LODA,R0 IPL                       ; IP += 3
-        ADDI,R0 3
+        LODA,R0 IPL                       ; IP += R1 (2 or 3), inlined (speed)
+        ADDZ,R1
         STRA,R0 IPL
-        COMI,R0 3                         ; unsigned: wrapped iff sum < 3
-        BCFR,LT EAC_GO
+        COMZ,R1                           ; sum < R1 (unsigned) iff IPL wrapped
+        BCFA,LT *TEMPRETH                 ; no wrap: straight to the continuation
 EAC_JMP:
-        LODA,R0 IPH
-        ADDI,R0 1
-        STRA,R0 IPH
+        LODA,R0 IPH                       ; IPH += 1: the carry of the inline IP increment above
+        ADDI,R0 1                         ;   (IP_HIBUMP's body inlined: this path ends in a jump
+        STRA,R0 IPH                       ;   to the continuation, not a return)
 EAC_GO:
         BCTA,UN *TEMPRETH
 
+; =============================================================================
+;  EAM_P_RET -- continuation after the right-hand atom of a '+' (EAM_PLUS)
+;  Same fast filter as EAM0_RET, but a plain atom goes straight to ADD16_SAVE_EXP.
+; In:  IP -> text after the atom; EXP = right operand; SW stack: left operand pushed (lo,hi)
+; Out: continues into ADD16_SAVE_EXP (full path: via CHECK_POW / EAM_HI_C)
+; Clobbers: R0 (full path: also R1, TEMPRET, and what CHECK_POW / EAM_HI_C clobber)
+EAM_P_RET:
+        LODA,R0 *IPH                      ; fast filter, as EAM0_RET
+        BCTA,EQ ADD16_SAVE_EXP
+        COMI,R0 A'0'
+        BCTR,LT EAM_P_OPS
+        COMI,R0 A'^'
+        BCFA,EQ ADD16_SAVE_EXP
+EAM_P_OPS:
+        BSTA,UN CHECK_POW                 ; [speed: direct, not *VCHECK_POW]
+        LODI,R0 >ADD16_SAVE_EXP 
+        LODI,R1 <ADD16_SAVE_EXP 
+        ; drop through
 ; =============================================================================
 ;  EAM_HI_C -- enter the * / % level only if one of those operators is next
 ; In:  R0 = continuation lo, R1 = hi (as PUSH_RET); IP -> text after an atom
@@ -2375,7 +2452,7 @@ EAM_HI_C:
         LODA,R0 *IPH
         COMI,R0 SP
         BCFR,EQ EHC_NB
-        ZBSR *VWSKIP                      ; blanks (rare)
+        BSTA,UN WSKIP                      ; blanks (rare)  [speed: direct, not *VWSKIP]
 EHC_NB:
         COMI,R0 A'*'
         BCTR,EQ EHC_PUSH
@@ -2386,8 +2463,7 @@ EHC_NB:
 EHC_PUSH:
         LODA,R0 TEMPRETL
         LODA,R1 TEMPRETH
-        ZBSR *VPUSH_RET
-;        ZBRR *VEAM_HI
+        BSTA,UN PUSH_RET                  ; [speed: direct, not *VPUSH_RET]
         ; Drop through
 ; =============================================================================
 ;  EAM_HI -- * / % level of the expression parser (left to right)
@@ -2406,31 +2482,31 @@ EH_NB:
         BCTR,EQ EAM_DIV
         COMI,R0 A'%'
         BCTR,EQ EAM_MOD
-        ZBRR *VPARSER_RET
+        BCTA,UN PARSER_RET                ; [speed: direct, not *VPARSER_RET]
 
 EAM_MUL:
-        ZBSR *VPUSH_EXP
+        BSTA,UN PUSH_EXP                  ; [speed: direct, not *VPUSH_EXP]
         LODI,R0 >MU_AT_RET
         LODI,R1 <MU_AT_RET
-        ZBRR *VEAM_ATOM_C
+        BCTA,UN EAM_ATOM_C                ; [speed: direct, not *VEAM_ATOM_C]
         
 MU_AT_RET:
-        ZBSR *VCHECK_POW
+        BSTA,UN CHECK_POW                 ; [speed: direct, not *VCHECK_POW]
         BSTR,UN POP_SAVE_TO_TMP           ; TMPH:TMPL = popped left operand
         BSTA,UN MUL16
-        ZBRR *VEAM_HI 
+        BCTR,UN EAM_HI                    ; [speed: direct, not *VEAM_HI]
 
 EAM_DIV:
-        ZBSR *VPUSH_EXP
+        BSTA,UN PUSH_EXP                  ; [speed: direct, not *VPUSH_EXP]
         LODI,R0 >DV_AT_RET
         LODI,R1 <DV_AT_RET
-        ZBRR *VEAM_ATOM_C
+        BCTA,UN EAM_ATOM_C                ; [speed: direct, not *VEAM_ATOM_C]
 
 DV_AT_RET:
-        ZBSR *VCHECK_POW
+        BSTA,UN CHECK_POW                 ; [speed: direct, not *VCHECK_POW]
         BSTR,UN POP_SAVE_TO_TMP
         BSTA,UN DIV16
-        ZBRR *VEAM_HI 
+        BCTR,UN EAM_HI                    ; [speed: direct, not *VEAM_HI]
 
 EAM_MOD:
         ZBSR *VPUSH_EXP
@@ -2469,11 +2545,10 @@ EAM_NEG:
 NEG_AT_RET:
         BSTA,UN NEG_EXP_BODY
         ZBSR *VCHECK_POW
-;        BCTR,UN PARSER_RET
         DB $EC
 POS_AT_RET:
         ZBSR *VCHECK_POW
-        BCTR,UN PARSER_RET
+        BCTR,UN PARSER_RET                ; [speed: direct, not *VPARSER_RET]
 
 ; EAM_POS -- unary plus
 EAM_POS:
@@ -2526,10 +2601,10 @@ SWRETURN:
 ; Clobbers: R0, R1, SC0 (+ TKH, TKL on the hex path). R2, R3 preserved.
 PARSE_FACTOR:
         LODA,R0 *IPH
-        COMI,R0 TOK_DEC                  ; tokenized decimal constant?
-        BCTR,EQ PF_CONST
-        COMI,R0 TOK_HEX                  ; tokenized hex constant?
-        BCTR,EQ PF_CONST
+        COMI,R0 TOK_BYTE                 ; tokenized small decimal constant? (most common)
+        BCTR,EQ PF_BYTE
+        COMI,R0 TOK_DEC-1                 ; TOK_HEX = TOK_DEC-1: R0 >= TOK_DEC-1 (unsigned)
+        BCFR,LT PF_CONST                  ;   catches both TOK_HEX(EQ) and TOK_DEC(GT)
         SUBI,R0 A'A'                     ; shift 'A'-'Z' to 0-25 (COM=1: one unsigned test);
         COMI,R0 A'Z'-A'A'                ; PF_LOADVAR uses the shifted value as its index
         BCFR,GT PF_LOADVAR               ; A-Z: R0 = index 0..25
@@ -2542,6 +2617,13 @@ PF_NUM:
 PF_CONST:
         ZBSR *VINC_IP                    ; [+1] past the token byte
         ZBRR *VFETCH16_IP                ; tail: EXP = payload, IP past it; returns to our caller
+PF_BYTE:
+        ZBSR *VINC_IP                    ; past the token byte
+        LODA,R0 *IPH                     ; the payload byte
+        STRA,R0 EXPL
+        EORZ,R0
+        STRA,R0 EXPH                     ; hi byte always 0
+        ZBRR *VINC_IP                    ; tail: IP past the payload byte, return to our caller
 
 ; =============================================================================
 ;  PF_LOADVAR -- Load variable value from VARS
@@ -2579,7 +2661,6 @@ PS16_UN:
 ; In:  IPH:IPL -> first digit char
 ; Out: EXPH:EXPL = value
 ; Clobbers: R0, R1, SC0, EXPH, EXPL, TKH, TKL (R3 untouched)
-;PARSE_U16:
         ZBSR *VCLR_EXP
         ZBSR *VDIGIT_CHECK
         BCTA,GT *VJSYNERR ; first char not a digit: syntax error
@@ -2631,7 +2712,6 @@ EXPH_Z:
 ; In:  EXPH:EXPL = a.  Out: EXPH:EXPL = ~a.  Clobbers: R0, R1.  Leaf.
 ; Looped as rarely used
 DO_NOT:
-;        LODI,R1 2               ; 2
 NOT_LOOP:        
         LODA,R0 EXPH-1,R1       ; 3
         EORI,R0 $FF             ; 2
@@ -2716,7 +2796,6 @@ DLS_ARG:
 ; Clobbers: R0, R1.  Leaf.
 ; Looped, low byte first (R1 = 2 -> 1)
 OP_AND:
-;        LODI,R1 2               ; 2
 AND_LOOP:
         LODA,R0 TMPH-1,R1       ; 3
         ANDA,R0 EXPH-1,R1       ; 3
@@ -2724,7 +2803,6 @@ AND_LOOP:
         BDRR,R1 AND_LOOP        ; 2
         RETC,UN                 ; 1 = 14
 OP_OR:
-;        LODI,R1 2
 OR_LOOP:
         LODA,R0 TMPH-1,R1
         IORA,R0 EXPH-1,R1
@@ -2732,7 +2810,6 @@ OR_LOOP:
         BDRR,R1 OR_LOOP
         RETC,UN                 ; = 14
 OP_XOR:
-;        LODI,R1 2
 XOR_LOOP:
         LODA,R0 TMPH-1,R1
         EORA,R0 EXPH-1,R1
@@ -2812,9 +2889,9 @@ DLS_BLPX:
         BCTA,EQ DLS_NL                    ; NUL: end of body (free zero test)
         COMI,R0 TOK_STMT_BASE             ; unsigned: a token (>= $80)?
         BCTA,LT DLS_ECHO                  ; < $80: ordinary char
-        COMI,R0 TOK_HEX                   ; unsigned: >= $FD (constant token)?
+        COMI,R0 TOK_BYTE                  ; unsigned: >= $FC (constant token)?
         BCFR,LT DLS_CONST
-; $80-$FC: a keyword/function token.  Walk the combined table (KW_TAB..FUNC_TAB, rows
+; $80-$FB: a keyword/function token.  Walk the combined table (KW_TAB..FUNC_TAB, rows
 ; [text][NUL][token], under 256 bytes) to the row with this token and echo its text.
 ; In: R0 = token.  TMP = table pointer, R2 = wanted token, R3 = row text index (R2/R3 are
 ;   free here: FB_CALL saved them for OP_LIST).
@@ -2841,12 +2918,23 @@ DTT_DONE:
         ZBSR *VINC_IP                     ; past the 1-byte token in the
         ZBRR *VDLS_BLPX                   ;   ACTUAL body (TMP is the table walk's)
 DLS_CONST:
+        COMI,R0 TOK_BYTE                  ; R0 still = the token (TOK_BYTE/TOK_HEX/TOK_DEC)
+        BCTR,EQ DLS_BYTEFMT
         STRZ,R2                           ; R2 = TOK_HEX or TOK_DEC (from R0)
         ZBSR *VINC_IP                     ; past the token
         ZBSR *VFETCH16_IP                 ; [+2] EXPH:EXPL = payload; IP past it
         COMI,R2 TOK_HEX
         BCTR,EQ DLS_HEXFMT
         ZBSR *VPRINT_S16                  ; TOK_DEC: signed decimal
+        ZBRR *VDLS_BLPX
+DLS_BYTEFMT:
+        ZBSR *VINC_IP                     ; past the token
+        LODA,R0 *IPH                      ; the payload byte
+        STRA,R0 EXPL
+        EORZ,R0
+        STRA,R0 EXPH                      ; hi byte always 0
+        ZBSR *VINC_IP                     ; past the payload byte
+        ZBSR *VPRINT_S16                  ; always positive: plain decimal
         ZBRR *VDLS_BLPX
 DLS_HEXFMT:
         LODI,R0 '$'
@@ -3193,7 +3281,7 @@ EATWORD:
         BCFR,EQ WSKIPRET
 EW_ADV:
         ZBSR *VINC_IP 
-        BCTR,UN EATWORD
+        BCTR,UN EATWORD                   ; [speed: direct, not *VEATWORD]
 
 ; =============================================================================
 ;  WORD_START -- can the text at IP be a multi-letter keyword/function word?
@@ -3224,7 +3312,11 @@ WS_RET:
 ; Out: IPH:IPL -> first non-space char; R0 = that char, CC=EQ iff NUL
 ; Clobbers: R0, CC.  RAS: +1 (INC_IP)
 WSKIP_LOOP:
-        ZBSR *VINC_IP           ; advance IP
+        LODA,R0 IPL              ; IP += 1, inlined (was ZBSR *VINC_IP: 27.5% of all INC_IP
+        ADDI,R0 1                 ;   calls traced to this one site)
+        STRA,R0 IPL
+        BCFR,EQ WSKIP             ; no wrap (common case)
+        BSTR,UN IP_HIBUMP         ; rare (1/256): shared tail, direct call
 WSKIP:
         LODA,R0 *IPH            ; read char at IP
         COMI,R0 SP              ; space?
@@ -3244,11 +3336,16 @@ WSKIPRET:
 ; The offsets (EXPH-IPH, TMPH-IPH) are assembly-time expressions, so the order of the
 ; IPH..EXPL RAM block must be preserved.  No BSTA inside: no extra RAS depth.
 INC_IP:
-        LODA,R0 IPL
+        LODA,R0 IPL                       ; IP += 1 (the shared routine; the hottest sites inline it)
         ADDI,R0 1
         STRA,R0 IPL
         RETC,GT                          ; result 1..127: no wrap
         RETC,LT                          ; result 128..255: no wrap
+; IP_HIBUMP -- shared rare-path tail (IPL wrapped to 0, carry into IPH).  Direct subroutine
+;  (BSTR/BSTA): each of the 5 inline-increment sites below calls it only on the 1/256 wrap
+;  case, so the common path stays branch-free and this body is never duplicated.
+; In: none.  Out: IPH += 1.  Clobbers: R0.  Leaf.
+IP_HIBUMP:
         LODA,R0 IPH                      ; result 0: carry into the hi byte
         ADDI,R0 1
         STRA,R0 IPH
@@ -3511,16 +3608,14 @@ CP_MUL_LOOP:
         BSTA,UN MUL16
 
         LODA,R0 POWCNTL                ; exponent counter -= 1 (16-bit)
+        BCFR,EQ CP_CNT_LO              ; lo != 0: no borrow from hi
+        LODA,R1 POWCNTH                ; lo = 0: borrow, hi -= 1 (R0 stays 0 -> lo = $FF below)
+        SUBI,R1 1
+        STRA,R1 POWCNTH
+CP_CNT_LO:
         SUBI,R0 1
         STRA,R0 POWCNTL
-        BCFR,LT CP_CNT_NB
-        LODA,R0 POWCNTH
-        SUBI,R0 1
-        STRA,R0 POWCNTH
-CP_CNT_NB:
-        LODA,R1 POWCNTH
-        LODA,R0 POWCNTL
-        IORZ R1
+        IORA,R0 POWCNTH                ; CC = EQ iff the counter (hi:lo) has reached 0
         BCFR,EQ CP_MUL_LOOP
         ; fall through: loop done
 
@@ -3533,7 +3628,7 @@ CP_CHAIN:
 ; =============================================================================
 ;  TABLES 
 BANNER:
-        DB CR, LF, "uBASIC 2650 V5.11", CR, LF, "Bytes Free:",NUL
+        DB CR, LF, "uBASIC 2650 V5.12", CR, LF, "Bytes Free:",NUL
 
 ; -- Keyword / function row table.
 ; Row: [full word text][NUL][token]; the table ends at a lone NUL.  KW_TAB holds the
@@ -3744,8 +3839,6 @@ GC_NEXT RES 1       ; round-robin next-slot write offset: always 0 or 4.  NOT ov
 ;  Line format: <lineno_hi> <lineno_lo> <len> <tokenized body> <NUL>
 ;  Pre-tokenized: the bytes TOKENIZE_LINE stores for typed lines.  <len> = body byte count
 ;  (NUL not counted; TOK_DEC/TOK_HEX count 3), as ADV_TMP_PAST_REC requires.
-;  Generated by tools/tokshowcase.py from showcase.bas, then tools/showcase_addlen.py
-;  (do not hand-edit; 'showcase_addlen.py verify' re-checks it).
 ;  Lines  10-190: feature demos (PRINT, CHR$, arithmetic, comparisons, GOTO loop)
 ;  Lines 192-218: FOR/NEXT and GOSUB/RETURN demos
 ;  Lines 220-240: function demos (ABS/NEG/AND/OR/XOR/NOT/PEEK/POKE/RND/LIST; 233 = nested calls)
@@ -3758,8 +3851,8 @@ GC_NEXT RES 1       ; round-robin next-slot write offset: always 0 or 4.  NOT ov
 ;  span several DB lines; the trailing comment shows the source line.
 ; =============================================================================
 PROG:
-        DB 0,10,27,TOK_REM," uBASIC 2650 - SHOWCASE V5",$00                                   ; 10  REM uBASIC 2650 - SHOWCASE V5
-        DB 0,20,33,TOK_PRINT," ",$22,"-- uBASIC 2650 V5 Showcase --",$22,$00                  ; 20  PRINT "-- uBASIC 2650 V5 Showcase --"
+        DB 0,10,27,TOK_REM,"4kBASIC 2650 - SHOWCASE   ",$00                                   ; 10  REM
+        DB 0,20,33,TOK_PRINT," ",$22,"--4kBASIC 2650 V5 Showcase --",$22,$00                  ; 20  PRINT "-- uBASIC 2650 V5 Showcase --"
         DB 0,30,24,TOK_PRINT," ",$22,"--- PRINT / CHR$ ---",$22,$00                             ; 30  PRINT "--- PRINT / CHR$ ---"
         DB 0,40,31,TOK_PRINT," CHR$(",TOK_DEC,0,65,")",$3B,"CHR$(",TOK_DEC,0,66,")",$3B,"CHR$("  ; 40  PRINT CHR$(65);CHR$(66);CHR$(67)
         DB TOK_DEC,0,67,")",$00
